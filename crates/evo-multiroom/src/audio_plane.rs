@@ -94,6 +94,168 @@ use evo::happenings::{Happening, HappeningBus};
 /// allocation.
 const MAX_FRAME_BYTES: usize = 1_048_576;
 
+/// The binary audio-frame format a peer may offer in
+/// `Hello.formats`: a fixed big-endian header and the codec
+/// payload raw, in place of the JSON+base64 `AudioFrame`
+/// envelope. Offered by every runtime of this version; sent
+/// only to a peer that offered it back, so a peer of an older
+/// version keeps receiving JSON. Control messages stay JSON
+/// in both directions. This is the retirement path the
+/// `payload_b64` note below calls for: the envelope goes by
+/// attrition as peers upgrade, and an MCU-class receiver
+/// never parses a frame as JSON.
+pub const FRAME_FORMAT_BIN1: &str = "bin1";
+
+/// First byte of a `bin1` body on the wire. Never the first
+/// byte of a JSON document, so a reader tells the two apart
+/// without negotiation state.
+pub const BIN1_MAGIC: u8 = 0xEB;
+/// Second byte: the kind of binary body. One kind so far.
+const BIN1_KIND_AUDIO_FRAME: u8 = 0x01;
+/// Fixed part of a `bin1` audio frame: magic, kind, group id
+/// length, codec length, sequence, presentation time, rate,
+/// channels, payload length.
+const BIN1_HEADER_LEN: usize = 1 + 1 + 1 + 1 + 8 + 8 + 4 + 2 + 4;
+
+/// An audio frame as the `bin1` format carries it: the fields
+/// of [`AudioPlaneMessage::AudioFrame`] with the payload raw.
+///
+/// Layout, all integers big-endian:
+///
+/// | offset | size | field                 |
+/// |--------|------|-----------------------|
+/// | 0      | 1    | `0xEB` magic          |
+/// | 1      | 1    | kind, `0x01`          |
+/// | 2      | 1    | group id length `g`   |
+/// | 3      | 1    | codec length `c`      |
+/// | 4      | 8    | sequence              |
+/// | 12     | 8    | presentation time, ms |
+/// | 20     | 4    | rate, Hz              |
+/// | 24     | 2    | channels              |
+/// | 26     | 4    | payload length `n`    |
+/// | 30     | g    | group id, UTF-8       |
+/// | 30+g   | c    | codec, UTF-8          |
+/// | 30+g+c | n    | payload               |
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryAudioFrame {
+    /// Group this frame is fanning out to.
+    pub group_id: String,
+    /// Per-group sequence.
+    pub sequence: u64,
+    /// Source-host's monotonic ms the frame plays at.
+    pub presentation_time_ms: u64,
+    /// Codec discriminator, as in the JSON envelope.
+    pub codec: String,
+    /// Sample rate in Hz.
+    pub rate_hz: u32,
+    /// Channel count.
+    pub channels: u16,
+    /// Codec payload, raw.
+    pub payload: Vec<u8>,
+}
+
+impl BinaryAudioFrame {
+    /// The frame as `bin1` bytes, ready to go after a length
+    /// prefix. Group id and codec longer than 255 bytes are an
+    /// error: neither is in practice.
+    pub fn encode(&self) -> Result<Vec<u8>, AudioPlaneError> {
+        let (g, c) = (self.group_id.as_bytes(), self.codec.as_bytes());
+        let gl = u8::try_from(g.len()).map_err(|_| {
+            AudioPlaneError::Protocol("bin1: group id over 255 bytes".into())
+        })?;
+        let cl = u8::try_from(c.len()).map_err(|_| {
+            AudioPlaneError::Protocol("bin1: codec over 255 bytes".into())
+        })?;
+        let n = u32::try_from(self.payload.len()).map_err(|_| {
+            AudioPlaneError::Protocol("bin1: payload over 4 GiB".into())
+        })?;
+        let mut out = Vec::with_capacity(
+            BIN1_HEADER_LEN + g.len() + c.len() + self.payload.len(),
+        );
+        out.push(BIN1_MAGIC);
+        out.push(BIN1_KIND_AUDIO_FRAME);
+        out.push(gl);
+        out.push(cl);
+        out.extend_from_slice(&self.sequence.to_be_bytes());
+        out.extend_from_slice(&self.presentation_time_ms.to_be_bytes());
+        out.extend_from_slice(&self.rate_hz.to_be_bytes());
+        out.extend_from_slice(&self.channels.to_be_bytes());
+        out.extend_from_slice(&n.to_be_bytes());
+        out.extend_from_slice(g);
+        out.extend_from_slice(c);
+        out.extend_from_slice(&self.payload);
+        Ok(out)
+    }
+
+    /// A frame from `bin1` bytes (the body after the length
+    /// prefix, magic included).
+    pub fn decode(body: &[u8]) -> Result<Self, AudioPlaneError> {
+        if body.len() < BIN1_HEADER_LEN {
+            return Err(AudioPlaneError::Protocol("bin1: body short".into()));
+        }
+        if body[0] != BIN1_MAGIC || body[1] != BIN1_KIND_AUDIO_FRAME {
+            return Err(AudioPlaneError::Protocol(format!(
+                "bin1: unknown body {:#04x} {:#04x}",
+                body[0], body[1]
+            )));
+        }
+        let (gl, cl) = (usize::from(body[2]), usize::from(body[3]));
+        let be = |at: usize, n: usize| -> &[u8] { &body[at..at + n] };
+        let sequence = u64::from_be_bytes(be(4, 8).try_into().expect("8"));
+        let presentation_time_ms =
+            u64::from_be_bytes(be(12, 8).try_into().expect("8"));
+        let rate_hz = u32::from_be_bytes(be(20, 4).try_into().expect("4"));
+        let channels = u16::from_be_bytes(be(24, 2).try_into().expect("2"));
+        let n = u32::from_be_bytes(be(26, 4).try_into().expect("4")) as usize;
+        let rest = &body[BIN1_HEADER_LEN..];
+        if rest.len() != gl + cl + n {
+            return Err(AudioPlaneError::Protocol(format!(
+                "bin1: body is {} bytes after the header, the header says {}",
+                rest.len(),
+                gl + cl + n
+            )));
+        }
+        let text = |b: &[u8], what: &str| {
+            std::str::from_utf8(b).map(str::to_owned).map_err(|_| {
+                AudioPlaneError::Protocol(format!("bin1: {what} is not UTF-8"))
+            })
+        };
+        Ok(Self {
+            group_id: text(&rest[..gl], "group id")?,
+            codec: text(&rest[gl..gl + cl], "codec")?,
+            sequence,
+            presentation_time_ms,
+            rate_hz,
+            channels,
+            payload: rest[gl + cl..].to_vec(),
+        })
+    }
+}
+
+/// What a read from the wire yields: a JSON control message,
+/// or a binary audio frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Inbound {
+    /// A JSON-enveloped message.
+    Message(AudioPlaneMessage),
+    /// A `bin1` audio frame.
+    Frame(BinaryAudioFrame),
+}
+
+/// What the per-peer write pump carries: a message to encode
+/// as JSON, or bytes already encoded (a `bin1` frame, shared
+/// across the peers of a fan-out).
+enum Outbound {
+    Message(Box<AudioPlaneMessage>),
+    Raw(Arc<Vec<u8>>),
+}
+
+impl Outbound {
+    fn message(msg: AudioPlaneMessage) -> Self {
+        Outbound::Message(Box::new(msg))
+    }
+}
+
 /// Wire-protocol message exchanged between peers on the
 /// audio-plane TCP channel. Tagged via serde's `type` field
 /// so unknown variants surface as decode errors rather than
@@ -114,6 +276,11 @@ pub enum AudioPlaneMessage {
         /// host for. Empty when the sender is purely a
         /// receiver.
         claimed_source_host_groups: Vec<String>,
+        /// Frame formats the sender can receive besides the
+        /// JSON envelope ([`FRAME_FORMAT_BIN1`]). Absent from
+        /// a peer of an earlier version, which then gets JSON.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        formats: Vec<String>,
     },
     /// Periodic liveness signal. Sent in both directions.
     Heartbeat {
@@ -547,7 +714,9 @@ struct Inner {
 
 struct ConnectionEntry {
     info: PeerConnectionInfo,
-    write_tx: mpsc::UnboundedSender<AudioPlaneMessage>,
+    write_tx: mpsc::UnboundedSender<Outbound>,
+    /// The peer offered `bin1`: audio frames go to it raw.
+    binary_frames: bool,
     read_task: JoinHandle<()>,
     write_task: JoinHandle<()>,
 }
@@ -660,7 +829,7 @@ impl AudioPlaneRuntime {
     ) -> bool {
         let g = self.inner.lock().await;
         if let Some(entry) = g.connections.get(peer_id) {
-            entry.write_tx.send(message).is_ok()
+            entry.write_tx.send(Outbound::message(message)).is_ok()
         } else {
             false
         }
@@ -680,7 +849,11 @@ impl AudioPlaneRuntime {
         let g = self.inner.lock().await;
         let mut delivered = 0usize;
         for entry in g.connections.values() {
-            if entry.write_tx.send(message.clone()).is_ok() {
+            if entry
+                .write_tx
+                .send(Outbound::message(message.clone()))
+                .is_ok()
+            {
                 delivered += 1;
             }
         }
@@ -778,7 +951,7 @@ impl AudioPlaneRuntime {
             device_id: device_id.clone(),
         };
         for (_, entry) in g.connections.drain() {
-            let _ = entry.write_tx.send(goodbye.clone());
+            let _ = entry.write_tx.send(Outbound::message(goodbye.clone()));
             entry.read_task.abort();
             entry.write_task.abort();
         }
@@ -825,7 +998,8 @@ impl AudioPlaneRuntime {
                 .collect();
             for id in &outbound_ids {
                 if let Some(entry) = g.connections.remove(id) {
-                    let _ = entry.write_tx.send(goodbye.clone());
+                    let _ =
+                        entry.write_tx.send(Outbound::message(goodbye.clone()));
                     entry.read_task.abort();
                     entry.write_task.abort();
                 }
@@ -946,7 +1120,10 @@ impl AudioPlaneRuntime {
             .cloned()
             .collect();
 
-        let msg = AudioPlaneMessage::AudioFrame {
+        // Each peer gets the frame in the format it offered:
+        // `bin1` raw, or the JSON envelope. Either is built once
+        // and shared across the fan-out.
+        let json = AudioPlaneMessage::AudioFrame {
             group_id: group_id.to_string(),
             sequence: frame.sequence,
             presentation_time_ms: frame.presentation_time_ms,
@@ -955,12 +1132,59 @@ impl AudioPlaneRuntime {
             channels: frame.channels,
             payload_b64: frame.payload_b64.clone(),
         };
+        let mut bin: Option<Arc<Vec<u8>>> = None;
+        let mut bin1_bytes = || -> Option<Arc<Vec<u8>>> {
+            if bin.is_none() {
+                use base64::engine::general_purpose::STANDARD;
+                use base64::Engine as _;
+                let payload = match STANDARD.decode(&frame.payload_b64) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "audio-plane: frame payload is not base64; sent as JSON"
+                        );
+                        return None;
+                    }
+                };
+                let encoded = BinaryAudioFrame {
+                    group_id: group_id.to_string(),
+                    sequence: frame.sequence,
+                    presentation_time_ms: frame.presentation_time_ms,
+                    codec: frame.codec.clone(),
+                    rate_hz: frame.rate_hz,
+                    channels: frame.channels,
+                    payload,
+                }
+                .encode();
+                match encoded {
+                    Ok(bytes) => bin = Some(Arc::new(bytes)),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "audio-plane: bin1 encode failed; sent as JSON"
+                        );
+                        return None;
+                    }
+                }
+            }
+            bin.clone()
+        };
 
         // Per-peer wire send for remote recipients.
         let g = self.inner.lock().await;
         for recipient_id in remote_recipients {
             if let Some(entry) = g.connections.get(&recipient_id) {
-                if entry.write_tx.send(msg.clone()).is_ok() {
+                let raw = if entry.binary_frames {
+                    bin1_bytes()
+                } else {
+                    None
+                };
+                let out = match raw {
+                    Some(bytes) => Outbound::Raw(bytes),
+                    None => Outbound::message(json.clone()),
+                };
+                if entry.write_tx.send(out).is_ok() {
                     // Audible-time trace stage 5a: the
                     // moment the runtime queued the frame
                     // onto this recipient's per-peer write
@@ -1112,7 +1336,7 @@ impl AudioPlaneRuntime {
         };
         let g = self.inner.lock().await;
         if let Some(entry) = g.connections.get(&report.source_device_id) {
-            let _ = entry.write_tx.send(msg);
+            let _ = entry.write_tx.send(Outbound::message(msg));
         }
     }
 
@@ -1186,18 +1410,25 @@ impl AudioPlaneRuntime {
         )
         .await
         .map_err(|_| AudioPlaneError::Protocol("hello timeout".into()))??;
-        let (remote_id, remote_version, claimed_source_groups) = match hello {
-            AudioPlaneMessage::Hello {
-                device_id,
-                framework_version,
-                claimed_source_host_groups,
-            } => (device_id, framework_version, claimed_source_host_groups),
-            other => {
-                return Err(AudioPlaneError::Protocol(format!(
-                    "expected Hello, got {other:?}"
-                )));
-            }
-        };
+        let (remote_id, remote_version, claimed_source_groups, formats) =
+            match hello {
+                AudioPlaneMessage::Hello {
+                    device_id,
+                    framework_version,
+                    claimed_source_host_groups,
+                    formats,
+                } => (
+                    device_id,
+                    framework_version,
+                    claimed_source_host_groups,
+                    formats,
+                ),
+                other => {
+                    return Err(AudioPlaneError::Protocol(format!(
+                        "expected Hello, got {other:?}"
+                    )));
+                }
+            };
 
         if remote_id == self.local_device_id.0 {
             return Err(AudioPlaneError::Protocol(
@@ -1231,8 +1462,13 @@ impl AudioPlaneRuntime {
         // the socket. The Hello is NOT routed through this
         // channel — see the inline `write_message` call at the
         // top of `run_connection`.
-        let (write_tx, mut write_rx) =
-            mpsc::unbounded_channel::<AudioPlaneMessage>();
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Outbound>();
+        let binary_frames = formats.iter().any(|f| f == FRAME_FORMAT_BIN1);
+        tracing::info!(
+            peer = %remote_id,
+            frames = if binary_frames { FRAME_FORMAT_BIN1 } else { "json" },
+            "audio-plane: peer connected"
+        );
 
         // Spawn read + write tasks. Use Arc-shared inner so
         // both can mutate connection state.
@@ -1240,10 +1476,15 @@ impl AudioPlaneRuntime {
         let remote_for_read = remote_id.clone();
         let read_task = tokio::spawn(async move {
             loop {
-                match read_message(&mut read_half).await {
-                    Ok(msg) => {
+                match read_inbound(&mut read_half).await {
+                    Ok(Inbound::Message(msg)) => {
                         runtime_for_read
                             .observe_message(&remote_for_read, msg)
+                            .await;
+                    }
+                    Ok(Inbound::Frame(frame)) => {
+                        runtime_for_read
+                            .observe_frame(&remote_for_read, frame)
                             .await;
                     }
                     Err(e) => {
@@ -1261,8 +1502,16 @@ impl AudioPlaneRuntime {
 
         let remote_for_write = remote_id.clone();
         let write_task = tokio::spawn(async move {
-            while let Some(msg) = write_rx.recv().await {
-                match write_message(&mut write_half, &msg).await {
+            while let Some(out) = write_rx.recv().await {
+                let written = match &out {
+                    Outbound::Message(msg) => {
+                        write_message(&mut write_half, msg).await
+                    }
+                    Outbound::Raw(bytes) => {
+                        write_body(&mut write_half, bytes).await
+                    }
+                };
+                match written {
                     Ok(()) => {}
                     Err(e) => {
                         tracing::debug!(
@@ -1279,6 +1528,7 @@ impl AudioPlaneRuntime {
         let entry = ConnectionEntry {
             info: info.clone(),
             write_tx,
+            binary_frames,
             read_task,
             write_task,
         };
@@ -1347,6 +1597,7 @@ impl AudioPlaneRuntime {
             device_id: self.local_device_id.0.clone(),
             framework_version: env!("CARGO_PKG_VERSION").to_string(),
             claimed_source_host_groups: claimed,
+            formats: vec![FRAME_FORMAT_BIN1.to_string()],
         }
     }
 
@@ -1384,6 +1635,43 @@ impl AudioPlaneRuntime {
                 }
             }
         }
+    }
+
+    /// An audio frame from `peer_id`, however it came: count
+    /// it on the connection and broadcast it to the plugins.
+    async fn observe_frame(
+        self: &Arc<Self>,
+        peer_id: &str,
+        frame: BinaryAudioFrame,
+    ) {
+        {
+            let mut g = self.inner.lock().await;
+            if let Some(entry) = g.connections.get_mut(peer_id) {
+                entry.info.last_channel_activity_ms = now_ms();
+                entry.info.frames_received =
+                    entry.info.frames_received.saturating_add(1);
+            }
+        }
+        // Audible-time trace stage: the moment the runtime had
+        // the frame's bytes. Receivers echo this back via
+        // FrameTraceReport for source-side aggregation.
+        let wire_recv_ns = self.monotonic_ns();
+        let received = AudioFrameReceived {
+            from_device_id: peer_id.to_string(),
+            group_id: frame.group_id,
+            sequence: frame.sequence,
+            presentation_time_ms: frame.presentation_time_ms,
+            codec: frame.codec,
+            rate_hz: frame.rate_hz,
+            channels: frame.channels,
+            payload: frame.payload,
+            wire_recv_ns,
+        };
+        // send() ignores the count of receivers and the
+        // Err(SendError) when no subscribers exist — the
+        // runtime keeps counting frames even when no plugin
+        // listens (substrate stays correct).
+        let _ = self.audio_frame_tx.send(received);
     }
 
     async fn observe_message(
@@ -1432,7 +1720,7 @@ impl AudioPlaneRuntime {
                 };
                 let g = self.inner.lock().await;
                 if let Some(entry) = g.connections.get(peer_id) {
-                    let _ = entry.write_tx.send(response);
+                    let _ = entry.write_tx.send(Outbound::message(response));
                 }
             }
             AudioPlaneMessage::SyncResponse {
@@ -1452,48 +1740,25 @@ impl AudioPlaneRuntime {
                 channels,
                 payload_b64,
             } => {
-                {
-                    let mut g = self.inner.lock().await;
-                    if let Some(entry) = g.connections.get_mut(peer_id) {
-                        entry.info.frames_received =
-                            entry.info.frames_received.saturating_add(1);
-                    }
-                }
-                // Decode the base64 envelope once and broadcast
-                // the raw bytes to every subscribed plugin.
-                // base64::engine::general_purpose::URL_SAFE_NO_PAD
-                // matches the encoding side used by
-                // fan_out_audio_frame's caller (the source-host
-                // plugin) so the round-trip is bit-exact.
+                // Decode the base64 envelope once; the raw
+                // bytes take the same path a `bin1` frame does.
                 use base64::engine::general_purpose::STANDARD;
                 use base64::Engine as _;
                 match STANDARD.decode(&payload_b64) {
                     Ok(payload) => {
-                        // Capture the audible-time trace
-                        // wire_recv_ns stage at the exact
-                        // moment the framework finished
-                        // decoding the envelope. Receivers
-                        // echo this value back to the source-
-                        // host via the FrameTraceReport
-                        // message for source-side aggregation.
-                        let wire_recv_ns = self.monotonic_ns();
-                        let frame = AudioFrameReceived {
-                            from_device_id: peer_id.to_string(),
-                            group_id,
-                            sequence,
-                            presentation_time_ms,
-                            codec,
-                            rate_hz,
-                            channels,
-                            payload,
-                            wire_recv_ns,
-                        };
-                        // send() ignores the count of receivers
-                        // and the Err(SendError) when no
-                        // subscribers exist — the runtime keeps
-                        // counting frames even when no plugin
-                        // listens (substrate stays correct).
-                        let _ = self.audio_frame_tx.send(frame);
+                        self.observe_frame(
+                            peer_id,
+                            BinaryAudioFrame {
+                                group_id,
+                                sequence,
+                                presentation_time_ms,
+                                codec,
+                                rate_hz,
+                                channels,
+                                payload,
+                            },
+                        )
+                        .await;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -1898,7 +2163,7 @@ impl AudioPlaneRuntime {
                 group_id: group_id.clone(),
                 t1_ms: now,
             };
-            let _ = entry.write_tx.send(probe);
+            let _ = entry.write_tx.send(Outbound::message(probe));
         }
         drop(g);
         // Record pending probes after releasing the read
@@ -1975,9 +2240,11 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-async fn read_message<R: AsyncReadExt + Unpin>(
+/// One length-prefixed body from the wire: a JSON message, or
+/// a `bin1` frame when the body opens with [`BIN1_MAGIC`].
+async fn read_inbound<R: AsyncReadExt + Unpin>(
     reader: &mut R,
-) -> Result<AudioPlaneMessage, AudioPlaneError> {
+) -> Result<Inbound, AudioPlaneError> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -1989,8 +2256,40 @@ async fn read_message<R: AsyncReadExt + Unpin>(
     }
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body).await?;
+    if body[0] == BIN1_MAGIC {
+        return Ok(Inbound::Frame(BinaryAudioFrame::decode(&body)?));
+    }
     let msg: AudioPlaneMessage = serde_json::from_slice(&body)?;
-    Ok(msg)
+    Ok(Inbound::Message(msg))
+}
+
+/// A JSON message from the wire; a binary frame in its place
+/// is a protocol error (the handshake, where only JSON may
+/// come).
+async fn read_message<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> Result<AudioPlaneMessage, AudioPlaneError> {
+    match read_inbound(reader).await? {
+        Inbound::Message(msg) => Ok(msg),
+        Inbound::Frame(_) => Err(AudioPlaneError::Protocol(
+            "expected a JSON message, got a bin1 frame".into(),
+        )),
+    }
+}
+
+/// `body` to the wire behind its length prefix.
+async fn write_body<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    body: &[u8],
+) -> Result<(), AudioPlaneError> {
+    if body.len() > MAX_FRAME_BYTES {
+        return Err(AudioPlaneError::FrameTooLarge(body.len()));
+    }
+    let len = (body.len() as u32).to_be_bytes();
+    writer.write_all(&len).await?;
+    writer.write_all(body).await?;
+    writer.flush().await?;
+    Ok(())
 }
 
 async fn write_message<W: AsyncWriteExt + Unpin>(
@@ -1998,14 +2297,7 @@ async fn write_message<W: AsyncWriteExt + Unpin>(
     msg: &AudioPlaneMessage,
 ) -> Result<(), AudioPlaneError> {
     let body = serde_json::to_vec(msg)?;
-    if body.len() > MAX_FRAME_BYTES {
-        return Err(AudioPlaneError::FrameTooLarge(body.len()));
-    }
-    let len = (body.len() as u32).to_be_bytes();
-    writer.write_all(&len).await?;
-    writer.write_all(&body).await?;
-    writer.flush().await?;
-    Ok(())
+    write_body(writer, &body).await
 }
 
 // ---------------------------------------------------------------
@@ -2059,6 +2351,7 @@ mod tests {
     #[test]
     fn message_hello_round_trips() {
         let msg = AudioPlaneMessage::Hello {
+            formats: vec![],
             device_id: "abc".into(),
             framework_version: "0.1.13".into(),
             claimed_source_host_groups: vec!["g1".into(), "g2".into()],
@@ -2128,19 +2421,16 @@ mod tests {
     /// test wires two runtimes against each other so the
     /// regression is caught at compile-and-test time rather
     /// than only on a real two-node deployment.
-    #[tokio::test]
-    async fn two_runtimes_handshake_and_connect_over_loopback() {
+    async fn build_runtime(
+        local_id: &str,
+        control_port: u16,
+    ) -> Arc<AudioPlaneRuntime> {
         use evo::clock_sync::{ClockSyncConfig, ClockSyncRuntime};
         use evo::discovery::{DiscoveryConfig, DiscoveryRuntime};
         use evo::groups::GroupStore;
         use evo::happenings::HappeningBus;
         use evo::persistence::{MemoryPersistenceStore, PersistenceStore};
-        use std::time::Duration;
-
-        async fn build_runtime(
-            local_id: &str,
-            control_port: u16,
-        ) -> Arc<AudioPlaneRuntime> {
+        {
             let persistence: Arc<dyn PersistenceStore> =
                 Arc::new(MemoryPersistenceStore::default());
             let bus = Arc::new(HappeningBus::with_capacity(256));
@@ -2184,6 +2474,30 @@ mod tests {
                 DeviceId(local_id.to_string()),
             ))
         }
+    }
+
+    /// Wait until `a` sees `b` connected, or panic.
+    async fn wait_connected(a: &Arc<AudioPlaneRuntime>, b: &str) {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let seen = a.list_connections().await.iter().any(|p| {
+                p.remote_device_id == b
+                    && p.state == PeerConnectionState::Connected
+            });
+            if seen {
+                return;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("{b} never connected");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn two_runtimes_handshake_and_connect_over_loopback() {
+        use std::time::Duration;
 
         // Bind both runtimes on operator-arbitrary ports above
         // the default 7331 so the test never collides with a
@@ -2232,6 +2546,135 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// Two runtimes of this version negotiate `bin1`: a frame
+    /// fanned out by the one reaches the other's subscribers
+    /// bit-exact and counts on the connection. The wire is not
+    /// inspected here (the duplex test above does that); what
+    /// this proves is that negotiation, fan-out, read and
+    /// broadcast agree end to end over real sockets.
+    #[tokio::test]
+    async fn a_fanned_out_frame_arrives_over_loopback() {
+        let alice = build_runtime("alice", 27341).await;
+        let bob = build_runtime("bob", 27342).await;
+        alice.start().await.expect("alice.start");
+        bob.start().await.expect("bob.start");
+        let bob_addr: std::net::SocketAddr = "127.0.0.1:27342".parse().unwrap();
+        let alice_for_dial = Arc::clone(&alice);
+        tokio::spawn(async move {
+            let _ = alice_for_dial.dial_for_test(bob_addr).await;
+        });
+        wait_connected(&alice, "bob").await;
+        wait_connected(&bob, "alice").await;
+        let mut frames = bob.subscribe_audio_frames();
+        alice
+            .group_store
+            .upsert_with_id("g", "Loopback", &["alice".into(), "bob".into()])
+            .await
+            .expect("group");
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+        let pcm: Vec<u8> = (0..3840u32).map(|i| (i % 253) as u8).collect();
+        alice
+            .fan_out_audio_frame(
+                "g",
+                AudioFrameSeed {
+                    sequence: 42,
+                    presentation_time_ms: 840,
+                    codec: "pcm_s16_le".into(),
+                    rate_hz: 48_000,
+                    channels: 2,
+                    payload_b64: STANDARD.encode(&pcm),
+                },
+            )
+            .await;
+        let got = tokio::time::timeout(Duration::from_secs(3), frames.recv())
+            .await
+            .expect("a frame within 3 s")
+            .expect("a frame");
+        assert_eq!(got.from_device_id, "alice");
+        assert_eq!((got.sequence, got.presentation_time_ms), (42, 840));
+        assert_eq!((got.rate_hz, got.channels), (48_000, 2));
+        assert_eq!(got.payload, pcm);
+        let seen = bob
+            .list_connections()
+            .await
+            .into_iter()
+            .find(|p| p.remote_device_id == "alice")
+            .expect("alice");
+        assert_eq!(seen.frames_received, 1);
+    }
+
+    #[test]
+    fn bin1_round_trips_and_is_told_from_json() {
+        let frame = BinaryAudioFrame {
+            group_id: "living-room".into(),
+            sequence: 7,
+            presentation_time_ms: 123_456,
+            codec: "pcm_s16_le".into(),
+            rate_hz: 48_000,
+            channels: 2,
+            payload: (0..3840u32).map(|i| (i % 251) as u8).collect(),
+        };
+        let bytes = frame.encode().unwrap();
+        assert_eq!(bytes.len(), BIN1_HEADER_LEN + 11 + 10 + 3840);
+        assert_eq!(bytes[0], BIN1_MAGIC);
+        assert_eq!(BinaryAudioFrame::decode(&bytes).unwrap(), frame);
+        // A JSON body never starts with the magic.
+        let json = serde_json::to_vec(&AudioPlaneMessage::Goodbye {
+            device_id: "x".into(),
+        })
+        .unwrap();
+        assert_ne!(json[0], BIN1_MAGIC);
+        // A short or lying body is refused, not read past.
+        assert!(BinaryAudioFrame::decode(&bytes[..20]).is_err());
+        let mut lying = bytes.clone();
+        lying[29] = lying[29].wrapping_add(1);
+        assert!(BinaryAudioFrame::decode(&lying).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_bin1_frame_and_a_json_message_share_the_wire() {
+        let (mut a, mut b) = tokio::io::duplex(65536);
+        let frame = BinaryAudioFrame {
+            group_id: "g".into(),
+            sequence: 1,
+            presentation_time_ms: 20,
+            codec: "pcm_s16_le".into(),
+            rate_hz: 48_000,
+            channels: 2,
+            payload: vec![1, 2, 3, 4],
+        };
+        write_body(&mut a, &frame.encode().unwrap()).await.unwrap();
+        let hb = AudioPlaneMessage::Heartbeat {
+            device_id: "x".into(),
+            monotonic_ms: 1,
+            groups: vec![],
+        };
+        write_message(&mut a, &hb).await.unwrap();
+        assert_eq!(read_inbound(&mut b).await.unwrap(), Inbound::Frame(frame));
+        assert_eq!(read_inbound(&mut b).await.unwrap(), Inbound::Message(hb));
+    }
+
+    #[test]
+    fn a_hello_without_formats_still_parses_and_ours_offers_bin1() {
+        // What a peer of the version before this one sends.
+        let old = br#"{"type":"hello","device_id":"d","framework_version":"0.1.0","claimed_source_host_groups":[]}"#;
+        let msg: AudioPlaneMessage = serde_json::from_slice(old).unwrap();
+        assert!(matches!(
+            msg,
+            AudioPlaneMessage::Hello { formats, .. } if formats.is_empty()
+        ));
+        // Ours, on the wire, carries the offer; nothing else changed.
+        let ours = AudioPlaneMessage::Hello {
+            device_id: "d".into(),
+            framework_version: "x".into(),
+            claimed_source_host_groups: vec![],
+            formats: vec![FRAME_FORMAT_BIN1.into()],
+        };
+        let text = serde_json::to_string(&ours).unwrap();
+        assert!(text.contains(r#""formats":["bin1"]"#), "{text}");
     }
 
     #[tokio::test]
