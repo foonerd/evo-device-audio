@@ -611,6 +611,9 @@ impl ShelfBundle {
             "playlist.move_in_playlist" => {
                 Ok(Some(self.dispatch_playlist_move_in_playlist(req).await?))
             }
+            "playlist.import_file" => {
+                Ok(Some(self.dispatch_playlist_import_file(req).await?))
+            }
             "playlist.save_selection" => {
                 Ok(Some(self.dispatch_playlist_save_selection(req).await?))
             }
@@ -981,6 +984,24 @@ impl ShelfBundle {
             .await
             .map_err(playlist_verb_to_plugin_error)?;
         encode_ok_response(req)
+    }
+
+    async fn dispatch_playlist_import_file(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: crate::playlist_import::ImportFilePayload =
+            parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        let body = crate::playlist_import::handle_import_file(
+            &self.playlist,
+            &mut conn,
+            Path::new(crate::playlist_import::DEFAULT_UPLOADS_DIR),
+            payload,
+        )
+        .await
+        .map_err(import_error_to_plugin_error)?;
+        encode_json_response(req, &body)
     }
 
     async fn dispatch_playlist_save_selection(
@@ -1412,6 +1433,23 @@ fn playlist_verb_to_plugin_error(e: playlist::VerbError) -> PluginError {
     }
 }
 
+/// Import refusals are the operator's to fix — the file, the
+/// name, the payload — except an MPD failure, which is the
+/// playlist shelf's usual Transient.
+fn import_error_to_plugin_error(
+    e: crate::playlist_import::ImportError,
+) -> PluginError {
+    use crate::playlist_import::ImportError;
+    match e {
+        ImportError::Verb(v) => playlist_verb_to_plugin_error(v),
+        ImportError::OneSource
+        | ImportError::FormatUnknown { .. }
+        | ImportError::UploadRefused { .. }
+        | ImportError::Unparseable { .. }
+        | ImportError::Nothing { .. } => PluginError::Permanent(e.to_string()),
+    }
+}
+
 fn favourites_verb_to_plugin_error(e: favourites::VerbError) -> PluginError {
     use favourites::VerbError;
     match e {
@@ -1458,14 +1496,15 @@ mod tests {
     /// directory, so a reboot does not cost the operator the
     /// queue they had. This is the whole bundle, brought up the
     /// way load brings it up and torn down the way unload does.
-    #[tokio::test]
-    async fn shutdown_keeps_the_queue_for_the_next_load() {
-        let dir = tempfile::tempdir().unwrap();
+    /// The whole bundle, brought up the way load brings it up,
+    /// over a mock whose every connection holds the same
+    /// two-row queue with the second row playing.
+    ///
+    /// Every connection the bundle opens — observers, the
+    /// reconciler, a verb, the shutdown snapshot — sees the same
+    /// queue; which slot each lands on must not matter.
+    async fn live_bundle(dir: &Path) -> ShelfBundle {
         let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
-        // Every connection the bundle opens — observers,
-        // reconciler, the shutdown snapshot — sees the same
-        // queue; which slot the snapshot lands on must not
-        // matter.
         let behaviours = (0..12)
             .map(|_| ConnBehaviour::LiveQueue {
                 commands: Arc::clone(&commands),
@@ -1478,9 +1517,8 @@ mod tests {
             .collect();
         let (endpoint, _mock) = spawn_mock_mpd(behaviours).await;
         let subjects = Arc::new(CapturingSubjectAnnouncer::default());
-
-        let bundle = ShelfBundle::init(
-            dir.path().to_path_buf(),
+        ShelfBundle::init(
+            dir.to_path_buf(),
             subjects as Arc<dyn SubjectAnnouncer>,
             endpoint,
             short_timeouts(),
@@ -1488,7 +1526,45 @@ mod tests {
             crate::mute_cell::MuteCell::new(),
             crate::album_shuffle::ShuffleModeCell::new(),
         )
-        .await;
+        .await
+    }
+
+    fn request(verb: &str, payload: &str) -> Request {
+        Request {
+            request_type: verb.to_string(),
+            payload: payload.as_bytes().to_vec(),
+            correlation_id: 1,
+            deadline: None,
+            instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
+        }
+    }
+
+    /// `playlist.import_file` is reachable on this shelf: a
+    /// payload naming neither source is refused by the verb,
+    /// not dropped as an unmatched request type.
+    #[tokio::test]
+    async fn import_file_dispatches_on_the_playlist_shelf() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = live_bundle(dir.path()).await;
+        let req = request("playlist.import_file", r#"{"v":1,"name":"X"}"#);
+        match bundle.dispatch_request(&req).await {
+            Err(PluginError::Permanent(msg)) => {
+                assert!(msg.contains("exactly one of"), "{msg}")
+            }
+            other => panic!(
+                "import_file must dispatch and refuse a sourceless payload: \
+                 {other:?}"
+            ),
+        }
+        bundle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_keeps_the_queue_for_the_next_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = live_bundle(dir.path()).await;
         assert!(
             !dir.path().join("last-queue.toml").exists(),
             "nothing is kept until something ends"
@@ -1496,15 +1572,7 @@ mod tests {
 
         // The verb is reachable on this shelf, and with nothing
         // kept it refuses rather than falling through unmatched.
-        let req = Request {
-            request_type: "queue.restore_last_queue".to_string(),
-            payload: br#"{"v":1}"#.to_vec(),
-            correlation_id: 1,
-            deadline: None,
-            instance_id: None,
-            principal_scope: None,
-            has_step_up: false,
-        };
+        let req = request("queue.restore_last_queue", r#"{"v":1}"#);
         match bundle.dispatch_request(&req).await {
             Err(PluginError::Permanent(msg)) => {
                 assert!(msg.contains("no saved queue"), "{msg}")

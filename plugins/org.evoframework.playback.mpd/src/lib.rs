@@ -125,6 +125,7 @@ mod mute_cell;
 mod network_shares_sync;
 mod playback_supervisor;
 mod playlist;
+mod playlist_import;
 mod queue;
 mod scan_progress;
 mod selection;
@@ -272,6 +273,7 @@ const SOURCE_REQUEST_TYPES: &[&str] = &[
     "playlist.remove_from_playlist",
     "playlist.move_in_playlist",
     "playlist.save_selection",
+    "playlist.import_file",
     // audio.favourites.v1 shelf verbs
     "favourites.list_favourites",
     "favourites.is_favourite",
