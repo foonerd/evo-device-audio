@@ -5777,13 +5777,22 @@ mod tests {
         let (mut p, _mock) = loaded_plugin_with_mock(vec![
             ConnBehaviour::LiveQueue {
                 commands: Arc::clone(&commands),
+                // A playing row that is not first, so similar
+                // mode — which leads with the playing row — can
+                // never draw the order the queue already has.
+                // Interleaved so that album mode cannot either,
+                // once each row carries its album; the mock does
+                // not yet tag rows, so for albums each file is
+                // still its own album here and a drawn identity
+                // order is still possible. A pin that could pass
+                // or fail on the draw is not a pin.
                 items: vec![
                     (11, "blue/1.flac".to_string()),
-                    (12, "blue/2.flac".to_string()),
                     (21, "red/1.flac".to_string()),
+                    (12, "blue/2.flac".to_string()),
                     (22, "red/2.flac".to_string()),
                 ],
-                playing: None,
+                playing: Some(2),
             },
             ConnBehaviour::HoldAfterWelcome,
         ])
