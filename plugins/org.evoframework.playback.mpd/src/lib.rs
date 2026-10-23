@@ -3055,7 +3055,7 @@ impl Respondent for MpdPlaybackPlugin {
                 "set_volume" => self.handle_set_volume(req).await,
                 "set_mute" => self.handle_set_bool(req, "set_mute").await,
                 "set_repeat" => self.handle_set_bool(req, "set_repeat").await,
-                "set_shuffle" => self.handle_set_bool(req, "set_shuffle").await,
+                "set_shuffle" => self.handle_set_shuffle(req).await,
                 "set_single" => self.handle_set_bool(req, "set_single").await,
                 "set_consume" => self.handle_set_bool(req, "set_consume").await,
                 "get_now_playing" => self.handle_get_now_playing(req).await,
@@ -3283,6 +3283,62 @@ impl MpdPlaybackPlugin {
     /// The payload shape is uniform (`{ "v": 1, "enabled": bool
     /// }`); the verb name selects which [`PlaybackCommand`]
     /// variant is dispatched.
+    /// `set_shuffle` on the shelf: off, by track, or by album.
+    ///
+    /// The glass sends `{ v, enabled }` and that is the fielded
+    /// contract — `true` is track shuffle, `false` is off. It is
+    /// the only shape an existing glass knows, so it keeps
+    /// working byte for byte.
+    ///
+    /// `{ v, mode }` is how albums are asked for. The mode went
+    /// in on the course-correction payload first, which the
+    /// operator never sends: the glass calls this verb, so a word
+    /// here was a parse failure and album shuffle was
+    /// unreachable from the only surface an operator has.
+    ///
+    /// Exactly one of the two is given. Both at once is refused
+    /// rather than resolved by precedence: a caller sending both
+    /// does not agree with itself, and guessing which half it
+    /// meant is how a device ends up in a mode nobody chose.
+    async fn handle_set_shuffle(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SetShufflePayload =
+            parse_versioned_payload(req, "set_shuffle")?;
+        let mode = match (payload.mode.as_deref(), payload.enabled) {
+            (Some(raw), None) => crate::album_shuffle::ShuffleMode::parse(raw)
+                .ok_or_else(|| {
+                    PluginError::Permanent(format!(
+                        "set_shuffle mode must be 'off', 'tracks' or \
+                             'albums', got {raw:?}"
+                    ))
+                })?,
+            (None, Some(true)) => crate::album_shuffle::ShuffleMode::Tracks,
+            (None, Some(false)) => crate::album_shuffle::ShuffleMode::Off,
+            (Some(_), Some(_)) => {
+                return Err(PluginError::Permanent(
+                    "set_shuffle takes either 'enabled' or 'mode', not \
+                     both"
+                        .to_string(),
+                ));
+            }
+            (None, None) => {
+                return Err(PluginError::Permanent(
+                    "set_shuffle needs 'enabled' (bool) or 'mode' \
+                     ('off' / 'tracks' / 'albums')"
+                        .to_string(),
+                ));
+            }
+        };
+        let supervisor = self.active_supervisor("set_shuffle")?;
+        supervisor
+            .command(PlaybackCommand::SetShuffle(mode))
+            .await
+            .map_err(playback_error_to_plugin_error)?;
+        encode_simple_ok(req)
+    }
+
     async fn handle_set_bool(
         &self,
         req: &Request,
@@ -3292,14 +3348,6 @@ impl MpdPlaybackPlugin {
         let cmd = match verb_name {
             "set_mute" => PlaybackCommand::SetMute(payload.enabled),
             "set_repeat" => PlaybackCommand::SetRepeat(payload.enabled),
-            // The typed bool verb keeps its meaning: enabled is
-            // track shuffle, exactly as the fielded glass sends
-            // it. Albums arrive through the string payload.
-            "set_shuffle" => PlaybackCommand::SetShuffle(if payload.enabled {
-                crate::album_shuffle::ShuffleMode::Tracks
-            } else {
-                crate::album_shuffle::ShuffleMode::Off
-            }),
             "set_single" => PlaybackCommand::SetSingle(payload.enabled),
             "set_consume" => PlaybackCommand::SetConsume(payload.enabled),
             other => {
@@ -3940,6 +3988,24 @@ impl HasPayloadVersion for SeekByDeltaPayload {
 /// `set_mute`, `set_repeat`, `set_shuffle`, `set_single`,
 /// `set_consume`. Uniform shape lets one struct + one handler
 /// (`handle_set_bool`) drive every toggle verb.
+#[derive(Debug, serde::Deserialize)]
+struct SetShufflePayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    /// The fielded shape. `true` is track shuffle.
+    #[serde(default)]
+    enabled: Option<bool>,
+    /// The mode by name: `off`, `tracks`, `albums`.
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+impl HasPayloadVersion for SetShufflePayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct SetBoolPayload {
     #[serde(default = "default_payload_version")]
@@ -5672,6 +5738,111 @@ mod tests {
     /// Build a respondent request for the supplied verb +
     /// JSON payload. Mirrors how the framework's source-verb
     /// dispatcher constructs the wire envelope.
+    /// The shelf verb is the only surface an operator has.
+    ///
+    /// `albums` went in on the course-correction payload first,
+    /// which the glass never sends — so a word on this verb was a
+    /// parse failure and album shuffle was unreachable. These
+    /// drive `handle_request` the way the glass does.
+    async fn shelf_set_shuffle(
+        payload: Value,
+    ) -> (Result<Response, PluginError>, Vec<String>) {
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut p, _mock) = loaded_plugin_with_mock(vec![
+            ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![
+                    (11, "blue/1.flac".to_string()),
+                    (12, "blue/2.flac".to_string()),
+                    (21, "red/1.flac".to_string()),
+                    (22, "red/2.flac".to_string()),
+                ],
+                playing: None,
+            },
+            ConnBehaviour::HoldAfterWelcome,
+        ])
+        .await;
+        let reporter: Arc<dyn CustodyStateReporter> =
+            Arc::new(CapturingReporter::default());
+        let handle = p.take_custody(assignment(reporter, 11)).await.unwrap();
+        let got = p
+            .handle_request(&source_request("set_shuffle", payload))
+            .await;
+        let seen = commands.lock().unwrap().clone();
+        p.release_custody(handle).await.unwrap();
+        (got, seen)
+    }
+
+    /// A shelf set_shuffle of albums reorders the queue and
+    /// leaves MPD random off.
+    #[tokio::test]
+    async fn shelf_set_shuffle_albums_reorders_with_random_off() {
+        let (got, seen) =
+            shelf_set_shuffle(json!({ "v": 1, "mode": "albums" })).await;
+        assert!(
+            got.is_ok(),
+            "the operator's surface must accept albums: {got:?}"
+        );
+        assert!(
+            seen.iter().any(|c| c == "random \"0\""),
+            "album order is the queue's: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|c| c != "random \"1\""),
+            "album mode must not hand the order back to MPD: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|c| c.starts_with("moveid ")),
+            "the chosen album order must reach the queue: {seen:?}"
+        );
+    }
+
+    /// A shelf set_shuffle of { enabled: true } is still track
+    /// shuffle. This is the shape the fielded glass sends.
+    #[tokio::test]
+    async fn shelf_set_shuffle_enabled_true_is_still_track_shuffle() {
+        let (got, seen) =
+            shelf_set_shuffle(json!({ "v": 1, "enabled": true })).await;
+        assert!(got.is_ok(), "the fielded shape must keep working: {got:?}");
+        assert!(
+            seen.iter().any(|c| c == "random \"1\""),
+            "enabled true is MPD random: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|c| !c.starts_with("moveid ")),
+            "track shuffle must not reorder the operator's queue: {seen:?}"
+        );
+
+        let (got_off, seen_off) =
+            shelf_set_shuffle(json!({ "v": 1, "enabled": false })).await;
+        assert!(got_off.is_ok(), "{got_off:?}");
+        assert!(
+            seen_off.iter().any(|c| c == "random \"0\"")
+                && seen_off.iter().all(|c| !c.starts_with("moveid ")),
+            "enabled false is plain off: {seen_off:?}"
+        );
+    }
+
+    /// A payload that does not agree with itself, or says
+    /// nothing, is refused rather than resolved by precedence.
+    #[tokio::test]
+    async fn shelf_set_shuffle_refuses_an_ambiguous_or_empty_payload() {
+        for payload in [
+            json!({ "v": 1, "enabled": true, "mode": "albums" }),
+            json!({ "v": 1 }),
+            json!({ "v": 1, "mode": "smart" }),
+        ] {
+            let (got, seen) = shelf_set_shuffle(payload.clone()).await;
+            assert!(got.is_err(), "{payload} must be refused");
+            assert!(
+                seen.iter()
+                    .all(|c| !c.starts_with("random ")
+                        && !c.starts_with("moveid ")),
+                "{payload} must change nothing: {seen:?}"
+            );
+        }
+    }
+
     fn source_request(verb: &str, payload: Value) -> Request {
         Request {
             request_type: verb.to_string(),
