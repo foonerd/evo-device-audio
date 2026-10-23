@@ -617,6 +617,9 @@ impl ShelfBundle {
             "playlist.export_file" => {
                 Ok(Some(self.dispatch_playlist_export_file(req).await?))
             }
+            "playlist.duplicate" => {
+                Ok(Some(self.dispatch_playlist_duplicate(req).await?))
+            }
             "playlist.save_selection" => {
                 Ok(Some(self.dispatch_playlist_save_selection(req).await?))
             }
@@ -1022,6 +1025,23 @@ impl ShelfBundle {
         .await
         .map_err(playlist_verb_to_plugin_error)?;
         encode_json_response(req, &body)
+    }
+
+    async fn dispatch_playlist_duplicate(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: crate::playlist_duplicate::DuplicatePayload =
+            parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        crate::playlist_duplicate::handle_duplicate(
+            &self.playlist,
+            &mut conn,
+            payload,
+        )
+        .await
+        .map_err(playlist_verb_to_plugin_error)?;
+        encode_ok_response(req)
     }
 
     async fn dispatch_playlist_save_selection(
@@ -1594,6 +1614,28 @@ mod tests {
             }
             other => panic!(
                 "export_file must dispatch and refuse a bad name: {other:?}"
+            ),
+        }
+        bundle.shutdown().await;
+    }
+
+    /// `playlist.duplicate` is reachable on this shelf: the
+    /// favourites name is refused by the verb, not dropped as
+    /// unmatched.
+    #[tokio::test]
+    async fn duplicate_dispatches_on_the_playlist_shelf() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = live_bundle(dir.path()).await;
+        let req = request(
+            "playlist.duplicate",
+            r#"{"v":1,"source":"__favourites__","target":"Copy"}"#,
+        );
+        match bundle.dispatch_request(&req).await {
+            Err(PluginError::Permanent(msg)) => {
+                assert!(msg.contains("favourites"), "{msg}")
+            }
+            other => panic!(
+                "duplicate must dispatch and refuse favourites: {other:?}"
             ),
         }
         bundle.shutdown().await;
