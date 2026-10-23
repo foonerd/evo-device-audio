@@ -67,6 +67,7 @@ request_types = [
     "playlist.move_in_playlist",
     "playlist.save_selection",
     "playlist.import_file",
+    "playlist.export_file",
 ]
 
 [[stockings]]
@@ -261,6 +262,7 @@ request_types = [
     "playlist.move_in_playlist",
     "playlist.save_selection",
     "playlist.import_file",
+    "playlist.export_file",
     # audio.favourites.v1 shelf verbs
     "favourites.list_favourites",
     "favourites.is_favourite",

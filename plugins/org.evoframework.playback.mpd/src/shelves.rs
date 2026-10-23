@@ -614,6 +614,9 @@ impl ShelfBundle {
             "playlist.import_file" => {
                 Ok(Some(self.dispatch_playlist_import_file(req).await?))
             }
+            "playlist.export_file" => {
+                Ok(Some(self.dispatch_playlist_export_file(req).await?))
+            }
             "playlist.save_selection" => {
                 Ok(Some(self.dispatch_playlist_save_selection(req).await?))
             }
@@ -1001,6 +1004,23 @@ impl ShelfBundle {
         )
         .await
         .map_err(import_error_to_plugin_error)?;
+        encode_json_response(req, &body)
+    }
+
+    async fn dispatch_playlist_export_file(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: crate::playlist_export::ExportFilePayload =
+            parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        let body = crate::playlist_export::handle_export_file(
+            &self.playlist,
+            &mut conn,
+            payload,
+        )
+        .await
+        .map_err(playlist_verb_to_plugin_error)?;
         encode_json_response(req, &body)
     }
 
@@ -1556,6 +1576,24 @@ mod tests {
             other => panic!(
                 "import_file must dispatch and refuse a sourceless payload: \
                  {other:?}"
+            ),
+        }
+        bundle.shutdown().await;
+    }
+
+    /// `playlist.export_file` is reachable on this shelf: a bad
+    /// name is refused by the verb, not dropped as unmatched.
+    #[tokio::test]
+    async fn export_file_dispatches_on_the_playlist_shelf() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = live_bundle(dir.path()).await;
+        let req = request("playlist.export_file", r#"{"v":1,"name":"a/b"}"#);
+        match bundle.dispatch_request(&req).await {
+            Err(PluginError::Permanent(msg)) => {
+                assert!(msg.contains("invalid"), "{msg}")
+            }
+            other => panic!(
+                "export_file must dispatch and refuse a bad name: {other:?}"
             ),
         }
         bundle.shutdown().await;
