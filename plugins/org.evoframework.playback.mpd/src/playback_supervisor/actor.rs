@@ -410,6 +410,57 @@ pub(crate) async fn spawn(
 /// the engineering bar's "no silent failure" rule (the warning
 /// is observable) without making MPD-version-skew a session-
 /// abort condition.
+/// Write the chosen album order into the queue.
+///
+/// The choice is made by [`crate::album_shuffle::album_shuffle_plan`]
+/// — pure, seeded, and the only place album order is decided. This
+/// carries it out: `moveid` per album, in ascending target
+/// position, so each song lands where no later move disturbs it.
+///
+/// Best-effort per move. A queue that changed under us (the
+/// operator removing a track mid-shuffle) makes one move fail, and
+/// the ones already applied are still a valid queue — every song is
+/// still present and every album still contiguous up to that
+/// point. Refusing the whole gesture because the eleventh move
+/// raced would leave the operator with shuffle reported on and a
+/// queue in the old order.
+async fn apply_album_shuffle(cmd_conn: &mut MpdConnection) {
+    let items = match cmd_conn.playlistinfo().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "could not read the queue; album order not written and \
+                 the queue plays as it stands"
+            );
+            return;
+        }
+    };
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let plan = crate::album_shuffle::album_shuffle_plan(&items, seed);
+    if plan.is_empty() {
+        // Fewer than two albums, or already in the chosen order.
+        return;
+    }
+    for mv in &plan {
+        if let Err(e) = cmd_conn.moveid(mv.id, mv.to_position).await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                id = mv.id,
+                to_position = mv.to_position,
+                error = %e,
+                "album order partly written; the queue is consistent but \
+                 not fully reordered"
+            );
+            return;
+        }
+    }
+}
+
 async fn apply_audio_protocol_settings(
     cmd_conn: &mut MpdConnection,
     settings: AudioProtocolSettings,
@@ -1081,10 +1132,19 @@ async fn dispatch_command(
         PlaybackCommand::SetRepeat(enabled) => {
             cmd_conn.set_repeat(enabled).await
         }
-        PlaybackCommand::SetShuffle(enabled) => {
-            // Operator-facing name `shuffle` maps to MPD's
-            // `random` mode primitive.
-            cmd_conn.set_random(enabled).await
+        PlaybackCommand::SetShuffle(mode) => {
+            // Track shuffle is MPD's own `random`. Album order is
+            // not in the protocol, so it is written into the
+            // queue and MPD plays the queue in order: the
+            // physical order IS the playback order, which is how
+            // playback follows the choice without this plugin
+            // sitting in the path of every song boundary.
+            let res = cmd_conn.set_random(mode.mpd_random()).await;
+            if res.is_ok() && mode == crate::album_shuffle::ShuffleMode::Albums
+            {
+                apply_album_shuffle(cmd_conn).await;
+            }
+            res
         }
         PlaybackCommand::SetSingle(enabled) => {
             cmd_conn.set_single(enabled).await
@@ -1661,6 +1721,128 @@ mod tests {
         });
         Box::leak(Box::new(tx));
         rx
+    }
+
+    /// Album shuffle reaches MPD as a reordered queue, not as a
+    /// random walk.
+    ///
+    /// MPD has no album mode. Track shuffle is its `random`;
+    /// album order is written into the queue and MPD plays the
+    /// queue in order, so album mode wants `random 0` and a run
+    /// of `moveid`. Setting `random 1` for albums would hand the
+    /// chosen order straight back to MPD to scramble.
+    #[tokio::test]
+    async fn album_shuffle_reorders_the_queue_with_random_off() {
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) = spawn_mock_mpd(vec![
+            ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![
+                    (11, "blue/1.flac".to_string()),
+                    (12, "blue/2.flac".to_string()),
+                    (21, "red/1.flac".to_string()),
+                    (22, "red/2.flac".to_string()),
+                ],
+                playing: None,
+            },
+            ConnBehaviour::HoldAfterWelcome,
+        ])
+        .await;
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let reporter_dyn: Arc<dyn CustodyStateReporter> = reporter.clone();
+        let handle = spawn(
+            endpoint,
+            short_timeouts(),
+            test_custody_handle(),
+            reporter_dyn,
+            SubjectEmitter::null(),
+            null_protocol_settings_rx(),
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        handle
+            .command(PlaybackCommand::SetShuffle(
+                crate::album_shuffle::ShuffleMode::Albums,
+            ))
+            .await
+            .expect("album shuffle");
+
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c == "random \"0\""),
+            "album order is the queue's, so MPD's random stays off: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|c| c != "random \"1\""),
+            "album mode must not hand the order back to MPD to \
+             scramble: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|c| c.starts_with("moveid ")),
+            "the chosen album order must be written into the queue: \
+             {seen:?}"
+        );
+        handle.shutdown().await;
+    }
+
+    /// Track shuffle is still MPD's own random, and writes no
+    /// moves. The fielded mode must not start rewriting queues.
+    #[tokio::test]
+    async fn track_shuffle_is_still_mpd_random_and_moves_nothing() {
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) = spawn_mock_mpd(vec![
+            ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![
+                    (11, "blue/1.flac".to_string()),
+                    (21, "red/1.flac".to_string()),
+                ],
+                playing: None,
+            },
+            ConnBehaviour::HoldAfterWelcome,
+        ])
+        .await;
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let reporter_dyn: Arc<dyn CustodyStateReporter> = reporter.clone();
+        let handle = spawn(
+            endpoint,
+            short_timeouts(),
+            test_custody_handle(),
+            reporter_dyn,
+            SubjectEmitter::null(),
+            null_protocol_settings_rx(),
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        handle
+            .command(PlaybackCommand::SetShuffle(
+                crate::album_shuffle::ShuffleMode::Tracks,
+            ))
+            .await
+            .expect("track shuffle");
+
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c == "random \"1\""),
+            "track shuffle is MPD's random: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|c| !c.starts_with("moveid ")),
+            "track shuffle must not reorder the operator's queue: {seen:?}"
+        );
+        handle.shutdown().await;
     }
 
     /// The operator's ReplayGain mode reaches MPD.

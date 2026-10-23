@@ -106,6 +106,7 @@
 // every `impl Plugin` / `impl Warden` method.
 #![allow(clippy::manual_async_fn)]
 
+mod album_shuffle;
 mod asound_watcher;
 mod availability;
 mod config;
@@ -2101,12 +2102,14 @@ fn parse_correction(
                 other
             ))),
         },
-        "set_shuffle" => match trimmed {
-            "1" | "true" => Ok(PlaybackCommand::SetShuffle(true)),
-            "0" | "false" => Ok(PlaybackCommand::SetShuffle(false)),
-            other => Err(PluginError::Permanent(format!(
-                "set_shuffle payload must be '0'/'1' or 'true'/'false', got {:?}",
-                other
+        "set_shuffle" => match crate::album_shuffle::ShuffleMode::parse(
+            trimmed,
+        ) {
+            Some(mode) => Ok(PlaybackCommand::SetShuffle(mode)),
+            None => Err(PluginError::Permanent(format!(
+                "set_shuffle payload must be '0'/'1', 'true'/'false', \
+                 'tracks' or 'albums', got {:?}",
+                trimmed
             ))),
         },
         "set_single" => match trimmed {
@@ -3289,7 +3292,14 @@ impl MpdPlaybackPlugin {
         let cmd = match verb_name {
             "set_mute" => PlaybackCommand::SetMute(payload.enabled),
             "set_repeat" => PlaybackCommand::SetRepeat(payload.enabled),
-            "set_shuffle" => PlaybackCommand::SetShuffle(payload.enabled),
+            // The typed bool verb keeps its meaning: enabled is
+            // track shuffle, exactly as the fielded glass sends
+            // it. Albums arrive through the string payload.
+            "set_shuffle" => PlaybackCommand::SetShuffle(if payload.enabled {
+                crate::album_shuffle::ShuffleMode::Tracks
+            } else {
+                crate::album_shuffle::ShuffleMode::Off
+            }),
             "set_single" => PlaybackCommand::SetSingle(payload.enabled),
             "set_consume" => PlaybackCommand::SetConsume(payload.enabled),
             other => {
@@ -4812,13 +4822,36 @@ mod tests {
 
     #[test]
     fn parse_set_shuffle_true_and_false() {
+        use crate::album_shuffle::ShuffleMode;
+        // The fielded spelling keeps its meaning: `1` is track
+        // shuffle, not the album mode.
         assert_eq!(
             parse_correction(&correction("set_shuffle", b"1", 1)).unwrap(),
-            PlaybackCommand::SetShuffle(true)
+            PlaybackCommand::SetShuffle(ShuffleMode::Tracks)
         );
         assert_eq!(
             parse_correction(&correction("set_shuffle", b"0", 1)).unwrap(),
-            PlaybackCommand::SetShuffle(false)
+            PlaybackCommand::SetShuffle(ShuffleMode::Off)
+        );
+    }
+
+    /// The operator can ask for albums over the same verb.
+    #[test]
+    fn parse_set_shuffle_accepts_albums() {
+        use crate::album_shuffle::ShuffleMode;
+        for raw in [&b"albums"[..], &b"album"[..]] {
+            assert_eq!(
+                parse_correction(&correction("set_shuffle", raw, 1)).unwrap(),
+                PlaybackCommand::SetShuffle(ShuffleMode::Albums),
+                "{:?}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+        // And a word this build does not implement is refused
+        // rather than silently read as one of the three.
+        assert!(
+            parse_correction(&correction("set_shuffle", b"smart", 1)).is_err(),
+            "an unknown shuffle mode must be refused"
         );
     }
 
