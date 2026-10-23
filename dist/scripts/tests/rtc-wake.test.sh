@@ -137,6 +137,20 @@ if [[ -z "$VISUDO" ]]; then
     # tool that was never shown able to report a positive.
     bad "visudo not found — the sudoers gate could not run"
 else
+    # The shipped byte, not the rendered copy. This file ended on
+    # `EVO_RTC_WAKE` with no newline after it; visudo rejects that
+    # outright - "missing line terminator at end of file" - and
+    # bootstrap runs the same check and exits instead of
+    # installing, so the grant never landed. The visudo gate below
+    # catches it today, but only because this host's visudo is
+    # strict about it. Naming the byte says which one is missing
+    # rather than only that the parse failed.
+    if [[ -n "$(tail -c1 "$SUDOERS")" ]]; then
+        bad "sudoers template does not end with a newline"
+    else
+        ok "sudoers template ends with a newline"
+    fi
+
     rendered="$WORK/evo-rtc-wake"
     sed "s|@EVO_SERVICE_USER@|$DUMMY_SERVICE_USER|g" "$SUDOERS" > "$rendered"
 
