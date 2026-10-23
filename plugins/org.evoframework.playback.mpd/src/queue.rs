@@ -70,6 +70,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Mutex;
 
+use crate::last_queue::{LastQueue, LastQueueStore, SnapshotReason};
 use crate::library::LIBRARY_PAYLOAD_VERSION;
 use crate::mpd::{MpdConnection, MpdLibraryEntry, MpdQueueItem, PlayState};
 use crate::skip_traversal::{PlayableQueueItem, SkipOutcome, SkipTraversal};
@@ -121,6 +122,9 @@ pub(crate) struct QueueContext {
     /// The shuffle mode the operator asked for; published
     /// beside MPD's own random flag on now_playing.
     pub(crate) shuffle: crate::album_shuffle::ShuffleModeCell,
+    /// Where the last queue is kept for `restore_last_queue`.
+    /// Written before a clear and at shutdown.
+    pub(crate) last_queue: LastQueueStore,
     /// In-memory mirror of the last published envelope, used
     /// by `queue.get_queue` to satisfy read-then-subscribe
     /// without round-tripping through the framework's subject
@@ -162,9 +166,20 @@ impl QueueContext {
             skip,
             mute,
             shuffle,
+            last_queue: LastQueueStore::default(),
             mirror: Arc::new(Mutex::new(None)),
             shelf_dispatcher,
         }
+    }
+
+    /// Keep the last queue here. Without this the context keeps
+    /// none, and `restore_last_queue` has nothing to restore.
+    pub(crate) fn with_last_queue_store(
+        mut self,
+        store: LastQueueStore,
+    ) -> Self {
+        self.last_queue = store;
+        self
     }
 }
 
@@ -701,6 +716,11 @@ pub(crate) enum VerbError {
     /// empty.
     #[error("queue.play_from_position: queue is empty")]
     QueueEmpty,
+    /// `queue.restore_last_queue` found no kept queue: nothing
+    /// has been cleared or shut down with a queue since the
+    /// plugin's state directory was last empty.
+    #[error("queue.restore_last_queue: no saved queue to restore")]
+    NoSavedQueue,
     /// MPD-side error during the verb's wire dispatch.
     #[error("queue.{verb}: MPD error: {reason}")]
     Mpd { verb: String, reason: String },
@@ -1826,16 +1846,155 @@ pub(crate) async fn handle_move_queue_item(
     Ok(())
 }
 
-/// `queue.clear_queue` — empty the queue.
+/// `queue.clear_queue` — empty the queue, keeping it first.
+///
+/// The snapshot is taken before `clear`, so the queue the
+/// operator is about to lose is the one `restore_last_queue`
+/// gives back. A snapshot that cannot be written is reported and
+/// does not stop the clear: the operator asked for an empty
+/// queue, and refusing that because a file would not write
+/// would be a different gesture failing.
 pub(crate) async fn handle_clear_queue(
     ctx: &QueueContext,
     conn: &mut MpdConnection,
 ) -> Result<(), VerbError> {
+    if let Err(e) = snapshot_last_queue(ctx, conn, SnapshotReason::Clear).await
+    {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            error = %e,
+            "clear_queue: the queue could not be kept before clearing; \
+             restore_last_queue will give back the one kept before it"
+        );
+    }
     conn.clear().await.map_err(|e| VerbError::Mpd {
         verb: "clear_queue".to_string(),
         reason: e.to_string(),
     })?;
     publish_queue(ctx, conn).await;
+    Ok(())
+}
+
+/// Keep the queue as it stands: every row in order, and the
+/// playing position when something is playing or paused.
+///
+/// An empty queue is not kept. Clearing an empty queue, or
+/// shutting down with one, must not write over the queue the
+/// operator could still restore. Returns whether a snapshot was
+/// written.
+pub(crate) async fn snapshot_last_queue(
+    ctx: &QueueContext,
+    conn: &mut MpdConnection,
+    reason: SnapshotReason,
+) -> Result<bool, VerbError> {
+    if !ctx.last_queue.is_enabled() {
+        return Ok(false);
+    }
+    let mpd = |e: crate::mpd::MpdError, what: &str| VerbError::Mpd {
+        verb: "snapshot_last_queue".to_string(),
+        reason: format!("{what}: {e}"),
+    };
+    let items = conn
+        .playlistinfo()
+        .await
+        .map_err(|e| mpd(e, "playlistinfo"))?;
+    if items.is_empty() {
+        return Ok(false);
+    }
+    let status = conn.status().await.map_err(|e| mpd(e, "status"))?;
+    let current = match status.state {
+        PlayState::Playing | PlayState::Paused => status.song_position,
+        PlayState::Stopped => None,
+    };
+    let last = LastQueue {
+        v: crate::last_queue::LAST_QUEUE_VERSION,
+        taken_at: crate::last_queue::now_unix(),
+        reason,
+        uris: items.into_iter().map(|i| i.file_path).collect(),
+        current,
+    };
+    ctx.last_queue
+        .save(&last)
+        .await
+        .map_err(|e| VerbError::Mpd {
+            verb: "snapshot_last_queue".to_string(),
+            reason: e.to_string(),
+        })?;
+    tracing::info!(
+        plugin = PLUGIN_NAME,
+        reason = ?reason,
+        rows = last.uris.len(),
+        current = ?last.current,
+        "last queue kept"
+    );
+    Ok(true)
+}
+
+/// `queue.restore_last_queue` — put the kept queue back.
+///
+/// The queue is replaced: `clear`, then `add` per kept row in
+/// order. A row MPD refuses (a path that no longer exists, a
+/// source that is gone) is skipped with a warning and the rest
+/// still go back — a queue with one dead row is a queue, and the
+/// operator sees the row that did not return rather than nothing.
+/// When every row is refused the verb fails, since nothing was
+/// restored.
+///
+/// The player is cued, not started: when the snapshot held a
+/// playing position, that row is selected and paused, so
+/// transport and now_playing describe the restored queue and the
+/// operator presses play. A restore must not start sound on its
+/// own — it may be the first gesture after a boot.
+pub(crate) async fn handle_restore_last_queue(
+    ctx: &QueueContext,
+    conn: &mut MpdConnection,
+) -> Result<(), VerbError> {
+    let Some(last) = ctx.last_queue.load().await else {
+        return Err(VerbError::NoSavedQueue);
+    };
+    let mpd = |e: crate::mpd::MpdError, what: &str| VerbError::Mpd {
+        verb: "restore_last_queue".to_string(),
+        reason: format!("{what}: {e}"),
+    };
+    conn.clear().await.map_err(|e| mpd(e, "clear"))?;
+    let mut restored = 0usize;
+    for uri in &last.uris {
+        match conn.add(uri).await {
+            Ok(()) => restored += 1,
+            Err(e) => tracing::warn!(
+                plugin = PLUGIN_NAME,
+                uri = %uri,
+                error = %e,
+                "restore_last_queue: row refused by MPD; skipped"
+            ),
+        }
+    }
+    if restored == 0 {
+        publish_queue(ctx, conn).await;
+        return Err(VerbError::Mpd {
+            verb: "restore_last_queue".to_string(),
+            reason: format!(
+                "none of the {} kept rows could be added",
+                last.uris.len()
+            ),
+        });
+    }
+    if let Some(pos) = last.current {
+        if (pos as usize) < restored {
+            conn.play_position(pos).await.map_err(|e| mpd(e, "play"))?;
+            conn.pause(true).await.map_err(|e| mpd(e, "pause"))?;
+        }
+    }
+    tracing::info!(
+        plugin = PLUGIN_NAME,
+        reason = ?last.reason,
+        kept = last.uris.len(),
+        restored,
+        cued = ?last.current,
+        "last queue restored"
+    );
+    publish_queue(ctx, conn).await;
+    publish_now_playing_after_transport(ctx, conn, "restore_last_queue").await;
     Ok(())
 }
 
@@ -2558,6 +2717,242 @@ mod tests {
             .into_iter()
             .map(|i| i.file_path)
             .collect()
+    }
+
+    // ===== the last queue: kept on clear, put back on restore =====
+
+    /// A queue context over a live-queue mock whose last queue is
+    /// kept in `dir`, with the mock's command log and the
+    /// announcer the publishes land on.
+    async fn last_queue_harness(
+        dir: &std::path::Path,
+        items: Vec<(u32, String)>,
+        playing: Option<u32>,
+    ) -> (
+        QueueContext,
+        MpdConnection,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        Arc<RecordingAnn>,
+    ) {
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items,
+                playing,
+            }])
+            .await;
+        let conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+        let ann = Arc::new(RecordingAnn::default());
+        let registry = SourceRegistry::new();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+            crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
+        )
+        .with_last_queue_store(LastQueueStore::at(dir.join("last-queue.toml")));
+        (ctx, conn, commands, ann)
+    }
+
+    fn three_rows() -> Vec<(u32, String)> {
+        vec![
+            (1, "INTERNAL/a/1.flac".to_string()),
+            (2, "INTERNAL/b/2.flac".to_string()),
+            (3, "USB/Stick/c/3.flac".to_string()),
+        ]
+    }
+
+    /// A clear keeps the queue first: every row in order, and
+    /// where the player was. The snapshot is read before `clear`
+    /// is sent, or it would be a snapshot of nothing.
+    #[tokio::test]
+    async fn clearing_the_queue_keeps_it_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut conn, commands, _ann) =
+            last_queue_harness(dir.path(), three_rows(), Some(1)).await;
+
+        handle_clear_queue(&ctx, &mut conn).await.unwrap();
+
+        assert!(queue_paths(&mut conn).await.is_empty(), "the clear cleared");
+        let kept = ctx.last_queue.load().await.expect("the queue was kept");
+        assert_eq!(
+            kept.uris,
+            vec![
+                "INTERNAL/a/1.flac",
+                "INTERNAL/b/2.flac",
+                "USB/Stick/c/3.flac"
+            ]
+        );
+        assert_eq!(kept.current, Some(1), "where the player was");
+        assert_eq!(kept.reason, SnapshotReason::Clear);
+        let seen = commands.lock().unwrap().clone();
+        let read = seen.iter().position(|c| c.starts_with("playlistinfo"));
+        let clear = seen.iter().position(|c| c == "clear");
+        assert!(
+            read.zip(clear).is_some_and(|(r, c)| r < c),
+            "the queue is read before it is cleared: {seen:?}"
+        );
+    }
+
+    /// Clearing an empty queue keeps nothing, so the queue kept
+    /// before it is still the one to restore.
+    #[tokio::test]
+    async fn an_empty_queue_is_not_kept_over_a_full_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let earlier = LastQueue {
+            v: crate::last_queue::LAST_QUEUE_VERSION,
+            taken_at: 1,
+            reason: SnapshotReason::Clear,
+            uris: vec!["INTERNAL/kept.flac".to_string()],
+            current: None,
+        };
+        let (ctx, mut conn, _commands, _ann) =
+            last_queue_harness(dir.path(), Vec::new(), None).await;
+        ctx.last_queue.save(&earlier).await.unwrap();
+
+        handle_clear_queue(&ctx, &mut conn).await.unwrap();
+
+        assert_eq!(
+            ctx.last_queue.load().await,
+            Some(earlier),
+            "an empty clear must not cost the operator the kept queue"
+        );
+    }
+
+    /// A stopped player is kept without a position, and comes
+    /// back stopped: nothing is cued that was not playing.
+    #[tokio::test]
+    async fn a_stopped_queue_is_kept_without_a_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut conn, commands, _ann) =
+            last_queue_harness(dir.path(), three_rows(), None).await;
+        handle_clear_queue(&ctx, &mut conn).await.unwrap();
+        assert_eq!(ctx.last_queue.load().await.unwrap().current, None);
+
+        handle_restore_last_queue(&ctx, &mut conn).await.unwrap();
+        let seen = commands.lock().unwrap().clone();
+        // `playlistinfo` is a read, not a transport verb.
+        assert!(
+            seen.iter().all(|c| {
+                c != "play"
+                    && !c.starts_with("play ")
+                    && !c.starts_with("pause")
+            }),
+            "a stopped queue comes back stopped: {seen:?}"
+        );
+        assert_eq!(queue_paths(&mut conn).await.len(), 3);
+    }
+
+    /// Restore puts the kept queue back in order and cues the
+    /// row that was playing — selected and paused, so transport
+    /// and now_playing describe the restored queue without a
+    /// restore starting sound on its own.
+    #[tokio::test]
+    async fn restore_puts_the_last_queue_back_and_cues_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut conn, commands, ann) = last_queue_harness(
+            dir.path(),
+            vec![(9, "INTERNAL/whatever-was-there.flac".to_string())],
+            None,
+        )
+        .await;
+        ctx.last_queue
+            .save(&LastQueue {
+                v: crate::last_queue::LAST_QUEUE_VERSION,
+                taken_at: 1,
+                reason: SnapshotReason::Shutdown,
+                uris: vec![
+                    "INTERNAL/x.flac".to_string(),
+                    "INTERNAL/y.flac".to_string(),
+                    "INTERNAL/z.flac".to_string(),
+                ],
+                current: Some(2),
+            })
+            .await
+            .unwrap();
+
+        handle_restore_last_queue(&ctx, &mut conn).await.unwrap();
+
+        assert_eq!(
+            queue_paths(&mut conn).await,
+            vec!["INTERNAL/x.flac", "INTERNAL/y.flac", "INTERNAL/z.flac"],
+            "the kept queue replaces what was there, in order"
+        );
+        let seen = commands.lock().unwrap().clone();
+        let play = seen.iter().position(|c| c == "play \"2\"");
+        let pause = seen.iter().position(|c| c == "pause \"1\"");
+        assert!(
+            play.zip(pause).is_some_and(|(p, q)| p < q),
+            "the playing row is selected, then paused: {seen:?}"
+        );
+
+        // The queue subject says so.
+        let queues = ann.states_on("queue");
+        let last = queues.last().expect("the queue was published");
+        assert_eq!(last["length"], 3, "{last}");
+        // And now_playing names the cued row: transport and the
+        // hero surface describe the restored queue.
+        let now = ann.states_on("now_playing");
+        let last = now.last().expect("now_playing was published");
+        assert_eq!(
+            last["track"]["mpd_path"], "INTERNAL/z.flac",
+            "now_playing must name what is cued: {last}"
+        );
+    }
+
+    /// Nothing kept is a refusal, and the queue is left alone:
+    /// a restore that found nothing must not clear what is there.
+    #[tokio::test]
+    async fn restore_with_nothing_kept_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut conn, commands, _ann) =
+            last_queue_harness(dir.path(), three_rows(), Some(0)).await;
+
+        let got = handle_restore_last_queue(&ctx, &mut conn).await;
+
+        assert!(matches!(got, Err(VerbError::NoSavedQueue)), "{got:?}");
+        assert!(
+            commands.lock().unwrap().iter().all(|c| c != "clear"),
+            "nothing to restore must not clear the queue"
+        );
+        assert_eq!(queue_paths(&mut conn).await.len(), 3);
+    }
+
+    /// Clear, then restore: the operator gets back exactly what
+    /// they cleared, cued where it was.
+    #[tokio::test]
+    async fn restore_after_clear_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut conn, commands, _ann) =
+            last_queue_harness(dir.path(), three_rows(), Some(2)).await;
+        let before = queue_paths(&mut conn).await;
+
+        handle_clear_queue(&ctx, &mut conn).await.unwrap();
+        assert!(queue_paths(&mut conn).await.is_empty());
+        handle_restore_last_queue(&ctx, &mut conn).await.unwrap();
+
+        assert_eq!(queue_paths(&mut conn).await, before);
+        assert!(
+            commands.lock().unwrap().iter().any(|c| c == "play \"2\""),
+            "cued where it was"
+        );
     }
 
     #[tokio::test]

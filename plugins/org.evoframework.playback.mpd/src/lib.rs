@@ -115,6 +115,7 @@ mod envelope_subscriber;
 mod favourites;
 mod gone_curation;
 mod idle_observer;
+mod last_queue;
 mod library;
 mod library_triage;
 mod mpd;
@@ -254,6 +255,7 @@ const SOURCE_REQUEST_TYPES: &[&str] = &[
     "queue.remove_queue_item",
     "queue.move_queue_item",
     "queue.clear_queue",
+    "queue.restore_last_queue",
     "queue.load_playlist_to_queue",
     "queue.append_playlist_to_queue",
     "queue.save_queue_as_playlist",

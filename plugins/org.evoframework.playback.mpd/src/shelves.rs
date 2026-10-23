@@ -177,7 +177,10 @@ impl ShelfBundle {
             shelf_dispatcher.clone(),
             mute,
             shuffle,
-        );
+        )
+        .with_last_queue_store(crate::last_queue::LastQueueStore::at(
+            state_dir.join("last-queue.toml"),
+        ));
         let playlist = PlaylistContext::new(
             music_directory.clone(),
             registry.clone(),
@@ -480,6 +483,32 @@ impl ShelfBundle {
     /// `emit` call so no explicit unload-time persist is
     /// needed.
     pub(crate) async fn shutdown(mut self) {
+        // Keep the queue first, while MPD is most likely still
+        // there to be asked. A reboot can lose it; this is what
+        // `restore_last_queue` gives back afterwards. A failure
+        // here is reported and does not hold up the unload.
+        match self.open_conn().await {
+            Ok(mut conn) => {
+                if let Err(e) = queue::snapshot_last_queue(
+                    &self.queue,
+                    &mut conn,
+                    crate::last_queue::SnapshotReason::Shutdown,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        "the queue could not be kept at shutdown"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "MPD unreachable at shutdown; the queue was not kept"
+            ),
+        }
         if let Some(handle) = self.idle_observer.take() {
             handle.stop().await;
         }
@@ -535,6 +564,9 @@ impl ShelfBundle {
             }
             "queue.clear_queue" => {
                 Ok(Some(self.dispatch_queue_clear_queue(req).await?))
+            }
+            "queue.restore_last_queue" => {
+                Ok(Some(self.dispatch_queue_restore_last_queue(req).await?))
             }
             "queue.load_playlist_to_queue" => {
                 Ok(Some(self.dispatch_queue_load_playlist_to_queue(req).await?))
@@ -750,6 +782,17 @@ impl ShelfBundle {
     ) -> Result<Response, PluginError> {
         let mut conn = self.open_conn().await?;
         queue::handle_clear_queue(&self.queue, &mut conn)
+            .await
+            .map_err(queue_verb_to_plugin_error)?;
+        encode_ok_response(req)
+    }
+
+    async fn dispatch_queue_restore_last_queue(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let mut conn = self.open_conn().await?;
+        queue::handle_restore_last_queue(&self.queue, &mut conn)
             .await
             .map_err(queue_verb_to_plugin_error)?;
         encode_ok_response(req)
@@ -1349,7 +1392,8 @@ fn queue_verb_to_plugin_error(e: queue::VerbError) -> PluginError {
         VerbError::PayloadVersion { .. }
         | VerbError::EmptyUris
         | VerbError::PositionOutOfRange { .. }
-        | VerbError::QueueEmpty => PluginError::Permanent(e.to_string()),
+        | VerbError::QueueEmpty
+        | VerbError::NoSavedQueue => PluginError::Permanent(e.to_string()),
         VerbError::Mpd { .. } => PluginError::Transient(e.to_string()),
     }
 }
@@ -1399,5 +1443,88 @@ fn library_verb_to_plugin_error(e: library::VerbError) -> PluginError {
         VerbError::Mpd { .. } | VerbError::WorkAggregateNotReady => {
             PluginError::Transient(e.to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::playback_supervisor::test_mock::{
+        short_timeouts, spawn_mock_mpd, CapturingSubjectAnnouncer,
+        ConnBehaviour,
+    };
+
+    /// The queue is kept at shutdown, in the plugin's state
+    /// directory, so a reboot does not cost the operator the
+    /// queue they had. This is the whole bundle, brought up the
+    /// way load brings it up and torn down the way unload does.
+    #[tokio::test]
+    async fn shutdown_keeps_the_queue_for_the_next_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Every connection the bundle opens — observers,
+        // reconciler, the shutdown snapshot — sees the same
+        // queue; which slot the snapshot lands on must not
+        // matter.
+        let behaviours = (0..12)
+            .map(|_| ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![
+                    (1, "INTERNAL/a/1.flac".to_string()),
+                    (2, "INTERNAL/b/2.flac".to_string()),
+                ],
+                playing: Some(1),
+            })
+            .collect();
+        let (endpoint, _mock) = spawn_mock_mpd(behaviours).await;
+        let subjects = Arc::new(CapturingSubjectAnnouncer::default());
+
+        let bundle = ShelfBundle::init(
+            dir.path().to_path_buf(),
+            subjects as Arc<dyn SubjectAnnouncer>,
+            endpoint,
+            short_timeouts(),
+            None,
+            crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
+        )
+        .await;
+        assert!(
+            !dir.path().join("last-queue.toml").exists(),
+            "nothing is kept until something ends"
+        );
+
+        // The verb is reachable on this shelf, and with nothing
+        // kept it refuses rather than falling through unmatched.
+        let req = Request {
+            request_type: "queue.restore_last_queue".to_string(),
+            payload: br#"{"v":1}"#.to_vec(),
+            correlation_id: 1,
+            deadline: None,
+            instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
+        };
+        match bundle.dispatch_request(&req).await {
+            Err(PluginError::Permanent(msg)) => {
+                assert!(msg.contains("no saved queue"), "{msg}")
+            }
+            other => panic!(
+                "restore_last_queue must dispatch and refuse with nothing \
+                 kept: {other:?}"
+            ),
+        }
+
+        bundle.shutdown().await;
+
+        let kept = crate::last_queue::LastQueueStore::at(
+            dir.path().join("last-queue.toml"),
+        )
+        .load()
+        .await
+        .expect("shutdown must keep the queue");
+        assert_eq!(kept.uris, vec!["INTERNAL/a/1.flac", "INTERNAL/b/2.flac"]);
+        assert_eq!(kept.current, Some(1));
+        assert_eq!(kept.reason, crate::last_queue::SnapshotReason::Shutdown);
     }
 }
