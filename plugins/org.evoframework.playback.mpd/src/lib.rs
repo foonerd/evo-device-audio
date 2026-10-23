@@ -5780,12 +5780,11 @@ mod tests {
                 // A playing row that is not first, so similar
                 // mode — which leads with the playing row — can
                 // never draw the order the queue already has.
-                // Interleaved so that album mode cannot either,
-                // once each row carries its album; the mock does
-                // not yet tag rows, so for albums each file is
-                // still its own album here and a drawn identity
-                // order is still possible. A pin that could pass
-                // or fail on the draw is not a pin.
+                // Interleaved so that album mode cannot either:
+                // the mock tags each row with its directory as
+                // the album, so these are two albums and no
+                // contiguous order is this one. A pin that could
+                // pass or fail on the draw is not a pin.
                 items: vec![
                     (11, "blue/1.flac".to_string()),
                     (21, "red/1.flac".to_string()),

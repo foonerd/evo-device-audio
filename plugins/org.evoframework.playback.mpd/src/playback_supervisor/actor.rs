@@ -1797,14 +1797,11 @@ mod tests {
         let (endpoint, _mock) = spawn_mock_mpd(vec![
             ConnBehaviour::LiveQueue {
                 commands: Arc::clone(&commands),
-                // Interleaved so that, once each row carries its
-                // album, no album order the planner can draw is
-                // the order the queue already has: every album
-                // order is contiguous, and this is not. The mock
-                // does not yet tag rows, so each file is still
-                // its own album here and a drawn identity order
-                // is still possible; the interleave is the shape
-                // the pin needs, not yet the proof.
+                // Interleaved so that no album order the planner
+                // can draw is the order the queue already has:
+                // the mock tags each row with its directory as
+                // the album, every album order is contiguous,
+                // and this is not. A move is always written.
                 items: vec![
                     (11, "blue/1.flac".to_string()),
                     (21, "red/1.flac".to_string()),

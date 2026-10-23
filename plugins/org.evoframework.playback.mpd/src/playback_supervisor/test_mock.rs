@@ -683,6 +683,15 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                         out.push_str(&format!(
                             "file: {path}\nPos: {pos}\nId: {id}\n"
                         ));
+                        // The directory is the album, so a row
+                        // under `blue/` is on album `blue`. Album
+                        // shuffle groups by this tag; without it
+                        // every file is its own album and no
+                        // fixture can make an order the planner
+                        // cannot draw.
+                        if let Some((dir, _)) = path.rsplit_once('/') {
+                            out.push_str(&format!("Album: {dir}\n"));
+                        }
                     }
                     out.push_str("OK\n");
                     let _ = w.write_all(out.as_bytes()).await;
