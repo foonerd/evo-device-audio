@@ -128,6 +128,7 @@ mod queue;
 mod scan_progress;
 mod selection;
 mod shelves;
+mod similar_shuffle;
 mod skip_traversal;
 mod source_probe;
 mod source_registry;
@@ -2112,7 +2113,7 @@ fn parse_correction(
             Some(mode) => Ok(PlaybackCommand::SetShuffle(mode)),
             None => Err(PluginError::Permanent(format!(
                 "set_shuffle payload must be '0'/'1', 'true'/'false', \
-                 'tracks' or 'albums', got {:?}",
+                 'tracks', 'albums' or 'similar', got {:?}",
                 trimmed
             ))),
         },
@@ -3317,8 +3318,8 @@ impl MpdPlaybackPlugin {
             (Some(raw), None) => crate::album_shuffle::ShuffleMode::parse(raw)
                 .ok_or_else(|| {
                     PluginError::Permanent(format!(
-                        "set_shuffle mode must be 'off', 'tracks' or \
-                             'albums', got {raw:?}"
+                        "set_shuffle mode must be 'off', 'tracks', \
+                         'albums' or 'similar', got {raw:?}"
                     ))
                 })?,
             (None, Some(true)) => crate::album_shuffle::ShuffleMode::Tracks,
@@ -3333,7 +3334,7 @@ impl MpdPlaybackPlugin {
             (None, None) => {
                 return Err(PluginError::Permanent(
                     "set_shuffle needs 'enabled' (bool) or 'mode' \
-                     ('off' / 'tracks' / 'albums')"
+                     ('off' / 'tracks' / 'albums' / 'similar')"
                         .to_string(),
                 ));
             }
@@ -4006,7 +4007,7 @@ struct SetShufflePayload {
     /// The fielded shape. `true` is track shuffle.
     #[serde(default)]
     enabled: Option<bool>,
-    /// The mode by name: `off`, `tracks`, `albums`.
+    /// The mode by name: `off`, `tracks`, `albums`, `similar`.
     #[serde(default)]
     mode: Option<String>,
 }
@@ -4924,8 +4925,14 @@ mod tests {
                 String::from_utf8_lossy(raw)
             );
         }
+        // And similar, by that name.
+        assert_eq!(
+            parse_correction(&correction("set_shuffle", b"similar", 1))
+                .unwrap(),
+            PlaybackCommand::SetShuffle(ShuffleMode::Similar)
+        );
         // And a word this build does not implement is refused
-        // rather than silently read as one of the three.
+        // rather than silently read as one of the four.
         assert!(
             parse_correction(&correction("set_shuffle", b"smart", 1)).is_err(),
             "an unknown shuffle mode must be refused"
@@ -5821,6 +5828,36 @@ mod tests {
         assert_eq!(
             remembered,
             crate::album_shuffle::ShuffleMode::Albums,
+            "the gesture must record the mode for now_playing"
+        );
+    }
+
+    /// A shelf set_shuffle of similar writes an order into the
+    /// queue, leaves MPD random off, and records the mode so
+    /// now_playing can say so. This is the surface the operator
+    /// selects it from.
+    #[tokio::test]
+    async fn shelf_set_shuffle_similar_reorders_with_random_off() {
+        let (got, seen, remembered) =
+            shelf_set_shuffle(json!({ "v": 1, "mode": "similar" })).await;
+        assert!(got.is_ok(), "the shelf must accept similar: {got:?}");
+        assert!(
+            seen.iter().any(|c| c == "random \"0\""),
+            "similar order is the queue's, so MPD's random stays off: \
+             {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|c| c != "random \"1\""),
+            "similar mode must not hand the order back to MPD to \
+             scramble: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|c| c.starts_with("moveid ")),
+            "the chosen order must reach the queue: {seen:?}"
+        );
+        assert_eq!(
+            remembered,
+            crate::album_shuffle::ShuffleMode::Similar,
             "the gesture must record the mode for now_playing"
         );
     }

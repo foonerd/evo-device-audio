@@ -421,26 +421,32 @@ pub(crate) async fn spawn(
 /// abort condition.
 /// Write the chosen album order into the queue.
 ///
-/// The choice is made by [`crate::album_shuffle::album_shuffle_plan`]
-/// — pure, seeded, and the only place album order is decided. This
-/// carries it out: `moveid` per album, in ascending target
-/// position, so each song lands where no later move disturbs it.
+/// The choice is made by a pure, seeded planner — the only place
+/// that order is decided: [`crate::album_shuffle::album_shuffle_plan`]
+/// for albums, [`crate::similar_shuffle::similar_shuffle_plan`] for
+/// similar, the latter walking on from the track that is playing.
+/// This carries it out: `moveid` per song, in ascending target
+/// position, so each lands where no later move disturbs it.
 ///
 /// Best-effort per move. A queue that changed under us (the
 /// operator removing a track mid-shuffle) makes one move fail, and
 /// the ones already applied are still a valid queue — every song is
-/// still present and every album still contiguous up to that
-/// point. Refusing the whole gesture because the eleventh move
-/// raced would leave the operator with shuffle reported on and a
-/// queue in the old order.
-async fn apply_album_shuffle(cmd_conn: &mut MpdConnection) {
+/// still present and the order chosen so far is in place. Refusing
+/// the whole gesture because the eleventh move raced would leave
+/// the operator with shuffle reported on and a queue in the old
+/// order.
+async fn write_queue_order(
+    cmd_conn: &mut MpdConnection,
+    mode: crate::album_shuffle::ShuffleMode,
+) {
     let items = match cmd_conn.playlistinfo().await {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
                 plugin = PLUGIN_NAME,
+                mode = mode.as_str(),
                 error = %e,
-                "could not read the queue; album order not written and \
+                "could not read the queue; the order was not written and \
                  the queue plays as it stands"
             );
             return;
@@ -450,20 +456,46 @@ async fn apply_album_shuffle(cmd_conn: &mut MpdConnection) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    let plan = crate::album_shuffle::album_shuffle_plan(&items, seed);
+    let plan = match mode {
+        crate::album_shuffle::ShuffleMode::Albums => {
+            crate::album_shuffle::album_shuffle_plan(&items, seed)
+        }
+        crate::album_shuffle::ShuffleMode::Similar => {
+            // The walk starts from what is playing, so what comes
+            // next is chosen against what the operator is hearing.
+            // A status we cannot read is nothing playing, not a
+            // refusal: the order is still chosen, from a drawn
+            // start.
+            let playing = match cmd_conn.status().await {
+                Ok(s) => s.song_position,
+                Err(e) => {
+                    tracing::debug!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        "status unreadable; similar order starts from a \
+                         drawn track rather than the playing one"
+                    );
+                    None
+                }
+            };
+            crate::similar_shuffle::similar_shuffle_plan(&items, playing, seed)
+        }
+        _ => return,
+    };
     if plan.is_empty() {
-        // Fewer than two albums, or already in the chosen order.
+        // Nothing to choose between, or already in the chosen order.
         return;
     }
     for mv in &plan {
         if let Err(e) = cmd_conn.moveid(mv.id, mv.to_position).await {
             tracing::warn!(
                 plugin = PLUGIN_NAME,
+                mode = mode.as_str(),
                 id = mv.id,
                 to_position = mv.to_position,
                 error = %e,
-                "album order partly written; the queue is consistent but \
-                 not fully reordered"
+                "order partly written; the queue is consistent but not \
+                 fully reordered"
             );
             return;
         }
@@ -1158,16 +1190,16 @@ async fn dispatch_command(
             cmd_conn.set_repeat(enabled).await
         }
         PlaybackCommand::SetShuffle(mode) => {
-            // Track shuffle is MPD's own `random`. Album order is
-            // not in the protocol, so it is written into the
-            // queue and MPD plays the queue in order: the
-            // physical order IS the playback order, which is how
-            // playback follows the choice without this plugin
-            // sitting in the path of every song boundary.
+            // Track shuffle is MPD's own `random`. Album and
+            // similar order are not in the protocol, so they are
+            // written into the queue and MPD plays the queue in
+            // order: the physical order IS the playback order,
+            // which is how playback follows the choice without
+            // this plugin sitting in the path of every song
+            // boundary.
             let res = cmd_conn.set_random(mode.mpd_random()).await;
-            if res.is_ok() && mode == crate::album_shuffle::ShuffleMode::Albums
-            {
-                apply_album_shuffle(cmd_conn).await;
+            if res.is_ok() && mode.orders_the_queue() {
+                write_queue_order(cmd_conn, mode).await;
             }
             res
         }
@@ -1817,6 +1849,94 @@ mod tests {
             "the chosen album order must be written into the queue: \
              {seen:?}"
         );
+        handle.shutdown().await;
+    }
+
+    /// Similar shuffle reaches MPD as a reordered queue that the
+    /// playing track leads, with random off.
+    ///
+    /// Playback follows the order because the order is the
+    /// queue. The playing track is placed first so what comes
+    /// next was chosen against it, and so the player is not
+    /// yanked onto another song by the reorder.
+    #[tokio::test]
+    async fn similar_shuffle_follows_on_from_the_playing_track() {
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) = spawn_mock_mpd(vec![
+            ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![
+                    (11, "blue/1.flac".to_string()),
+                    (12, "blue/2.flac".to_string()),
+                    (21, "red/1.flac".to_string()),
+                    (22, "red/2.flac".to_string()),
+                ],
+                // Position 2 is playing: id 21.
+                playing: Some(2),
+            },
+            ConnBehaviour::HoldAfterWelcome,
+        ])
+        .await;
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let reporter_dyn: Arc<dyn CustodyStateReporter> = reporter.clone();
+        let handle = spawn(
+            endpoint,
+            short_timeouts(),
+            test_custody_handle(),
+            reporter_dyn,
+            SubjectEmitter::null(),
+            null_protocol_settings_rx(),
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        handle
+            .command(PlaybackCommand::SetShuffle(
+                crate::album_shuffle::ShuffleMode::Similar,
+            ))
+            .await
+            .expect("similar shuffle");
+
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c == "random \"0\""),
+            "similar order is the queue's, so MPD's random stays off: \
+             {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|c| c != "random \"1\""),
+            "similar mode must not hand the order back to MPD to \
+             scramble: {seen:?}"
+        );
+        // Replay the moves the way MPD would and read the order.
+        let mut ids = vec![11u32, 12, 21, 22];
+        let mut moved = 0;
+        for c in &seen {
+            let Some(rest) = c.strip_prefix("moveid ") else {
+                continue;
+            };
+            let mut parts = rest.split('"').filter(|s| !s.trim().is_empty());
+            let id: u32 = parts.next().unwrap().parse().unwrap();
+            let to: usize = parts.next().unwrap().trim().parse().unwrap();
+            let from = ids.iter().position(|i| *i == id).unwrap();
+            let id = ids.remove(from);
+            ids.insert(to.min(ids.len()), id);
+            moved += 1;
+        }
+        assert!(moved > 0, "the chosen order must be written: {seen:?}");
+        assert_eq!(
+            ids[0], 21,
+            "the playing track leads the new order: {ids:?} from {seen:?}"
+        );
+        let mut all = ids.clone();
+        all.sort_unstable();
+        assert_eq!(all, vec![11, 12, 21, 22], "every track still queued");
         handle.shutdown().await;
     }
 

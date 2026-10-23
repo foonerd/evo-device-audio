@@ -27,7 +27,7 @@ use evo_mpd_shared::types::MpdQueueItem;
 /// How shuffle picks what plays next.
 ///
 /// Lives in this plugin. The steward carries no shuffle type: the
-/// wire still sends `set_shuffle`, and the operator's three
+/// wire still sends `set_shuffle`, and the operator's four
 /// answers are spelled out at that boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum ShuffleMode {
@@ -40,6 +40,10 @@ pub(crate) enum ShuffleMode {
     /// Shuffle albums, tracks within each album in order. MPD
     /// `random 0` over a queue this module has reordered.
     Albums,
+    /// A weighted walk, each track drawn against the one before
+    /// it. MPD `random 0` over a queue
+    /// [`crate::similar_shuffle`] has reordered.
+    Similar,
 }
 
 impl ShuffleMode {
@@ -54,6 +58,7 @@ impl ShuffleMode {
             "0" | "false" | "off" => Some(Self::Off),
             "1" | "true" | "tracks" | "track" => Some(Self::Tracks),
             "albums" | "album" => Some(Self::Albums),
+            "similar" => Some(Self::Similar),
             _ => None,
         }
     }
@@ -64,15 +69,22 @@ impl ShuffleMode {
             Self::Off => "off",
             Self::Tracks => "tracks",
             Self::Albums => "albums",
+            Self::Similar => "similar",
         }
     }
 
-    /// What MPD's `random` must be for this mode. Album order is
-    /// carried by the queue, so album mode wants random off — a
-    /// random walk over an album-ordered queue is just a random
-    /// walk.
+    /// What MPD's `random` must be for this mode. Album and
+    /// similar order are carried by the queue, so both want
+    /// random off — a random walk over a queue this plugin has
+    /// ordered is just a random walk.
     pub(crate) fn mpd_random(self) -> bool {
         matches!(self, Self::Tracks)
+    }
+
+    /// Whether this mode's order is written into the queue — the
+    /// modes MPD has no primitive for.
+    pub(crate) fn orders_the_queue(self) -> bool {
+        matches!(self, Self::Albums | Self::Similar)
     }
 }
 
@@ -103,6 +115,7 @@ impl ShuffleModeCell {
         match self.mode.load(std::sync::atomic::Ordering::SeqCst) {
             1 => ShuffleMode::Tracks,
             2 => ShuffleMode::Albums,
+            3 => ShuffleMode::Similar,
             _ => ShuffleMode::Off,
         }
     }
@@ -113,6 +126,7 @@ impl ShuffleModeCell {
             ShuffleMode::Off => 0u8,
             ShuffleMode::Tracks => 1,
             ShuffleMode::Albums => 2,
+            ShuffleMode::Similar => 3,
         };
         self.mode.store(v, std::sync::atomic::Ordering::SeqCst);
     }
@@ -133,10 +147,10 @@ impl Default for ShuffleModeCell {
 /// `albums` can never be reported while that flag is true, which
 /// would be a report disagreeing with itself.
 ///
-/// With `random` off, the remembered intent decides: `albums` if
-/// that is what was asked for, otherwise `off`. A remembered
-/// `tracks` with the flag off means something turned MPD's random
-/// off underneath us, and the flag wins.
+/// With `random` off, the remembered intent decides: `albums` or
+/// `similar` if that is what was asked for, otherwise `off`. A
+/// remembered `tracks` with the flag off means something turned
+/// MPD's random off underneath us, and the flag wins.
 pub(crate) fn reported_shuffle_mode(
     mpd_random: bool,
     remembered: ShuffleMode,
@@ -146,6 +160,7 @@ pub(crate) fn reported_shuffle_mode(
     }
     match remembered {
         ShuffleMode::Albums => ShuffleMode::Albums,
+        ShuffleMode::Similar => ShuffleMode::Similar,
         _ => ShuffleMode::Off,
     }
 }
@@ -174,7 +189,9 @@ fn album_key(item: &MpdQueueItem) -> String {
 
 /// Deterministic shuffle. SplitMix64 — small, well-distributed,
 /// and reproducible from the seed, so a plan can be asserted.
-fn next_rand(state: &mut u64) -> u64 {
+/// Shared with [`crate::similar_shuffle`] so both modes draw from
+/// the same source and a seed means one thing.
+pub(crate) fn next_rand(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = *state;
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -493,15 +510,21 @@ mod tests {
         );
     }
 
-    /// Every mode has a token, and they are the three the glass
+    /// Every mode has a token, and they are the four the glass
     /// reads.
     #[test]
     fn every_mode_has_a_wire_token() {
         assert_eq!(ShuffleMode::Off.as_str(), "off");
         assert_eq!(ShuffleMode::Tracks.as_str(), "tracks");
         assert_eq!(ShuffleMode::Albums.as_str(), "albums");
+        assert_eq!(ShuffleMode::Similar.as_str(), "similar");
         // Round-trips, so the glass can send back what it read.
-        for m in [ShuffleMode::Off, ShuffleMode::Tracks, ShuffleMode::Albums] {
+        for m in [
+            ShuffleMode::Off,
+            ShuffleMode::Tracks,
+            ShuffleMode::Albums,
+            ShuffleMode::Similar,
+        ] {
             assert_eq!(ShuffleMode::parse(m.as_str()), Some(m));
         }
     }
@@ -512,7 +535,12 @@ mod tests {
     fn the_cell_remembers_the_mode() {
         let cell = ShuffleModeCell::new();
         assert_eq!(cell.get(), ShuffleMode::Off, "a fresh session is off");
-        for m in [ShuffleMode::Albums, ShuffleMode::Tracks, ShuffleMode::Off] {
+        for m in [
+            ShuffleMode::Albums,
+            ShuffleMode::Similar,
+            ShuffleMode::Tracks,
+            ShuffleMode::Off,
+        ] {
             cell.set(m);
             assert_eq!(cell.get(), m);
             assert_eq!(cell.clone().get(), m, "shared, not copied");
@@ -532,7 +560,8 @@ mod tests {
         for raw in ["albums", "album"] {
             assert_eq!(ShuffleMode::parse(raw), Some(ShuffleMode::Albums));
         }
-        for raw in ["", "yes", "Albums", "random"] {
+        assert_eq!(ShuffleMode::parse("similar"), Some(ShuffleMode::Similar));
+        for raw in ["", "yes", "Albums", "random", "smart"] {
             assert_eq!(ShuffleMode::parse(raw), None, "{raw:?}");
         }
     }
@@ -545,5 +574,27 @@ mod tests {
         assert!(!ShuffleMode::Off.mpd_random());
         assert!(ShuffleMode::Tracks.mpd_random());
         assert!(!ShuffleMode::Albums.mpd_random());
+    }
+
+    /// Similar order is the queue's too: random off, and the
+    /// order written. The modes MPD has no primitive for are
+    /// exactly the ones that order the queue.
+    #[test]
+    fn similar_mode_is_written_into_the_queue_with_random_off() {
+        assert!(!ShuffleMode::Similar.mpd_random());
+        assert!(ShuffleMode::Similar.orders_the_queue());
+        assert!(ShuffleMode::Albums.orders_the_queue());
+        assert!(!ShuffleMode::Tracks.orders_the_queue());
+        assert!(!ShuffleMode::Off.orders_the_queue());
+        assert_eq!(
+            reported_shuffle_mode(false, ShuffleMode::Similar),
+            ShuffleMode::Similar,
+            "similar in force must be reported as similar"
+        );
+        assert_eq!(
+            reported_shuffle_mode(true, ShuffleMode::Similar),
+            ShuffleMode::Tracks,
+            "random on is always tracks, whatever was remembered"
+        );
     }
 }
