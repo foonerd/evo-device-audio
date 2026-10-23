@@ -6536,6 +6536,30 @@ impl NmInner {
         steps: &mut Vec<String>,
     ) -> Result<(), PluginError> {
         let ifname = wifi_ifname.trim();
+        // No interface to put an access point on.
+        //
+        // A device with no AP-capable radio resolves no AP
+        // interface, and the profile write below would ask nmcli
+        // for `ifname ""`. nmcli refuses that, the refusal became
+        // a Permanent error, and the error took the whole apply
+        // with it — so the operator turning the access point on
+        // got 400 Bad Request and could not record the preference
+        // at all.
+        //
+        // Their preference is theirs to hold whether or not this
+        // box can honour it today: the intent is saved before the
+        // apply runs, a radio may arrive later, and the same
+        // settings travel to other hardware. So this records what
+        // it found and lets the rest of the apply finish, exactly
+        // as the empty-SSID case below already does.
+        if ifname.is_empty() {
+            steps.push(format!(
+                "hotspot {hotspot_name} enabled but this device has no \
+                 interface that can carry an access point; nothing raised \
+                 and the preference is kept"
+            ));
+            return Ok(());
+        }
         // Empty `ap_ssid` under an enabled hotspot is soft-recovered
         // to `default_ap_ssid()` (a per-unit MAC-derived SSID).
         // Prior behaviour was a hard permanent error which cascaded
@@ -15245,6 +15269,67 @@ exit 0\n",
             !calls.contains("connection up")
                 && !calls.contains("connection modify"),
             "a decline must raise and rewrite nothing: {calls}"
+        );
+    }
+
+    /// The operator can turn the access point on even where no
+    /// radio can carry one.
+    ///
+    /// A device with no AP-capable interface resolves no AP
+    /// interface, and the profile write asked nmcli for
+    /// `ifname ""`. nmcli refuses that, the refusal was a
+    /// Permanent error, and it took the whole apply with it — so
+    /// the gesture came back 400 Bad Request and the preference
+    /// could not be recorded at all.
+    ///
+    /// The preference is the operator's to hold whether or not
+    /// this box can honour it today. The apply records what it
+    /// found and finishes.
+    #[tokio::test]
+    async fn an_access_point_with_no_interface_is_recorded_not_refused() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", false);
+        let p = recovery_plugin(dir.path(), &nmcli);
+
+        let wifi = WifiIntent {
+            ap_ssid: "evo-4466".to_string(),
+            ..WifiIntent::default()
+        };
+        let fallback = FallbackIntent {
+            hotspot_enabled: true,
+            ..FallbackIntent::default()
+        };
+
+        let mut steps = Vec::new();
+        let got = p
+            .ensure_hotspot_profile(
+                "", &wifi, None, &fallback, false, &mut steps,
+            )
+            .await;
+
+        assert!(
+            got.is_ok(),
+            "no AP interface must not fail the apply: {got:?}"
+        );
+        assert!(
+            steps.iter().any(|s| s.contains(
+                "no \
+                 interface that can carry an access point"
+            ) || (s.contains("no")
+                && s.contains("access point"))),
+            "the apply must say what it found: {steps:?}"
+        );
+
+        // And nothing was written. A profile bound to an empty
+        // interface is the thing nmcli refused.
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            !calls.contains("connection add")
+                && !calls.contains("connection up"),
+            "no profile may be written for an interface that does not \
+             exist: {calls}"
         );
     }
 

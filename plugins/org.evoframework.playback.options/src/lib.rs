@@ -168,6 +168,11 @@ const HAPPENING_EVENT_TYPE: &str = "audio.options.changed";
 const MIXER_TRANSITION_STARTED: &str = "audio.mixer_transition.started";
 const MIXER_TRANSITION_APPLIED: &str = "audio.mixer_transition.applied";
 const MIXER_TRANSITION_ROLLED_BACK: &str = "audio.mixer_transition.rolled_back";
+/// The authority applied but the warden's unmute did not ack.
+/// Not a rollback: the operator's mixer is in force and the
+/// chain simply did not resume.
+const MIXER_TRANSITION_UNMUTE_INCOMPLETE: &str =
+    "audio.mixer_transition.unmute_incomplete";
 const MIXER_TRANSITION_FAILED: &str = "audio.mixer_transition.failed";
 
 /// External-addressing scheme + value the plugin uses for its
@@ -2116,35 +2121,47 @@ impl PlaybackOptionsPlugin {
 
         // Step 7 — unmute. Symmetric to step 2: publish
         // envelope_requested with state=Unmuted, await the
-        // warden's matching ack. Failure here is a rollback
-        // even though the new authority has already been
-        // persisted — the operator-facing behaviour is the
-        // chain remains muted with the prior settings
-        // restored; the operator can re-attempt the gesture
-        // once the underlying cause clears.
-        let unmute_generation = match self
+        // warden's matching ack.
+        //
+        // A failure here is NOT a rollback. The warden unmutes by
+        // resuming the chain, and a resume the player cannot
+        // perform says nothing about the mixer: MPD answers
+        // `Bad song index` when there is no valid song position
+        // to resume, and `Broken pipe` when the connection went
+        // with it. Neither is evidence the operator's chosen
+        // authority is wrong.
+        //
+        // It used to roll back, which meant a Pi with a hardware
+        // mixer and nothing playing could not keep Hardware: the
+        // gesture persisted it, the unmute failed because there
+        // was nothing to resume, and the restore put Software
+        // back. The operator chose Hardware and the device
+        // disagreed for a reason that had nothing to do with
+        // mixers.
+        //
+        // The authority stands, verified at step 6, and the
+        // unmute's failure is recorded against the transition so
+        // the chain not coming back is still visible.
+        let mut unmute_failure: Option<String> = None;
+        match self
             .publish_envelope_requested(EnvelopeState::Unmuted)
             .await
         {
-            Ok(g) => g,
-            Err(e) => {
-                return self
-                    .rollback_or_fail_restore(
-                        from,
-                        to,
-                        "unmute",
-                        e,
-                        prior_settings,
+            Ok(unmute_generation) => {
+                if let Err(e) = self
+                    .await_envelope_ack(
+                        unmute_generation,
+                        EnvelopeState::Unmuted,
                     )
-                    .await;
+                    .await
+                {
+                    unmute_failure = Some(e);
+                }
             }
-        };
-        if let Err(e) = self
-            .await_envelope_ack(unmute_generation, EnvelopeState::Unmuted)
-            .await
-        {
-            return self
-                .rollback_or_fail_restore(from, to, "unmute", e, prior_settings)
+            Err(e) => unmute_failure = Some(e),
+        }
+        if let Some(reason) = unmute_failure {
+            self.emit_lifecycle_unmute_incomplete(from, to, &reason)
                 .await;
         }
 
@@ -2228,6 +2245,31 @@ impl PlaybackOptionsPlugin {
                 "to": to.as_wire_str(),
                 "carried_level": carried_level,
                 "effective_level": effective_level,
+            }),
+        )
+        .await;
+    }
+
+    /// The authority applied, and the chain did not come back.
+    ///
+    /// Recorded rather than rolled back: the operator's chosen
+    /// mixer is in force, but the warden's unmute did not ack, so
+    /// whatever was playing is not playing now. On a player with
+    /// nothing queued that is the expected answer and not a
+    /// fault — which is exactly why it must not undo the mixer.
+    async fn emit_lifecycle_unmute_incomplete(
+        &self,
+        from: MixerType,
+        to: MixerType,
+        reason: &str,
+    ) {
+        self.emit_lifecycle(
+            MIXER_TRANSITION_UNMUTE_INCOMPLETE,
+            serde_json::json!({
+                "v": PAYLOAD_VERSION,
+                "from": from.as_wire_str(),
+                "to": to.as_wire_str(),
+                "reason": reason,
             }),
         )
         .await;
@@ -5189,6 +5231,21 @@ mod tests {
         StubQuerier,
         tempfile::TempDir,
     ) {
+        let (p, a, sub, q, d, _emitter) =
+            envelope_wired_plugin_with_emitter().await;
+        (p, a, sub, q, d)
+    }
+
+    /// As [`envelope_wired_plugin`], and hands back the emitter so
+    /// a test can assert what the transition recorded.
+    async fn envelope_wired_plugin_with_emitter() -> (
+        PlaybackOptionsPlugin,
+        Arc<CapturingAnnouncer>,
+        StubStateSubscriber,
+        StubQuerier,
+        tempfile::TempDir,
+        Arc<CapturingEmitter>,
+    ) {
         const OBSERVED_CID: &str = "stub-envelope-observed-cid";
         let dir = tempdir().unwrap();
         let state_path = dir.path().join(STATE_FILENAME);
@@ -5205,7 +5262,8 @@ mod tests {
         let mut p = PlaybackOptionsPlugin::new()
             .with_state_path(state_path)
             .with_envelope_ack_timeout_override(Duration::from_millis(200));
-        p.happening_emitter = Some(Arc::new(CapturingEmitter::default()));
+        let emitter = Arc::new(CapturingEmitter::default());
+        p.happening_emitter = Some(Arc::clone(&emitter) as Arc<_>);
         p.subject_announcer =
             Some(Arc::clone(&announcer) as Arc<dyn SubjectAnnouncer>);
         p.subject_state_subscriber = Some(
@@ -5214,7 +5272,7 @@ mod tests {
         p.subject_querier =
             Some(Arc::new(querier.clone()) as Arc<dyn SubjectQuerier>);
         p.loaded = true;
-        (p, announcer, subscriber, querier, dir)
+        (p, announcer, subscriber, querier, dir, emitter)
     }
 
     fn envelope_observed_state(
@@ -5311,6 +5369,129 @@ mod tests {
         assert!(
             requests[1].generation > requests[0].generation,
             "generation monotonic across envelope publishes"
+        );
+    }
+
+    /// A resume the player cannot do must not put the mixer back.
+    ///
+    /// The warden unmutes by resuming the chain. On a player with
+    /// no valid song position MPD answers `Bad song index`, and
+    /// the connection often goes with it (`Broken pipe`). Neither
+    /// says anything about the mixer — but the unmute failure used
+    /// to restore the prior settings, so a Pi with a hardware
+    /// mixer and nothing playing could not keep Hardware: the
+    /// gesture persisted it and the restore put Software back.
+    ///
+    /// The mute is acked here and the unmute never is, which is
+    /// exactly the shape of that field failure.
+    #[tokio::test]
+    async fn an_unacked_unmute_keeps_the_chosen_mixer() {
+        const OBSERVED_CID: &str = "stub-envelope-observed-cid";
+        let (p, announcer, subscriber, _querier, _dir, emitter) =
+            envelope_wired_plugin_with_emitter().await;
+
+        // Marco's Pi: Innomaker on the Allo overlay, card 2.
+        // Hardware mode needs the coordinates first; silent
+        // degrade is forbidden.
+        p.handle_request(&req(
+            "options.set_mixer_device",
+            json!({ "v": 1, "value": "hw:2" }),
+        ))
+        .await
+        .unwrap();
+        p.handle_request(&req(
+            "options.set_mixer_control",
+            json!({ "v": 1, "value": "Master" }),
+        ))
+        .await
+        .unwrap();
+
+        // Ack the mute. Never ack the unmute — the resume the
+        // warden attempts is the one MPD refuses.
+        let subscriber_clone = subscriber.clone();
+        let announcer_clone = Arc::clone(&announcer);
+        let ack_task = tokio::spawn(async move {
+            let mut acked = std::collections::HashSet::new();
+            for _ in 0..200 {
+                for req in envelope_requested_publishes(&announcer_clone) {
+                    if req.requested_state == EnvelopeState::Muted
+                        && !acked.contains(&req.generation)
+                    {
+                        subscriber_clone.publish(
+                            OBSERVED_CID,
+                            envelope_observed_state(
+                                req.generation,
+                                req.requested_state,
+                            ),
+                        );
+                        acked.insert(req.generation);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+
+        let resp = p
+            .handle_request(&req(
+                "options.set_mixer_type",
+                json!({ "v": 1, "value": "hardware" }),
+            ))
+            .await;
+        ack_task.abort();
+
+        // The gesture does not fail on the operator.
+        let resp = resp.expect("an unacked unmute must not fail the gesture");
+        let v: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v["status"], "ok", "payload: {v}");
+
+        // And the authority the operator chose is the one in
+        // force. This is the whole row.
+        assert_eq!(
+            p.settings().mixer_type,
+            MixerType::Hardware,
+            "a resume the player cannot do must not put the mixer \
+             back on Software"
+        );
+
+        // Both envelope publishes still happened: the unmute was
+        // attempted, it just was not acked.
+        let requests = envelope_requested_publishes(&announcer);
+        assert_eq!(requests.len(), 2, "mute then unmute: {requests:?}");
+        assert_eq!(requests[1].requested_state, EnvelopeState::Unmuted);
+
+        // Not swallowed. The chain did not come back, and the
+        // transition says so — the operator's mixer is right and
+        // their music is not playing, which are two facts.
+        // The lifecycle happenings are emitted detached, so wait
+        // for the one this row is about rather than reading the
+        // vector the instant the gesture returns.
+        let kinds = |()| -> Vec<String> {
+            emitter
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|e| e.event_type.clone())
+                .collect()
+        };
+        let mut seen = kinds(());
+        for _ in 0..200 {
+            if seen.iter().any(|k| k == MIXER_TRANSITION_UNMUTE_INCOMPLETE) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            seen = kinds(());
+        }
+        let kinds = seen;
+        assert!(
+            kinds
+                .iter()
+                .any(|k| k == MIXER_TRANSITION_UNMUTE_INCOMPLETE),
+            "the unacked unmute must be recorded: {kinds:?}"
+        );
+        assert!(
+            !kinds.iter().any(|k| k == MIXER_TRANSITION_ROLLED_BACK),
+            "nothing was rolled back: {kinds:?}"
         );
     }
 
