@@ -447,6 +447,11 @@ pub(crate) enum ConnBehaviour {
     /// MPD ended up holding. `library` maps an lsinfo path to
     /// its `(subdirectories, files)`; the root is the empty
     /// string.
+    ///
+    /// A `playlistadd` of a URI under `refused:` is ACKed the way
+    /// MPD refuses a song its database does not hold; inside a
+    /// command list the commands before it have landed and the
+    /// rest do not run, which is MPD's own behaviour.
     StoredPlaylists {
         commands: Arc<Mutex<Vec<String>>>,
         playlists: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
@@ -926,6 +931,18 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                             } else if c.starts_with("playlistadd")
                                 && a.len() >= 2
                             {
+                                // A URI under `refused:` is one
+                                // MPD's database does not hold.
+                                // MPD ACKs it and stops the list
+                                // there: what came before has
+                                // landed, what follows never runs.
+                                if a[1].starts_with("refused:") {
+                                    out.push_str(
+                                        "ACK [50@0] {playlistadd} No such \
+                                         song\n",
+                                    );
+                                    break;
+                                }
                                 held.entry(a[0].clone())
                                     .or_default()
                                     .push(a[1].clone());
@@ -934,7 +951,9 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                                 out.push_str("list_OK\n");
                             }
                         }
-                        out.push_str("OK\n");
+                        if !out.contains("ACK [") {
+                            out.push_str("OK\n");
+                        }
                         out
                     } else if cmd.starts_with("count") {
                         // Models a library that matches nothing,

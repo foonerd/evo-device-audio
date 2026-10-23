@@ -108,7 +108,15 @@ pub(crate) async fn handle_duplicate(
         .await;
     }
 
-    // One command list: the target exists whole or not at all.
+    // One command list for one round trip — but MPD applies each
+    // `playlistadd` as it goes: when one is refused, the rows
+    // before it have landed under the new name and the rest never
+    // run. A list is not a transaction. So a refused row is
+    // followed by `rm` of the name this call created, and the
+    // operator gets the error with nothing left behind: the next
+    // duplicate is not refused for a name that is only half
+    // there. The target did not exist before this call — that was
+    // checked above — so removing it removes only our own work.
     let commands: Vec<(&str, Vec<String>)> = rows
         .iter()
         .map(|r| {
@@ -118,9 +126,19 @@ pub(crate) async fn handle_duplicate(
             )
         })
         .collect();
-    conn.command_list(&commands)
-        .await
-        .map_err(|e| mpd("playlistadd", e))?;
+    if let Err(e) = conn.command_list(&commands).await {
+        if let Err(rm) = conn.rm_playlist(&payload.target).await {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                target = %payload.target,
+                error = %rm,
+                "duplicate: a row was refused and the partial copy could \
+                 not be removed; the name is listed with part of the rows"
+            );
+        }
+        publish_index(ctx, conn).await;
+        return Err(mpd("playlistadd", e));
+    }
     publish_index(ctx, conn).await;
     Ok(())
 }
@@ -363,6 +381,63 @@ mod tests {
             .unwrap()
             .iter()
             .all(|c| !c.starts_with("playlistadd")));
+    }
+
+    /// A row MPD refuses mid-copy does not leave the new name
+    /// behind. The rows before it had landed; the partial copy is
+    /// removed before the error is returned, the source is as it
+    /// was, and the name is free for the next attempt.
+    #[tokio::test]
+    async fn a_failed_copy_leaves_no_name_behind() {
+        let mut h = harness().await;
+        h.held.lock().unwrap().insert(
+            "Mixed".to_string(),
+            vec![
+                "INTERNAL/ok1.flac".to_string(),
+                "refused:INTERNAL/gone.flac".to_string(),
+                "INTERNAL/ok2.flac".to_string(),
+            ],
+        );
+        let got = handle_duplicate(
+            &h.ctx,
+            &mut h.conn,
+            payload("Mixed", "Mixed Copy"),
+        )
+        .await;
+        assert!(matches!(got, Err(VerbError::Mpd { .. })), "{got:?}");
+        {
+            let held = h.held.lock().unwrap();
+            assert!(
+                held.get("Mixed Copy").is_none(),
+                "the partial copy must be gone from the index: {held:?}"
+            );
+            assert_eq!(
+                held.get("Mixed").unwrap().len(),
+                3,
+                "the source is as it was"
+            );
+            let seen = h.commands.lock().unwrap();
+            assert!(
+                seen.iter().any(|c| c == "rm \"Mixed Copy\""),
+                "the name this call created is removed: {seen:?}"
+            );
+            assert!(
+                seen.iter().all(|c| c != "rm \"Mixed\""),
+                "the source is never removed: {seen:?}"
+            );
+        }
+        // And the name is free: a second attempt is not refused
+        // for a name that is only half there.
+        let again = handle_duplicate(
+            &h.ctx,
+            &mut h.conn,
+            payload("Mixed", "Mixed Copy"),
+        )
+        .await;
+        assert!(
+            !matches!(again, Err(VerbError::DuplicateName { .. })),
+            "the next attempt must not be refused as a duplicate: {again:?}"
+        );
     }
 
     /// An empty playlist duplicates to an empty playlist.
