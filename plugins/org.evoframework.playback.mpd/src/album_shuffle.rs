@@ -58,12 +58,95 @@ impl ShuffleMode {
         }
     }
 
+    /// The token the now-playing report carries.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Tracks => "tracks",
+            Self::Albums => "albums",
+        }
+    }
+
     /// What MPD's `random` must be for this mode. Album order is
     /// carried by the queue, so album mode wants random off — a
     /// random walk over an album-ordered queue is just a random
     /// walk.
     pub(crate) fn mpd_random(self) -> bool {
         matches!(self, Self::Tracks)
+    }
+}
+
+/// Shared record of the mode the operator last asked for.
+///
+/// MPD has no album mode, so its `status` cannot report one: album
+/// order lives in the queue and `random` is off for it. Every
+/// now-playing publisher would otherwise have to guess, and the
+/// only guess available from `status` is "not shuffling" — which is
+/// how the control lost album across a refresh.
+///
+/// Only `set_shuffle` writes this. Mirrors `MuteCell`, which exists
+/// for the same reason: operator intent MPD does not carry.
+#[derive(Debug, Clone)]
+pub(crate) struct ShuffleModeCell {
+    mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl ShuffleModeCell {
+    pub(crate) fn new() -> Self {
+        Self {
+            mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        }
+    }
+
+    /// The mode the operator last asked for.
+    pub(crate) fn get(&self) -> ShuffleMode {
+        match self.mode.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => ShuffleMode::Tracks,
+            2 => ShuffleMode::Albums,
+            _ => ShuffleMode::Off,
+        }
+    }
+
+    /// Record it. Only `set_shuffle` calls this.
+    pub(crate) fn set(&self, mode: ShuffleMode) {
+        let v = match mode {
+            ShuffleMode::Off => 0u8,
+            ShuffleMode::Tracks => 1,
+            ShuffleMode::Albums => 2,
+        };
+        self.mode.store(v, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Default for ShuffleModeCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// What the report should say, given MPD's own flag and the mode
+/// the operator asked for.
+///
+/// MPD's `random` is the authority for track shuffle: another
+/// client can set it, and the report must not contradict the flag
+/// it publishes beside this. So `random` on is always `tracks` —
+/// `albums` can never be reported while that flag is true, which
+/// would be a report disagreeing with itself.
+///
+/// With `random` off, the remembered intent decides: `albums` if
+/// that is what was asked for, otherwise `off`. A remembered
+/// `tracks` with the flag off means something turned MPD's random
+/// off underneath us, and the flag wins.
+pub(crate) fn reported_shuffle_mode(
+    mpd_random: bool,
+    remembered: ShuffleMode,
+) -> ShuffleMode {
+    if mpd_random {
+        return ShuffleMode::Tracks;
+    }
+    match remembered {
+        ShuffleMode::Albums => ShuffleMode::Albums,
+        _ => ShuffleMode::Off,
     }
 }
 
@@ -351,6 +434,88 @@ mod tests {
                     "seed {seed}: {album} must be contiguous in {order:?}"
                 );
             }
+        }
+    }
+
+    /// The report must carry the mode, and must never claim
+    /// MPD's flag is on under album shuffle.
+    ///
+    /// Album order lives in the queue with `random` off, so a
+    /// report that read only `shuffle` said "not shuffling" and
+    /// the control lost album across a refresh. These are the two
+    /// ways that can go wrong: the mode omitted, or the flag
+    /// turned true to carry it.
+    #[test]
+    fn the_report_carries_album_mode_without_touching_the_flag() {
+        // Album shuffle in force: random is off, mode is albums.
+        assert_eq!(
+            reported_shuffle_mode(false, ShuffleMode::Albums),
+            ShuffleMode::Albums,
+            "album shuffle in force must report albums"
+        );
+        assert_eq!(
+            reported_shuffle_mode(false, ShuffleMode::Albums).as_str(),
+            "albums",
+            "and carry it as a token the glass can read"
+        );
+
+        // The flag is MPD's and album mode leaves it off. A
+        // report claiming random on under album shuffle would be
+        // disagreeing with the flag it publishes beside it.
+        for remembered in
+            [ShuffleMode::Off, ShuffleMode::Tracks, ShuffleMode::Albums]
+        {
+            if remembered == ShuffleMode::Albums {
+                assert!(
+                    !remembered.mpd_random(),
+                    "album mode must never ask for random on"
+                );
+            }
+            // Whatever was remembered, random on reports tracks
+            // and never albums: another client can set that flag.
+            assert_eq!(
+                reported_shuffle_mode(true, remembered),
+                ShuffleMode::Tracks,
+                "random on is always tracks, never albums ({remembered:?})"
+            );
+        }
+
+        // Off stays off, and a remembered tracks with the flag
+        // off means something turned MPD's random off under us.
+        assert_eq!(
+            reported_shuffle_mode(false, ShuffleMode::Off),
+            ShuffleMode::Off
+        );
+        assert_eq!(
+            reported_shuffle_mode(false, ShuffleMode::Tracks),
+            ShuffleMode::Off,
+            "the flag wins when it disagrees with the memory"
+        );
+    }
+
+    /// Every mode has a token, and they are the three the glass
+    /// reads.
+    #[test]
+    fn every_mode_has_a_wire_token() {
+        assert_eq!(ShuffleMode::Off.as_str(), "off");
+        assert_eq!(ShuffleMode::Tracks.as_str(), "tracks");
+        assert_eq!(ShuffleMode::Albums.as_str(), "albums");
+        // Round-trips, so the glass can send back what it read.
+        for m in [ShuffleMode::Off, ShuffleMode::Tracks, ShuffleMode::Albums] {
+            assert_eq!(ShuffleMode::parse(m.as_str()), Some(m));
+        }
+    }
+
+    /// The cell remembers what the operator asked for. Only
+    /// `set_shuffle` writes it; every publisher reads it.
+    #[test]
+    fn the_cell_remembers_the_mode() {
+        let cell = ShuffleModeCell::new();
+        assert_eq!(cell.get(), ShuffleMode::Off, "a fresh session is off");
+        for m in [ShuffleMode::Albums, ShuffleMode::Tracks, ShuffleMode::Off] {
+            cell.set(m);
+            assert_eq!(cell.get(), m);
+            assert_eq!(cell.clone().get(), m, "shared, not copied");
         }
     }
 

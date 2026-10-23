@@ -72,7 +72,7 @@ use crate::mpd::{
 use crate::PLUGIN_NAME;
 
 use super::command::{PlaybackCommand, PlaybackError};
-use super::report::PlaybackStateReport;
+use super::report::{IntentCells, PlaybackStateReport, PublisherIntent};
 use super::subject_emitter::SubjectEmitter;
 
 // ----- tuning constants -----
@@ -293,6 +293,10 @@ pub(crate) struct SupervisorSpawn {
     /// Operator mute. Shared with the ambient observer and
     /// the queue shelf.
     pub(crate) mute: crate::mute_cell::MuteCell,
+    /// The shuffle mode the operator asked for. MPD cannot
+    /// report an album mode, so every now-playing publisher
+    /// reads it from here instead of guessing.
+    pub(crate) shuffle: crate::album_shuffle::ShuffleModeCell,
 }
 
 pub(crate) async fn spawn(
@@ -359,7 +363,11 @@ pub(crate) async fn spawn(
         &subject_emitter,
         &mut file_tracker,
         io.music_directory.as_deref(),
-        io.mute.is_muted(),
+        IntentCells {
+            mute: &io.mute,
+            shuffle: &io.shuffle,
+        }
+        .read(),
     )
     .await?;
 
@@ -388,6 +396,7 @@ pub(crate) async fn spawn(
         file_tracker,
         music_directory: io.music_directory,
         muted: io.mute,
+        shuffle_mode: io.shuffle,
         pre_mute_volume: initial_pre_mute_volume,
     };
     let task_handle = tokio::spawn(task_state.run(
@@ -655,6 +664,10 @@ struct SupervisorTask {
     /// Operator mute. Same cell the ambient observer and the
     /// queue shelf read when they publish now_playing.
     muted: crate::mute_cell::MuteCell,
+    /// The shuffle mode the operator asked for. Same cell every
+    /// now-playing publisher reads; MPD cannot report an album
+    /// mode, so none of them may guess.
+    shuffle_mode: crate::album_shuffle::ShuffleModeCell,
     /// Captured volume to restore on `set_mute(false)`. Updated
     /// every time the warden issues `set_mute(true)`: the actor
     /// reads MPD's current volume via `status()` before sending
@@ -726,7 +739,11 @@ impl SupervisorTask {
                                     &self.subject_emitter,
                                     &mut self.file_tracker,
                                     self.music_directory.as_deref(),
-                                    self.muted.is_muted(),
+                                    IntentCells {
+                                        mute: &self.muted,
+                                        shuffle: &self.shuffle_mode,
+                                    }
+                                    .read(),
                                 ).await;
                             }
                         }
@@ -780,7 +797,11 @@ impl SupervisorTask {
                                 &mut self.cmd_conn,
                                 &self.endpoint,
                                 self.timeouts,
-                                self.muted.is_muted(),
+                                IntentCells {
+                                    mute: &self.muted,
+                                    shuffle: &self.shuffle_mode,
+                                }
+                                .read(),
                             ).await;
                             let _ = reply.send(result);
                         }
@@ -814,7 +835,11 @@ impl SupervisorTask {
                                 &self.subject_emitter,
                                 &mut self.file_tracker,
                                 self.music_directory.as_deref(),
-                                self.muted.is_muted(),
+                                IntentCells {
+                                    mute: &self.muted,
+                                    shuffle: &self.shuffle_mode,
+                                }
+                                .read(),
                             ).await;
                         }
                     }
@@ -914,10 +939,10 @@ async fn handle_query(
     cmd_conn: &mut MpdConnection,
     endpoint: &MpdEndpoint,
     timeouts: ConnectTimeouts,
-    muted: bool,
+    intent: PublisherIntent,
 ) -> Result<PlaybackStateReport, PlaybackError> {
     // First attempt on the current connection.
-    match do_query(cmd_conn, muted).await {
+    match do_query(cmd_conn, intent).await {
         Ok(report) => return Ok(report),
         Err(e) if !error_calls_for_reconnect(&e) => {
             return Err(classify_command_error(e));
@@ -942,18 +967,18 @@ async fn handle_query(
     reconnect_cmd_conn(cmd_conn, endpoint, timeouts).await?;
 
     // Retry the query once on the fresh connection.
-    do_query(cmd_conn, muted)
+    do_query(cmd_conn, intent)
         .await
         .map_err(classify_command_error)
 }
 
 async fn do_query(
     cmd_conn: &mut MpdConnection,
-    muted: bool,
+    intent: PublisherIntent,
 ) -> Result<PlaybackStateReport, MpdError> {
     let status = cmd_conn.status().await?;
     let song = cmd_conn.current_song().await?;
-    Ok(PlaybackStateReport::from_mpd(status, song, muted))
+    Ok(PlaybackStateReport::from_mpd(status, song, intent))
 }
 
 /// Cycle MPD output 0 (`disableoutput` + `enableoutput`) with the
@@ -1210,7 +1235,7 @@ async fn emit_initial_report(
     subject_emitter: &SubjectEmitter,
     file_tracker: &mut FileEmissionTracker,
     music_directory: Option<&std::path::Path>,
-    muted: bool,
+    intent: PublisherIntent,
 ) -> Result<(), PlaybackError> {
     let status = cmd_conn.status().await.map_err(classify_command_error)?;
     let song = cmd_conn
@@ -1221,7 +1246,7 @@ async fn emit_initial_report(
     // emitter can read the same song. MpdSong is cheap to clone
     // (a small fixed set of Option<String> plus a short String).
     let song_for_emitter = song.clone();
-    let report = PlaybackStateReport::from_mpd(status, song, muted);
+    let report = PlaybackStateReport::from_mpd(status, song, intent);
     let payload = report.serialise().into_bytes();
     if let Err(e) = reporter
         .report(custody_handle, payload, HealthStatus::Healthy)
@@ -1268,7 +1293,7 @@ async fn emit_best_effort_report(
     subject_emitter: &SubjectEmitter,
     file_tracker: &mut FileEmissionTracker,
     music_directory: Option<&std::path::Path>,
-    muted: bool,
+    intent: PublisherIntent,
 ) {
     let status = match cmd_conn.status().await {
         Ok(s) => s,
@@ -1324,7 +1349,7 @@ async fn emit_best_effort_report(
         }
     };
     let song_for_emitter = song.clone();
-    let report = PlaybackStateReport::from_mpd(status, song, muted);
+    let report = PlaybackStateReport::from_mpd(status, song, intent);
     let payload = report.serialise().into_bytes();
     if let Err(e) = reporter
         .report(custody_handle, payload, HealthStatus::Healthy)
@@ -1597,6 +1622,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -1651,6 +1677,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -1688,6 +1715,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -1761,6 +1789,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -1821,6 +1850,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -1842,6 +1872,93 @@ mod tests {
             seen.iter().all(|c| !c.starts_with("moveid ")),
             "track shuffle must not reorder the operator's queue: {seen:?}"
         );
+        handle.shutdown().await;
+    }
+
+    /// Album shuffle in force reaches the glass on the
+    /// now-playing subject, with MPD's flag still off.
+    ///
+    /// This is the whole carriage, end to end: the mode is read
+    /// from the cell the publisher holds, projected onto the
+    /// report, and rendered into the payload a subscriber
+    /// receives. The unit pins each cover one link of that and
+    /// stay green if a publisher reads a default cell instead of
+    /// the device's own, or if the projection drops the intent —
+    /// which is the original defect, the control losing album
+    /// across a refresh because the payload said "not shuffling".
+    #[tokio::test]
+    async fn the_now_playing_payload_says_albums_with_random_off() {
+        let (endpoint, _mock) = spawn_mock_mpd(vec![
+            ConnBehaviour::StandardWithSong {
+                file: "blue/1.flac".to_string(),
+                title: "One".to_string(),
+                artist: "Someone".to_string(),
+                album: "Blue".to_string(),
+            },
+            ConnBehaviour::HoldAfterWelcome,
+        ])
+        .await;
+
+        let (subjects, _relations, emitter) = capturing_emitter();
+        let reporter = Arc::new(CapturingReporter::default());
+        let reporter_dyn: Arc<dyn CustodyStateReporter> = reporter.clone();
+
+        // Album shuffle is already in force when the publisher
+        // starts — the operator set it, the plugin remembers it,
+        // and MPD's own flag is off because album order lives in
+        // the queue.
+        let shuffle = crate::album_shuffle::ShuffleModeCell::new();
+        shuffle.set(crate::album_shuffle::ShuffleMode::Albums);
+
+        let handle = spawn(
+            endpoint,
+            short_timeouts(),
+            test_custody_handle(),
+            reporter_dyn,
+            emitter,
+            null_protocol_settings_rx(),
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+                shuffle,
+            },
+        )
+        .await
+        .unwrap();
+
+        // The initial snapshot is published as the supervisor
+        // comes up; give it a moment to land.
+        let now_playing_payload = || {
+            (0..subjects.state_update_count()).find_map(|i| {
+                subjects.state_update_at(i).and_then(|(_, v)| {
+                    v.get("shuffle_mode").is_some().then_some(v)
+                })
+            })
+        };
+        for _ in 0..60 {
+            if now_playing_payload().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let v = now_playing_payload().unwrap_or_else(|| {
+            panic!(
+                "no now-playing payload carried a shuffle_mode at all; \
+                 {} update_state calls seen",
+                subjects.state_update_count()
+            )
+        });
+        assert_eq!(
+            v["shuffle_mode"], "albums",
+            "album shuffle in force must reach the glass: {v}"
+        );
+        assert_eq!(
+            v["shuffle"], false,
+            "and MPD's flag keeps its own meaning — album order is \
+             the queue's, so random is off: {v}"
+        );
+
         handle.shutdown().await;
     }
 
@@ -1877,6 +1994,7 @@ mod tests {
                 SupervisorSpawn {
                     music_directory: None,
                     mute: crate::mute_cell::MuteCell::new(),
+                    shuffle: crate::album_shuffle::ShuffleModeCell::new(),
                 },
             )
             .await
@@ -1930,6 +2048,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -1994,6 +2113,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -2042,6 +2162,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -2097,6 +2218,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -2137,6 +2259,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -2172,6 +2295,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -2220,6 +2344,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -2274,6 +2399,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -2319,6 +2445,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -2382,6 +2509,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await

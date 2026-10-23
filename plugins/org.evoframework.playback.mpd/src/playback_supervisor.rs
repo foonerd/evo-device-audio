@@ -42,9 +42,10 @@ mod subject_emitter;
 pub(crate) mod test_mock;
 
 // Public-within-crate surface. `lib.rs` consumes these from
-// `crate::playback_supervisor::{...}`. `report` types are not
-// re-exported because they are internal helpers used only inside
-// the module graph.
+// `crate::playback_supervisor::{...}`. The `report` types stay
+// internal apart from `IntentCells`, which names a parameter of
+// the re-exported `publish_now_playing_from_mpd` and so has to be
+// nameable by its callers.
 pub(crate) use actor::{
     spawn, SupervisorCommandSender, SupervisorHandle, SupervisorSpawn,
 };
@@ -52,6 +53,7 @@ pub(crate) use ambient_observer::{
     spawn as spawn_ambient_observer, AmbientObserverHandle,
 };
 pub(crate) use command::{PlaybackCommand, PlaybackError};
+pub(crate) use report::IntentCells;
 pub(crate) use startup_volume::{
     spawn as spawn_startup_volume_applier, StartupVolume,
     StartupVolumeApplierHandle,

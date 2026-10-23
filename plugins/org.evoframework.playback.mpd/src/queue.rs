@@ -118,6 +118,9 @@ pub(crate) struct QueueContext {
     /// `set_mute`. A transport publish that guesses `false`
     /// wipes a live mute on the hero surface.
     pub(crate) mute: crate::mute_cell::MuteCell,
+    /// The shuffle mode the operator asked for; published
+    /// beside MPD's own random flag on now_playing.
+    pub(crate) shuffle: crate::album_shuffle::ShuffleModeCell,
     /// In-memory mirror of the last published envelope, used
     /// by `queue.get_queue` to satisfy read-then-subscribe
     /// without round-tripping through the framework's subject
@@ -150,6 +153,7 @@ impl QueueContext {
             >,
         >,
         mute: crate::mute_cell::MuteCell,
+        shuffle: crate::album_shuffle::ShuffleModeCell,
     ) -> Self {
         Self {
             music_directory,
@@ -157,6 +161,7 @@ impl QueueContext {
             subjects,
             skip,
             mute,
+            shuffle,
             mirror: Arc::new(Mutex::new(None)),
             shelf_dispatcher,
         }
@@ -2439,7 +2444,11 @@ async fn publish_now_playing_after_transport(
         &ctx.subjects,
         status,
         song,
-        ctx.mute.is_muted(),
+        crate::playback_supervisor::IntentCells {
+            mute: &ctx.mute,
+            shuffle: &ctx.shuffle,
+        }
+        .read(),
     )
     .await;
 }
@@ -2536,6 +2545,7 @@ mod tests {
             skip,
             None,
             crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
         );
         (ctx, conn, commands)
     }
@@ -3245,6 +3255,7 @@ mod tests {
             skip,
             None,
             crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
         );
 
         for uri in [
@@ -3331,6 +3342,7 @@ mod tests {
             skip,
             None,
             crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
         );
 
         // Missing objectId after `dlna:<sid>/`.
@@ -3542,6 +3554,7 @@ mod tests {
             skip,
             None,
             crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
         );
 
         handle_play_from_position(
@@ -3629,6 +3642,7 @@ mod tests {
             skip,
             None,
             mute,
+            crate::album_shuffle::ShuffleModeCell::new(),
         );
 
         handle_enqueue_selection_criteria(
@@ -3741,6 +3755,7 @@ mod tests {
             skip,
             None,
             crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
         );
         (ctx, conn, ann, commands)
     }
@@ -3918,6 +3933,7 @@ mod tests {
             skip,
             Some(dispatcher as Arc<dyn evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher>),
             crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
         );
 
         let body = handle_enqueue_selection_container(
@@ -4002,6 +4018,7 @@ mod tests {
             skip,
             None,
             crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
         );
         (ctx, conn, playlists, commands)
     }
@@ -4209,6 +4226,7 @@ mod tests {
             skip,
             None,
             crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
         );
 
         handle_enqueue_selection_criteria(
@@ -4282,6 +4300,7 @@ mod tests {
             skip,
             None,
             crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
         );
 
         let outcome = handle_skip_to_next_available(
@@ -4372,6 +4391,7 @@ mod tests {
             skip,
             None,
             mute,
+            crate::album_shuffle::ShuffleModeCell::new(),
         );
 
         handle_skip_to_next_available(
@@ -4430,6 +4450,7 @@ mod tests {
             skip,
             None,
             crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
         );
 
         handle_play_from_position(

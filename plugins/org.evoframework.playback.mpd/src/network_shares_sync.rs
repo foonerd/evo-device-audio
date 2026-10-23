@@ -831,6 +831,7 @@ mod tests {
             skip,
             None,
             crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
         );
         let retract = RetractHandles {
             library,
@@ -1239,6 +1240,7 @@ mod tests {
             skip,
             None,
             crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
         );
         let retract = RetractHandles {
             library,
@@ -1317,6 +1319,7 @@ mod tests {
             skip,
             None,
             crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
         );
         let retract = RetractHandles {
             library,

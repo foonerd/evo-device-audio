@@ -479,6 +479,9 @@ pub struct MpdPlaybackPlugin {
     /// observer, and the queue shelf so a skip or a tap
     /// cannot paint the hero surface unmuted.
     mute: crate::mute_cell::MuteCell,
+    /// The shuffle mode the operator asked for. MPD has no
+    /// album mode, so the now-playing publishers read it here.
+    shuffle: crate::album_shuffle::ShuffleModeCell,
     /// Cumulative count of course corrections dispatched to the
     /// supervisor since construction. Counts attempts, not
     /// successes: a dispatched command that the supervisor then
@@ -726,6 +729,7 @@ impl MpdPlaybackPlugin {
                 false,
             )),
             mute: crate::mute_cell::MuteCell::new(),
+            shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             corrections_dispatched: 0,
             requests_handled: std::sync::atomic::AtomicU64::new(0),
             fragment_path: PathBuf::from(config::DEFAULT_FRAGMENT_PATH),
@@ -2422,6 +2426,7 @@ impl Plugin for MpdPlaybackPlugin {
                     ambient_emitter,
                     music_directory,
                     self.mute.clone(),
+                    self.shuffle.clone(),
                 ));
             tracing::info!(
                 plugin = PLUGIN_NAME,
@@ -2548,6 +2553,7 @@ impl Plugin for MpdPlaybackPlugin {
                 self.timeouts,
                 ctx.shelf_request_dispatcher.clone(),
                 self.mute.clone(),
+                self.shuffle.clone(),
             )
             .await;
             self.shelves = Some(shelves);
@@ -2831,6 +2837,7 @@ impl Warden for MpdPlaybackPlugin {
                             ),
                         ),
                     mute: self.mute.clone(),
+                    shuffle: self.shuffle.clone(),
                 },
             )
             .await
@@ -3332,6 +3339,10 @@ impl MpdPlaybackPlugin {
             }
         };
         let supervisor = self.active_supervisor("set_shuffle")?;
+        // Remembered before dispatch so the report cannot be
+        // published between the mode taking effect and this
+        // being written.
+        self.shuffle.set(mode);
         supervisor
             .command(PlaybackCommand::SetShuffle(mode))
             .await
@@ -5746,7 +5757,11 @@ mod tests {
     /// drive `handle_request` the way the glass does.
     async fn shelf_set_shuffle(
         payload: Value,
-    ) -> (Result<Response, PluginError>, Vec<String>) {
+    ) -> (
+        Result<Response, PluginError>,
+        Vec<String>,
+        crate::album_shuffle::ShuffleMode,
+    ) {
         let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (mut p, _mock) = loaded_plugin_with_mock(vec![
             ConnBehaviour::LiveQueue {
@@ -5769,15 +5784,19 @@ mod tests {
             .handle_request(&source_request("set_shuffle", payload))
             .await;
         let seen = commands.lock().unwrap().clone();
+        // What the now-playing publishers will read. The mode
+        // reaching MPD is not the same fact as the report being
+        // able to say so.
+        let remembered = p.shuffle.get();
         p.release_custody(handle).await.unwrap();
-        (got, seen)
+        (got, seen, remembered)
     }
 
     /// A shelf set_shuffle of albums reorders the queue and
     /// leaves MPD random off.
     #[tokio::test]
     async fn shelf_set_shuffle_albums_reorders_with_random_off() {
-        let (got, seen) =
+        let (got, seen, remembered) =
             shelf_set_shuffle(json!({ "v": 1, "mode": "albums" })).await;
         assert!(
             got.is_ok(),
@@ -5795,13 +5814,22 @@ mod tests {
             seen.iter().any(|c| c.starts_with("moveid ")),
             "the chosen album order must reach the queue: {seen:?}"
         );
+        // And the publishers can say so. The mode reaching MPD is
+        // not the same fact as the report carrying it: album order
+        // lives in the queue with random off, so a publisher that
+        // reads only MPD sees "not shuffling".
+        assert_eq!(
+            remembered,
+            crate::album_shuffle::ShuffleMode::Albums,
+            "the gesture must record the mode for now_playing"
+        );
     }
 
     /// A shelf set_shuffle of { enabled: true } is still track
     /// shuffle. This is the shape the fielded glass sends.
     #[tokio::test]
     async fn shelf_set_shuffle_enabled_true_is_still_track_shuffle() {
-        let (got, seen) =
+        let (got, seen, remembered) =
             shelf_set_shuffle(json!({ "v": 1, "enabled": true })).await;
         assert!(got.is_ok(), "the fielded shape must keep working: {got:?}");
         assert!(
@@ -5812,14 +5840,24 @@ mod tests {
             seen.iter().all(|c| !c.starts_with("moveid ")),
             "track shuffle must not reorder the operator's queue: {seen:?}"
         );
+        assert_eq!(
+            remembered,
+            crate::album_shuffle::ShuffleMode::Tracks,
+            "the fielded shape records track shuffle, not albums"
+        );
 
-        let (got_off, seen_off) =
+        let (got_off, seen_off, remembered_off) =
             shelf_set_shuffle(json!({ "v": 1, "enabled": false })).await;
         assert!(got_off.is_ok(), "{got_off:?}");
         assert!(
             seen_off.iter().any(|c| c == "random \"0\"")
                 && seen_off.iter().all(|c| !c.starts_with("moveid ")),
             "enabled false is plain off: {seen_off:?}"
+        );
+        assert_eq!(
+            remembered_off,
+            crate::album_shuffle::ShuffleMode::Off,
+            "and records off"
         );
     }
 
@@ -5832,7 +5870,7 @@ mod tests {
             json!({ "v": 1 }),
             json!({ "v": 1, "mode": "smart" }),
         ] {
-            let (got, seen) = shelf_set_shuffle(payload.clone()).await;
+            let (got, seen, _) = shelf_set_shuffle(payload.clone()).await;
             assert!(got.is_err(), "{payload} must be refused");
             assert!(
                 seen.iter()
@@ -6704,6 +6742,7 @@ mod tests {
             playback_supervisor::SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await

@@ -128,6 +128,7 @@ impl ShelfBundle {
             >,
         >,
         mute: crate::mute_cell::MuteCell,
+        shuffle: crate::album_shuffle::ShuffleModeCell,
     ) -> Self {
         let music_directory = source_probe::load_music_directory_from_mpd_conf(
             Path::new(source_probe::DEFAULT_MPD_CONF_PATH),
@@ -175,6 +176,7 @@ impl ShelfBundle {
             skip_traversal.clone(),
             shelf_dispatcher.clone(),
             mute,
+            shuffle,
         );
         let playlist = PlaylistContext::new(
             music_directory.clone(),

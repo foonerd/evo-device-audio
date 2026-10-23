@@ -60,7 +60,7 @@ use tokio::task::JoinHandle;
 use crate::mpd::{
     ConnectTimeouts, IdleSubsystem, MpdConnection, MpdEndpoint, MpdSong,
 };
-use crate::playback_supervisor::report::PlaybackStateReport;
+use crate::playback_supervisor::report::{IntentCells, PlaybackStateReport};
 use crate::playback_supervisor::subject_emitter::SubjectEmitter;
 
 const PLUGIN_NAME: &str = "org.evoframework.playback.mpd";
@@ -111,6 +111,7 @@ pub(crate) fn spawn(
     subject_emitter: SubjectEmitter,
     music_directory: Option<std::path::PathBuf>,
     mute: crate::mute_cell::MuteCell,
+    shuffle: crate::album_shuffle::ShuffleModeCell,
 ) -> AmbientObserverHandle {
     let shutdown = Arc::new(Notify::new());
     let task_shutdown = Arc::clone(&shutdown);
@@ -122,6 +123,7 @@ pub(crate) fn spawn(
             subject_emitter,
             music_directory,
             mute,
+            shuffle,
             task_shutdown,
         )
         .await;
@@ -136,6 +138,7 @@ async fn run(
     subject_emitter: SubjectEmitter,
     music_directory: Option<std::path::PathBuf>,
     mute: crate::mute_cell::MuteCell,
+    shuffle: crate::album_shuffle::ShuffleModeCell,
     shutdown: Arc<Notify>,
 ) {
     tracing::info!(
@@ -181,7 +184,10 @@ async fn run(
             &subject_emitter,
             music_directory.as_deref(),
             &mut last_probed_file,
-            &mute,
+            IntentCells {
+                mute: &mute,
+                shuffle: &shuffle,
+            },
         )
         .await;
 
@@ -195,7 +201,10 @@ async fn run(
             &subject_emitter,
             music_directory.as_deref(),
             &mut last_probed_file,
-            &mute,
+            IntentCells {
+                mute: &mute,
+                shuffle: &shuffle,
+            },
             &shutdown,
         )
         .await;
@@ -251,7 +260,7 @@ async fn run_inner(
     subject_emitter: &SubjectEmitter,
     music_directory: Option<&std::path::Path>,
     last_probed_file: &mut Option<String>,
-    mute: &crate::mute_cell::MuteCell,
+    cells: IntentCells<'_>,
     shutdown: &Arc<Notify>,
 ) {
     // The supervisor uses the same idle subsystems + a 24-hour
@@ -290,7 +299,7 @@ async fn run_inner(
                             subject_emitter,
                             music_directory,
                             last_probed_file,
-                            mute,
+                            cells,
                         )
                         .await;
                     }
@@ -333,7 +342,7 @@ async fn emit_now_playing(
     subject_emitter: &SubjectEmitter,
     music_directory: Option<&std::path::Path>,
     last_probed_file: &mut Option<String>,
-    mute: &crate::mute_cell::MuteCell,
+    cells: IntentCells<'_>,
 ) {
     let status = match cmd_conn.status().await {
         Ok(s) => s,
@@ -384,7 +393,7 @@ async fn emit_now_playing(
     )
     .await;
 
-    let report = PlaybackStateReport::from_mpd(status, song, mute.is_muted());
+    let report = PlaybackStateReport::from_mpd(status, song, cells.read());
     subject_emitter.update_now_playing(&report).await;
 }
 

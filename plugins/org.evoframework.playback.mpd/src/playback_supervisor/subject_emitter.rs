@@ -75,7 +75,9 @@ use evo_plugin_sdk::contract::{
 use serde_json::json;
 
 use crate::mpd::{MpdSong, PlayState};
-use crate::playback_supervisor::report::PlaybackStateReport;
+use crate::playback_supervisor::report::{
+    PlaybackStateReport, PublisherIntent,
+};
 use crate::PLUGIN_NAME;
 
 // ----- catalogue-aligned constants -----
@@ -631,9 +633,9 @@ pub(crate) async fn publish_now_playing_from_mpd(
     subjects: &Arc<dyn SubjectAnnouncer>,
     status: crate::mpd::MpdStatus,
     song: Option<MpdSong>,
-    muted: bool,
+    intent: PublisherIntent,
 ) {
-    let report = PlaybackStateReport::from_mpd(status, song, muted);
+    let report = PlaybackStateReport::from_mpd(status, song, intent);
     publish_now_playing_report(subjects, &report).await;
 }
 
@@ -728,7 +730,12 @@ pub(crate) fn render_now_playing_state(
         "volume":          volume,
         "muted":           report.muted,
         "repeat":          report.repeat,
+        // MPD's flag, unchanged. Album order lives in the
+        // queue with random off, so this reads false there.
         "shuffle":         report.shuffle,
+        // What the operator asked for, which MPD cannot report.
+        // The glass reads this and does not guess.
+        "shuffle_mode":    report.shuffle_mode.as_str(),
         "single":          report.single,
         "consume":         report.consume,
     })
@@ -1606,6 +1613,42 @@ mod tests {
         CurrentSongReport, PlaybackStateReport,
     };
 
+    /// The glass reads `shuffle_mode` and does not guess.
+    ///
+    /// MPD's `random` is off under album shuffle, so a payload
+    /// carrying only `shuffle` says "not shuffling" — which is
+    /// how the control lost album across a refresh. The flag
+    /// keeps its meaning; the mode rides beside it.
+    #[test]
+    fn now_playing_carries_the_shuffle_mode_beside_the_flag() {
+        let mut r = now_playing_playing(1_000);
+        r.shuffle = false;
+        r.shuffle_mode = crate::album_shuffle::ShuffleMode::Albums;
+        let v = render_now_playing_state(&r);
+        assert_eq!(
+            v["shuffle_mode"], "albums",
+            "album shuffle in force must reach the glass: {v}"
+        );
+        assert_eq!(
+            v["shuffle"], false,
+            "and MPD's flag keeps its meaning: {v}"
+        );
+
+        // Track shuffle: the flag is on and the mode says so.
+        let mut t = now_playing_playing(1_000);
+        t.shuffle = true;
+        t.shuffle_mode = crate::album_shuffle::ShuffleMode::Tracks;
+        let v = render_now_playing_state(&t);
+        assert_eq!(v["shuffle"], true);
+        assert_eq!(v["shuffle_mode"], "tracks");
+
+        // Off: both say so.
+        let o = now_playing_playing(1_000);
+        let v = render_now_playing_state(&o);
+        assert_eq!(v["shuffle"], false);
+        assert_eq!(v["shuffle_mode"], "off");
+    }
+
     fn now_playing_playing(elapsed_ms: u64) -> PlaybackStateReport {
         PlaybackStateReport {
             state: PlayState::Playing,
@@ -1616,6 +1659,7 @@ mod tests {
             muted: false,
             repeat: false,
             shuffle: false,
+            shuffle_mode: crate::album_shuffle::ShuffleMode::Off,
             single: false,
             consume: false,
             current_song: Some(CurrentSongReport {
@@ -1639,6 +1683,7 @@ mod tests {
             muted: false,
             repeat: false,
             shuffle: false,
+            shuffle_mode: crate::album_shuffle::ShuffleMode::Off,
             single: false,
             consume: false,
             current_song: None,
