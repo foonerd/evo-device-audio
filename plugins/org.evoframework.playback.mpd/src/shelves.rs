@@ -217,6 +217,12 @@ impl ShelfBundle {
             registry.clone(),
             subjects.clone(),
             shelf_dispatcher.clone(),
+        )
+        .with_forgotten(
+            crate::forgotten_tracks::ForgottenTracks::open(
+                state_dir.join("forgotten-tracks.toml"),
+            )
+            .await,
         );
         // The triage context clones the library, registry, and
         // subject announcer — every field is Arc-wrapped, so
@@ -756,6 +762,7 @@ impl ShelfBundle {
                     parse_json(req)?;
                 let body = crate::play_history::handle_recently_played(
                     &self.play_history,
+                    &self.library.forgotten,
                     payload,
                 )
                 .await
@@ -767,6 +774,18 @@ impl ShelfBundle {
                     parse_json(req)?;
                 let body = crate::play_history::handle_most_played(
                     &self.play_history,
+                    &self.library.forgotten,
+                    payload,
+                )
+                .await
+                .map_err(library_verb_to_plugin_error)?;
+                Ok(Some(encode_json_response(req, &body)?))
+            }
+            "library.forget_track" => {
+                let payload: crate::forgotten_tracks::ForgetTrackPayload =
+                    parse_json(req)?;
+                let body = crate::forgotten_tracks::handle_forget_track(
+                    &self.library,
                     payload,
                 )
                 .await
@@ -1375,6 +1394,7 @@ impl ShelfBundle {
         let mut conn = self.open_conn().await?;
         let env = library::handle_browse_by_tag(
             &mut conn,
+            &self.library.forgotten,
             payload,
             verb_name,
             tag,
@@ -1554,7 +1574,8 @@ fn library_verb_to_plugin_error(e: library::VerbError) -> PluginError {
         | VerbError::UnknownWork { .. }
         | VerbError::RewritePrefixInvalid
         | VerbError::RewritePrefixUnchanged
-        | VerbError::ParkPrefixInvalid => PluginError::Permanent(e.to_string()),
+        | VerbError::ParkPrefixInvalid
+        | VerbError::ForgetUriEmpty => PluginError::Permanent(e.to_string()),
         // WorkAggregateNotReady is transient — the next
         // Database / Update idle event populates the cache.
         // Operator retry succeeds; treat as transient so
@@ -1710,6 +1731,25 @@ mod tests {
             }
             other => panic!(
                 "duplicate must dispatch and refuse favourites: {other:?}"
+            ),
+        }
+        bundle.shutdown().await;
+    }
+
+    /// `library.forget_track` is reachable on this shelf: an
+    /// empty URI is refused by the verb, not dropped as
+    /// unmatched.
+    #[tokio::test]
+    async fn forget_track_dispatches_on_the_library_shelf() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = live_bundle(dir.path()).await;
+        let req = request("library.forget_track", r#"{"v":1,"uri":""}"#);
+        match bundle.dispatch_request(&req).await {
+            Err(PluginError::Permanent(msg)) => {
+                assert!(msg.contains("must not be empty"), "{msg}")
+            }
+            other => panic!(
+                "forget_track must dispatch and refuse an empty uri: {other:?}"
             ),
         }
         bundle.shutdown().await;

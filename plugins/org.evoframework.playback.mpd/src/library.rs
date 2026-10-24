@@ -127,6 +127,11 @@ pub(crate) struct LibraryContext {
     /// manifest declares it and eliminates the MPD-music_directory
     /// error surface for network sources.
     pub(crate) shelf_dispatcher: Option<Arc<dyn ShelfRequestDispatcher>>,
+    /// Tracks the operator has forgotten. Every answer that lists
+    /// tracks — browse, search, the facet drills, the two
+    /// play-history reads — omits them. See
+    /// [`crate::forgotten_tracks`].
+    pub(crate) forgotten: crate::forgotten_tracks::ForgottenTracks,
 }
 
 impl LibraryContext {
@@ -145,7 +150,18 @@ impl LibraryContext {
             state_mirror: Arc::new(Mutex::new(None)),
             works_aggregate: Arc::new(Mutex::new(None)),
             shelf_dispatcher,
+            forgotten: crate::forgotten_tracks::ForgottenTracks::default(),
         }
+    }
+
+    /// Keep the forgotten set here. Without this the context
+    /// forgets nothing across a restart.
+    pub(crate) fn with_forgotten(
+        mut self,
+        forgotten: crate::forgotten_tracks::ForgottenTracks,
+    ) -> Self {
+        self.forgotten = forgotten;
+        self
     }
 }
 
@@ -596,6 +612,8 @@ pub(crate) enum VerbError {
         "library.park_uri_prefix: prefix must be a non-empty MPD folder path"
     )]
     ParkPrefixInvalid,
+    #[error("library.forget_track: uri must not be empty")]
+    ForgetUriEmpty,
 }
 
 fn check_version(v: u32, verb: &str) -> Result<(), VerbError> {
@@ -1957,8 +1975,14 @@ pub(crate) async fn handle_browse_library(
             .get(&(payload.source_id.clone(), path.clone()))
             .cloned();
         drop(cache);
+        // The cache holds the listing as MPD gave it; what the
+        // operator has forgotten is taken out on the way to the
+        // answer, so forgetting needs no refresh.
         let full_entries: Vec<serde_json::Value> =
-            cached.map(|c| c.entries).unwrap_or_default();
+            crate::forgotten_tracks::omit_forgotten(
+                cached.map(|c| c.entries).unwrap_or_default(),
+                &ctx.forgotten.snapshot().await,
+            );
         let (page_entries, next_page, truncated) =
             paginate(&full_entries, range_start, page_size);
         return Ok(json!({
@@ -2070,8 +2094,14 @@ pub(crate) async fn handle_browse_library(
             },
         );
     }
+    // Cached as MPD gave it; answered without what the operator
+    // has forgotten.
+    let shown = crate::forgotten_tracks::omit_forgotten(
+        rendered,
+        &ctx.forgotten.snapshot().await,
+    );
     let (page_entries, next_page, truncated) =
-        paginate(&rendered, range_start, page_size);
+        paginate(&shown, range_start, page_size);
     Ok(json!({
         "v":            LIBRARY_PAYLOAD_VERSION,
         "source_id":    payload.source_id,
@@ -2081,7 +2111,7 @@ pub(crate) async fn handle_browse_library(
         "source_state": record.state,
         "page":         page,
         "page_size":    page_size,
-        "total":        rendered.len(),
+        "total":        shown.len(),
         "truncated":    truncated,
         "next_page":    next_page,
     }))
@@ -2192,6 +2222,7 @@ pub(crate) struct BrowseSelectorParent {
 /// [`handle_search_library`].
 pub(crate) async fn handle_browse_by_tag(
     conn: &mut MpdConnection,
+    forgotten: &crate::forgotten_tracks::ForgottenTracks,
     payload: BrowseByTagPayload,
     verb_name: &'static str,
     tag: &'static str,
@@ -2204,7 +2235,8 @@ pub(crate) async fn handle_browse_by_tag(
     let page_size = requested_size.clamp(1, BROWSE_HARD_CAP);
     let range_start = page.saturating_mul(page_size);
 
-    // Drill path — return TRACKS matching the selector.
+    // Drill path — return TRACKS matching the selector, minus
+    // what the operator has forgotten.
     if let Some(selector) = payload.select.as_ref() {
         return drill_by_tag(
             conn,
@@ -2214,7 +2246,7 @@ pub(crate) async fn handle_browse_by_tag(
             selector,
             page,
             page_size,
-            range_start,
+            &forgotten.snapshot().await,
         )
         .await;
     }
@@ -2734,8 +2766,9 @@ async fn drill_by_tag(
     selector: &BrowseSelector,
     page: usize,
     page_size: usize,
-    range_start: usize,
+    forgotten: &std::collections::BTreeSet<String>,
 ) -> Result<serde_json::Value, VerbError> {
+    let range_start = page.saturating_mul(page_size);
     let selector_value = selector.value.trim();
     if selector_value.is_empty() {
         return Err(VerbError::Mpd {
@@ -2979,15 +3012,19 @@ async fn drill_by_tag(
     // Render the tracks in the same file-entry shape
     // handle_search_library uses so any consumer of that
     // envelope reads the drill response identically.
-    let rendered: Vec<serde_json::Value> = entries
-        .iter()
-        .filter_map(|e| match e {
-            crate::mpd::MpdLibraryEntry::File { .. } => {
-                Some(render_library_entry(e, None))
-            }
-            _ => None,
-        })
-        .collect();
+    let rendered: Vec<serde_json::Value> =
+        crate::forgotten_tracks::omit_forgotten(
+            entries
+                .iter()
+                .filter_map(|e| match e {
+                    crate::mpd::MpdLibraryEntry::File { .. } => {
+                        Some(render_library_entry(e, None))
+                    }
+                    _ => None,
+                })
+                .collect(),
+            forgotten,
+        );
 
     let (page_entries, next_page, truncated) =
         paginate(&rendered, range_start, page_size);
@@ -3539,7 +3576,15 @@ pub(crate) async fn handle_search_library(
         let render_ctx = RenderCtx {
             music_directory: &ctx.music_directory,
         };
+        let forgotten = ctx.forgotten.snapshot().await;
         for e in entries {
+            // A forgotten track is not a result, and does not
+            // count toward the cap.
+            if let crate::mpd::MpdLibraryEntry::File { path, .. } = &e {
+                if forgotten.contains(path) {
+                    continue;
+                }
+            }
             let mut item = render_library_entry(&e, Some(render_ctx));
             item.as_object_mut().unwrap().insert(
                 "source_id".to_string(),

@@ -387,9 +387,11 @@ fn check_version(v: u32, verb: &str) -> Result<(), VerbError> {
     Ok(())
 }
 
-/// `library.recently_played` — the last plays, newest first.
+/// `library.recently_played` — the last plays, newest first,
+/// without the tracks the operator has forgotten.
 pub(crate) async fn handle_recently_played(
     history: &PlayHistory,
+    forgotten: &crate::forgotten_tracks::ForgottenTracks,
     payload: HistoryReadPayload,
 ) -> Result<serde_json::Value, VerbError> {
     check_version(payload.v, "library.recently_played")?;
@@ -398,10 +400,13 @@ pub(crate) async fn handle_recently_played(
         .map(|l| l as usize)
         .unwrap_or(RECENT_CAP)
         .min(RECENT_CAP);
+    let forgotten = forgotten.snapshot().await;
     let plays: Vec<serde_json::Value> = history
-        .recently_played(limit)
+        .recently_played(RECENT_CAP)
         .await
         .into_iter()
+        .filter(|p| !forgotten.contains(&p.uri))
+        .take(limit)
         .map(|p| json!({ "uri": p.uri, "finished_at": p.finished_at }))
         .collect();
     Ok(json!({
@@ -415,9 +420,11 @@ pub(crate) async fn handle_recently_played(
 pub(crate) const MOST_PLAYED_CAP: usize = 1000;
 
 /// `library.most_played` — every track that has finished at
-/// least once, highest count first.
+/// least once, highest count first, without the tracks the
+/// operator has forgotten.
 pub(crate) async fn handle_most_played(
     history: &PlayHistory,
+    forgotten: &crate::forgotten_tracks::ForgottenTracks,
     payload: HistoryReadPayload,
 ) -> Result<serde_json::Value, VerbError> {
     check_version(payload.v, "library.most_played")?;
@@ -426,10 +433,13 @@ pub(crate) async fn handle_most_played(
         .map(|l| l as usize)
         .unwrap_or(RECENT_CAP)
         .min(MOST_PLAYED_CAP);
+    let forgotten = forgotten.snapshot().await;
     let tracks: Vec<serde_json::Value> = history
-        .most_played(limit)
+        .most_played(MOST_PLAYED_CAP)
         .await
         .into_iter()
+        .filter(|c| !forgotten.contains(&c.uri))
+        .take(limit)
         .map(|c| {
             json!({
                 "uri": c.uri,
@@ -939,6 +949,7 @@ mod tests {
         h.record_finish("a.flac", 3).await;
         let recent = handle_recently_played(
             &h,
+            &crate::forgotten_tracks::ForgottenTracks::default(),
             HistoryReadPayload {
                 v: 1,
                 limit: Some(2),
@@ -951,10 +962,13 @@ mod tests {
         assert_eq!(recent["plays"][0]["uri"], "a.flac");
         assert_eq!(recent["plays"][0]["finished_at"], 3);
         assert_eq!(recent["plays"][1]["uri"], "b.flac");
-        let most =
-            handle_most_played(&h, HistoryReadPayload { v: 1, limit: None })
-                .await
-                .unwrap();
+        let most = handle_most_played(
+            &h,
+            &crate::forgotten_tracks::ForgottenTracks::default(),
+            HistoryReadPayload { v: 1, limit: None },
+        )
+        .await
+        .unwrap();
         let tracks = most["tracks"].as_array().unwrap();
         assert_eq!(tracks.len(), 2);
         assert_eq!(tracks[0]["uri"], "a.flac");
@@ -964,6 +978,7 @@ mod tests {
         // A limit over the cap is the cap.
         let over = handle_recently_played(
             &h,
+            &crate::forgotten_tracks::ForgottenTracks::default(),
             HistoryReadPayload {
                 v: 1,
                 limit: Some(9_999),
@@ -977,9 +992,12 @@ mod tests {
             "a limit over the cap is the cap, and the cap holds all three"
         );
         // The wrong version is refused.
-        let bad =
-            handle_most_played(&h, HistoryReadPayload { v: 2, limit: None })
-                .await;
+        let bad = handle_most_played(
+            &h,
+            &crate::forgotten_tracks::ForgottenTracks::default(),
+            HistoryReadPayload { v: 2, limit: None },
+        )
+        .await;
         assert!(matches!(bad, Err(VerbError::PayloadVersion { .. })));
     }
 }

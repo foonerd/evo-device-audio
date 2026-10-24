@@ -113,6 +113,7 @@ mod config;
 mod disposition_emitter;
 mod envelope_subscriber;
 mod favourites;
+mod forgotten_tracks;
 mod gone_curation;
 mod idle_observer;
 mod last_queue;
@@ -308,6 +309,7 @@ const SOURCE_REQUEST_TYPES: &[&str] = &[
     "library.reconcile_triage",
     "library.recently_played",
     "library.most_played",
+    "library.forget_track",
 ];
 
 /// Wire-protocol payload version every source-verb request

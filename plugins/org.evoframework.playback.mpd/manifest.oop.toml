@@ -110,6 +110,7 @@ request_types = [
     "library.reconcile_triage",
     "library.recently_played",
     "library.most_played",
+    "library.forget_track",
 ]
 
 [kind]
@@ -296,6 +297,7 @@ request_types = [
     "library.reconcile_triage",
     "library.recently_played",
     "library.most_played",
+    "library.forget_track",
 ]
 # USB Remove waits here for detach + MPD prune. See
 # manifest.toml for the 2 s → 30 s reason.

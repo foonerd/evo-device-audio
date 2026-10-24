@@ -1006,6 +1006,25 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                         }
                         out.push_str("OK\n");
                         out
+                    } else if cmd.starts_with("search ") {
+                        // `search any "<q>"`: every file in the
+                        // library whose path contains the query,
+                        // case-insensitively.
+                        let q = args(&cmd)
+                            .get(1)
+                            .cloned()
+                            .unwrap_or_default()
+                            .to_lowercase();
+                        let mut out = String::new();
+                        for (_, _, files) in library.iter() {
+                            for f in files {
+                                if f.to_lowercase().contains(&q) {
+                                    out.push_str(&format!("file: {f}\n"));
+                                }
+                            }
+                        }
+                        out.push_str("OK\n");
+                        out
                     } else if cmd.starts_with("playlistadd") {
                         let a = args(&cmd);
                         if a.len() >= 2 {
