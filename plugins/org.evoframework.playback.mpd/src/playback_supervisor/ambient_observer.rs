@@ -60,6 +60,7 @@ use tokio::task::JoinHandle;
 use crate::mpd::{
     ConnectTimeouts, IdleSubsystem, MpdConnection, MpdEndpoint, MpdSong,
 };
+use crate::play_history::PlayHistory;
 use crate::playback_supervisor::report::{IntentCells, PlaybackStateReport};
 use crate::playback_supervisor::subject_emitter::SubjectEmitter;
 
@@ -109,38 +110,50 @@ pub(crate) fn spawn(
     endpoint: MpdEndpoint,
     timeouts: ConnectTimeouts,
     subject_emitter: SubjectEmitter,
-    music_directory: Option<std::path::PathBuf>,
-    mute: crate::mute_cell::MuteCell,
-    shuffle: crate::album_shuffle::ShuffleModeCell,
+    inputs: AmbientInputs,
 ) -> AmbientObserverHandle {
     let shutdown = Arc::new(Notify::new());
     let task_shutdown = Arc::clone(&shutdown);
 
     let task = tokio::spawn(async move {
-        run(
-            endpoint,
-            timeouts,
-            subject_emitter,
-            music_directory,
-            mute,
-            shuffle,
-            task_shutdown,
-        )
-        .await;
+        run(endpoint, timeouts, subject_emitter, inputs, task_shutdown).await;
     });
 
     AmbientObserverHandle { task, shutdown }
+}
+
+/// What the observer is handed at spawn besides its connection:
+/// where the music is, the two cells the publisher reads, and the
+/// play history every wake feeds.
+pub(crate) struct AmbientInputs {
+    pub(crate) music_directory: Option<std::path::PathBuf>,
+    pub(crate) mute: crate::mute_cell::MuteCell,
+    pub(crate) shuffle: crate::album_shuffle::ShuffleModeCell,
+    pub(crate) history: PlayHistory,
+}
+
+/// What one wake reads and writes besides the subjects: the
+/// intent cells for the report, and the play history for the
+/// track that was playing.
+#[derive(Clone, Copy)]
+struct Watch<'a> {
+    cells: IntentCells<'a>,
+    history: &'a PlayHistory,
 }
 
 async fn run(
     endpoint: MpdEndpoint,
     timeouts: ConnectTimeouts,
     subject_emitter: SubjectEmitter,
-    music_directory: Option<std::path::PathBuf>,
-    mute: crate::mute_cell::MuteCell,
-    shuffle: crate::album_shuffle::ShuffleModeCell,
+    inputs: AmbientInputs,
     shutdown: Arc<Notify>,
 ) {
+    let AmbientInputs {
+        music_directory,
+        mute,
+        shuffle,
+        history,
+    } = inputs;
     tracing::info!(
         plugin = PLUGIN_NAME,
         endpoint = %endpoint,
@@ -179,15 +192,19 @@ async fn run(
         // immediately rather than waiting for the next
         // transition.
         let mut cmd_conn = cmd_conn;
+        let watch = Watch {
+            cells: IntentCells {
+                mute: &mute,
+                shuffle: &shuffle,
+            },
+            history: &history,
+        };
         emit_now_playing(
             &mut cmd_conn,
             &subject_emitter,
             music_directory.as_deref(),
             &mut last_probed_file,
-            IntentCells {
-                mute: &mute,
-                shuffle: &shuffle,
-            },
+            watch,
         )
         .await;
 
@@ -201,10 +218,7 @@ async fn run(
             &subject_emitter,
             music_directory.as_deref(),
             &mut last_probed_file,
-            IntentCells {
-                mute: &mute,
-                shuffle: &shuffle,
-            },
+            watch,
             &shutdown,
         )
         .await;
@@ -260,7 +274,7 @@ async fn run_inner(
     subject_emitter: &SubjectEmitter,
     music_directory: Option<&std::path::Path>,
     last_probed_file: &mut Option<String>,
-    cells: IntentCells<'_>,
+    watch: Watch<'_>,
     shutdown: &Arc<Notify>,
 ) {
     // The supervisor uses the same idle subsystems + a 24-hour
@@ -299,7 +313,7 @@ async fn run_inner(
                             subject_emitter,
                             music_directory,
                             last_probed_file,
-                            cells,
+                            watch,
                         )
                         .await;
                     }
@@ -342,7 +356,7 @@ async fn emit_now_playing(
     subject_emitter: &SubjectEmitter,
     music_directory: Option<&std::path::Path>,
     last_probed_file: &mut Option<String>,
-    cells: IntentCells<'_>,
+    watch: Watch<'_>,
 ) {
     let status = match cmd_conn.status().await {
         Ok(s) => s,
@@ -366,6 +380,16 @@ async fn emit_now_playing(
             return;
         }
     };
+    // What this wake saw goes to the play history first: if the
+    // track that was playing at the last wake has reached its
+    // end and the player moved on, that is a finished play, and
+    // this is the one place every transition passes through
+    // whether or not a custody is live.
+    watch
+        .history
+        .observe(std::time::Instant::now(), &status, song.as_ref())
+        .await;
+
     // Publish the source codec name BEFORE now_playing. The
     // source_codec is derived from the file extension on the
     // currentsong file: path; `None` covers both "no current
@@ -393,7 +417,8 @@ async fn emit_now_playing(
     )
     .await;
 
-    let report = PlaybackStateReport::from_mpd(status, song, cells.read());
+    let report =
+        PlaybackStateReport::from_mpd(status, song, watch.cells.read());
     subject_emitter.update_now_playing(&report).await;
 }
 
@@ -623,6 +648,66 @@ mod tests {
             new_source.is_null() || new_source["kind"] != "dsd",
             "post-transition source must NOT carry stale DSD shape; \
              got {new_source}"
+        );
+    }
+
+    /// The observer feeds the play history: a track seen near
+    /// its end, then the player on the next song after an idle
+    /// wake, is one recorded play — the whole observer, brought
+    /// up the way load brings it up, against a mock MPD.
+    #[tokio::test]
+    async fn a_finished_track_is_recorded_by_the_observer() {
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        // Command connection: song A at 179.5 of 180 on the
+        // first read, song B from the second. Idle connection:
+        // one `changed: player`, then hold.
+        let (endpoint, _mock) = spawn_mock_mpd(vec![
+            ConnBehaviour::FinishesThenAdvances {
+                first: "INTERNAL/a.flac".to_string(),
+                second: "INTERNAL/b.flac".to_string(),
+            },
+            ConnBehaviour::IdleOnceThenHold,
+        ])
+        .await;
+        let history = PlayHistory::disabled();
+        let handle = spawn(
+            endpoint,
+            short_timeouts(),
+            SubjectEmitter::null(),
+            AmbientInputs {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                history: history.clone(),
+            },
+        );
+        let mut recent = Vec::new();
+        for _ in 0..60 {
+            recent = history.recently_played(10).await;
+            if !recent.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Not `handle.stop().await`: `stop` fires one notify, the
+        // inner idle loop consumes it, and the outer loop's
+        // re-check finds no permit and reconnects forever — so a
+        // stop issued while the observer is in its idle loop never
+        // returns. That is the observer's, not this row's; the
+        // task is dropped with the test runtime instead.
+        drop(handle);
+        assert_eq!(recent.len(), 1, "one finish, recorded once: {recent:?}");
+        assert_eq!(
+            recent[0].uri, "INTERNAL/a.flac",
+            "the track that finished, not the one playing"
+        );
+        let most = history.most_played(10).await;
+        assert_eq!(most.len(), 1);
+        assert_eq!(
+            (most[0].uri.as_str(), most[0].count),
+            ("INTERNAL/a.flac", 1)
         );
     }
 

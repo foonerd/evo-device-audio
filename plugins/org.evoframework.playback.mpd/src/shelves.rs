@@ -105,8 +105,22 @@ pub(crate) struct ShelfBundle {
     /// discovered.json sidecar and probes them on a fixed
     /// cadence. Held so unload can stop the task cleanly.
     pub(crate) dlna_sync: Option<DlnaSyncHandle>,
+    /// Finished plays, recorded by the ambient observer; the
+    /// library's `recently_played` / `most_played` read it.
+    pub(crate) play_history: crate::play_history::PlayHistory,
     pub(crate) endpoint: MpdEndpoint,
     pub(crate) timeouts: ConnectTimeouts,
+}
+
+/// What the plugin holds and the shelves read: the two intent
+/// cells the now-playing publishers share, and the play history
+/// the library's two history reads answer from. Handed to
+/// [`ShelfBundle::init`] as one value, the way the ambient
+/// observer takes its inputs.
+pub(crate) struct ShelfInputs {
+    pub(crate) mute: crate::mute_cell::MuteCell,
+    pub(crate) shuffle: crate::album_shuffle::ShuffleModeCell,
+    pub(crate) play_history: crate::play_history::PlayHistory,
 }
 
 impl ShelfBundle {
@@ -127,9 +141,13 @@ impl ShelfBundle {
                 dyn evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher,
             >,
         >,
-        mute: crate::mute_cell::MuteCell,
-        shuffle: crate::album_shuffle::ShuffleModeCell,
+        inputs: ShelfInputs,
     ) -> Self {
+        let ShelfInputs {
+            mute,
+            shuffle,
+            play_history,
+        } = inputs;
         let music_directory = source_probe::load_music_directory_from_mpd_conf(
             Path::new(source_probe::DEFAULT_MPD_CONF_PATH),
         )
@@ -341,6 +359,7 @@ impl ShelfBundle {
             sticker_reconciler,
             idle_observer,
             dlna_sync,
+            play_history,
             endpoint,
             timeouts,
         }
@@ -731,6 +750,28 @@ impl ShelfBundle {
             )),
             "library.get_triage" => {
                 Ok(Some(self.dispatch_library_get_triage(req).await?))
+            }
+            "library.recently_played" => {
+                let payload: crate::play_history::HistoryReadPayload =
+                    parse_json(req)?;
+                let body = crate::play_history::handle_recently_played(
+                    &self.play_history,
+                    payload,
+                )
+                .await
+                .map_err(library_verb_to_plugin_error)?;
+                Ok(Some(encode_json_response(req, &body)?))
+            }
+            "library.most_played" => {
+                let payload: crate::play_history::HistoryReadPayload =
+                    parse_json(req)?;
+                let body = crate::play_history::handle_most_played(
+                    &self.play_history,
+                    payload,
+                )
+                .await
+                .map_err(library_verb_to_plugin_error)?;
+                Ok(Some(encode_json_response(req, &body)?))
             }
             "library.reconcile_triage" => {
                 Ok(Some(self.dispatch_library_reconcile_triage(req).await?))
@@ -1563,10 +1604,43 @@ mod tests {
             endpoint,
             short_timeouts(),
             None,
-            crate::mute_cell::MuteCell::new(),
-            crate::album_shuffle::ShuffleModeCell::new(),
+            ShelfInputs {
+                mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                play_history: crate::play_history::PlayHistory::disabled(),
+            },
         )
         .await
+    }
+
+    /// The two history reads are reachable on this shelf, and a
+    /// bundle whose history holds one finish answers it: a row
+    /// on `recently_played`, a count of one on `most_played`.
+    #[tokio::test]
+    async fn the_history_reads_dispatch_on_the_library_shelf() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = live_bundle(dir.path()).await;
+        bundle
+            .play_history
+            .record_finish("INTERNAL/a.flac", 7)
+            .await;
+
+        let req = request("library.recently_played", r#"{"v":1}"#);
+        let resp = bundle.dispatch_request(&req).await.unwrap().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v["plays"][0]["uri"], "INTERNAL/a.flac", "{v}");
+        assert_eq!(v["plays"][0]["finished_at"], 7);
+
+        let req = request("library.most_played", r#"{"v":1}"#);
+        let resp = bundle.dispatch_request(&req).await.unwrap().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v["tracks"][0]["uri"], "INTERNAL/a.flac", "{v}");
+        assert_eq!(v["tracks"][0]["count"], 1);
+        assert_eq!(v["tracks"].as_array().unwrap().len(), 1, "no zero rows");
+
+        bundle.shutdown().await;
     }
 
     fn request(verb: &str, payload: &str) -> Request {

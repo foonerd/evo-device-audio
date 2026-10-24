@@ -376,6 +376,15 @@ pub(crate) enum ConnBehaviour {
     /// Welcome, then respond to the first `idle` command with
     /// `changed: player\nOK\n`, then hold.
     IdleOnceThenHold,
+    /// A track at its last half-second, then the next one. The
+    /// first `status` reports `first` playing at 179.5 of 180;
+    /// every later `status` reports `second` at 0.5. `currentsong`
+    /// follows the same switch. `idle` holds. Pairs with
+    /// [`IdleOnceThenHold`] on the idle connection to show a
+    /// player moving on because the song ended.
+    ///
+    /// [`IdleOnceThenHold`]: Self::IdleOnceThenHold
+    FinishesThenAdvances { first: String, second: String },
     /// A library that records every command it is sent.
     ///
     /// `listallinfo <path>` answers with `files`, so a caller
@@ -1087,6 +1096,47 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                     return;
                 }
                 let _ = w.write_all(reply.as_bytes()).await;
+                let _ = w.flush().await;
+            }
+        }
+        ConnBehaviour::FinishesThenAdvances {
+            ref first,
+            ref second,
+        } => {
+            let song = |file: &str| {
+                format!(
+                    "file: {file}\nTitle: T\nArtist: A\nAlbum: X\n\
+                     Time: 180\nduration: 180.000\nOK\n"
+                )
+            };
+            let before = b"state: play\nsong: 0\nelapsed: 179.500\nduration: 180.000\nvolume: 50\nOK\n";
+            let after = b"state: play\nsong: 1\nelapsed: 0.500\nduration: 180.000\nvolume: 50\nOK\n";
+            let mut status_reads = 0usize;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                if line.starts_with("status") {
+                    status_reads += 1;
+                    let body: &[u8] =
+                        if status_reads <= 1 { before } else { after };
+                    let _ = w.write_all(body).await;
+                } else if line.starts_with("currentsong") {
+                    let body = if status_reads <= 1 {
+                        song(first)
+                    } else {
+                        song(second)
+                    };
+                    let _ = w.write_all(body.as_bytes()).await;
+                } else if line.starts_with("idle") {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    return;
+                } else {
+                    let _ = w.write_all(b"OK\n").await;
+                }
                 let _ = w.flush().await;
             }
         }

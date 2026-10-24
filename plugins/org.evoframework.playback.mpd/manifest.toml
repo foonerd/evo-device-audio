@@ -111,6 +111,8 @@ request_types = [
     "library.browse_by_year",
     "library.get_triage",
     "library.reconcile_triage",
+    "library.recently_played",
+    "library.most_played",
 ]
 
 [kind]
@@ -295,6 +297,8 @@ request_types = [
     "library.browse_by_year",
     "library.get_triage",
     "library.reconcile_triage",
+    "library.recently_played",
+    "library.most_played",
 ]
 # USB Remove on this shelf waits for storage.usb to detach
 # then for MPD to prune. 2 s was the glass 400: the nested

@@ -50,7 +50,7 @@ pub(crate) use actor::{
     spawn, SupervisorCommandSender, SupervisorHandle, SupervisorSpawn,
 };
 pub(crate) use ambient_observer::{
-    spawn as spawn_ambient_observer, AmbientObserverHandle,
+    spawn as spawn_ambient_observer, AmbientInputs, AmbientObserverHandle,
 };
 pub(crate) use command::{PlaybackCommand, PlaybackError};
 pub(crate) use report::IntentCells;

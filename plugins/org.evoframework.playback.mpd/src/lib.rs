@@ -123,6 +123,7 @@ mod mpd_fragment;
 mod mpd_restart;
 mod mute_cell;
 mod network_shares_sync;
+mod play_history;
 mod playback_supervisor;
 mod playlist;
 mod playlist_duplicate;
@@ -305,6 +306,8 @@ const SOURCE_REQUEST_TYPES: &[&str] = &[
     "library.browse_by_year",
     "library.get_triage",
     "library.reconcile_triage",
+    "library.recently_played",
+    "library.most_played",
 ];
 
 /// Wire-protocol payload version every source-verb request
@@ -2428,14 +2431,25 @@ impl Plugin for MpdPlaybackPlugin {
                      source-format probe disarmed — source_codec still surfaces"
                 );
             }
+            // The play history lives in the plugin's state
+            // directory and survives a restart. The observer
+            // records into it; the library's two history reads
+            // answer from it.
+            let play_history = play_history::PlayHistory::open(
+                ctx.state_dir.join("play-history.toml"),
+            )
+            .await;
             self.ambient_observer =
                 Some(playback_supervisor::spawn_ambient_observer(
                     self.endpoint.clone(),
                     self.timeouts,
                     ambient_emitter,
-                    music_directory,
-                    self.mute.clone(),
-                    self.shuffle.clone(),
+                    playback_supervisor::AmbientInputs {
+                        music_directory,
+                        mute: self.mute.clone(),
+                        shuffle: self.shuffle.clone(),
+                        history: play_history.clone(),
+                    },
                 ));
             tracing::info!(
                 plugin = PLUGIN_NAME,
@@ -2561,8 +2575,11 @@ impl Plugin for MpdPlaybackPlugin {
                 self.endpoint.clone(),
                 self.timeouts,
                 ctx.shelf_request_dispatcher.clone(),
-                self.mute.clone(),
-                self.shuffle.clone(),
+                shelves::ShelfInputs {
+                    mute: self.mute.clone(),
+                    shuffle: self.shuffle.clone(),
+                    play_history,
+                },
             )
             .await;
             self.shelves = Some(shelves);
