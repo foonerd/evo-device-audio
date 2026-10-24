@@ -310,6 +310,7 @@ const SOURCE_REQUEST_TYPES: &[&str] = &[
     "library.recently_played",
     "library.most_played",
     "library.forget_track",
+    "library.forget_album",
 ];
 
 /// Wire-protocol payload version every source-verb request

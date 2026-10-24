@@ -1006,6 +1006,17 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                         }
                         out.push_str("OK\n");
                         out
+                    } else if cmd.starts_with("listallinfo") {
+                        // Every file in the library, the way the
+                        // album enumeration walks the database.
+                        let mut out = String::new();
+                        for (_, _, files) in library.iter() {
+                            for f in files {
+                                out.push_str(&format!("file: {f}\n"));
+                            }
+                        }
+                        out.push_str("OK\n");
+                        out
                     } else if cmd.starts_with("search ") {
                         // `search any "<q>"`: every file in the
                         // library whose path contains the query,

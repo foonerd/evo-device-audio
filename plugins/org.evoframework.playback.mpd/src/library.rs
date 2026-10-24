@@ -614,6 +614,10 @@ pub(crate) enum VerbError {
     ParkPrefixInvalid,
     #[error("library.forget_track: uri must not be empty")]
     ForgetUriEmpty,
+    #[error("library.forget_album: album must not be empty")]
+    ForgetAlbumEmpty,
+    #[error("library.forget_album: album {album:?} resolves to no track")]
+    ForgetAlbumUnknown { album: String },
 }
 
 fn check_version(v: u32, verb: &str) -> Result<(), VerbError> {
@@ -2235,18 +2239,15 @@ pub(crate) async fn handle_browse_by_tag(
     let page_size = requested_size.clamp(1, BROWSE_HARD_CAP);
     let range_start = page.saturating_mul(page_size);
 
+    // What the operator has forgotten, once for this answer.
+    let forgotten = forgotten.snapshot().await;
+
     // Drill path — return TRACKS matching the selector, minus
     // what the operator has forgotten.
     if let Some(selector) = payload.select.as_ref() {
         return drill_by_tag(
-            conn,
-            verb_name,
-            tag,
-            facet_key,
-            selector,
-            page,
-            page_size,
-            &forgotten.snapshot().await,
+            conn, verb_name, tag, facet_key, selector, page, page_size,
+            &forgotten,
         )
         .await;
     }
@@ -2277,7 +2278,9 @@ pub(crate) async fn handle_browse_by_tag(
     //   (year extraction) and case-insensitive dedupe. See
     //   [`enumerate_generic_facet`].
     let rendered: Vec<serde_json::Value> = match facet_key {
-        "album" => enumerate_albums_via_folder(conn, verb_name).await?,
+        "album" => {
+            enumerate_albums_via_folder(conn, verb_name, &forgotten).await?
+        }
         "artist" => {
             enumerate_artists_via_fanout(conn, tag, verb_name, post_process)
                 .await?
@@ -2360,9 +2363,19 @@ pub(crate) struct AlbumTile {
 
 impl AlbumTile {
     /// Track count = number of File entries in the canonical
-    /// folder.
-    pub(crate) fn track_count(&self) -> u64 {
-        self.tracks.len() as u64
+    /// folder the operator has not forgotten. A tile whose count
+    /// is zero is not shown.
+    pub(crate) fn remaining_track_count(
+        &self,
+        forgotten: &std::collections::BTreeSet<String>,
+    ) -> u64 {
+        self.tracks
+            .iter()
+            .filter(|t| match t {
+                MpdLibraryEntry::File { path, .. } => !forgotten.contains(path),
+                _ => false,
+            })
+            .count() as u64
     }
 }
 
@@ -2602,24 +2615,30 @@ fn pick_majority(votes: &HashMap<String, u64>) -> Option<String> {
 async fn enumerate_albums_via_folder(
     conn: &mut MpdConnection,
     verb_name: &'static str,
+    forgotten: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<serde_json::Value>, VerbError> {
     let tiles = resolve_album_tiles(conn, verb_name).await?;
     let rendered = tiles
         .into_iter()
-        .map(|tile| {
+        .filter_map(|tile| {
+            // A tile counts the tracks the operator has not
+            // forgotten, and goes when none of them remain.
+            let remaining = tile.remaining_track_count(forgotten);
+            if remaining == 0 {
+                return None;
+            }
             let cover_url = evo_device_audio_shared::artwork_target_url_sized(
                 "mpd-path",
                 &tile.representative_track_path,
                 Some("small"),
             );
-            let track_count = tile.track_count();
-            json!({
+            Some(json!({
                 "album":       tile.display_title,
                 "album_id":    tile.canonical_folder,
                 "artist":      tile.display_artist,
                 "cover_url":   cover_url,
-                "track_count": track_count,
-            })
+                "track_count": remaining,
+            }))
         })
         .collect();
     Ok(rendered)
@@ -2757,6 +2776,148 @@ async fn enumerate_generic_facet(
 /// renders each track via [`render_library_entry`], and
 /// paginates the same envelope shape as the enumeration
 /// response.
+/// The tracks an album selector names now — the one identity
+/// the album drill and `library.forget_album` share.
+///
+/// The enumeration path grouped tracks by
+/// [`AlbumTile::canonical_folder`]. The selector may carry the
+/// tile's `album_id` (canonical folder path, when the UI emits
+/// it) or the tile's `album` display title (backward-compatible
+/// path). Tiles are matched by whichever the selector value
+/// equals; an optional parent artist narrows same-titled albums
+/// by different artists; the tracks the tiles already carry come
+/// back, deduplicated, with no second MPD roundtrip.
+///
+/// `Ok(None)` is no tile matching the selector at all. The
+/// caller says what that means for its verb.
+async fn album_tracks_for_selector(
+    conn: &mut MpdConnection,
+    verb_name: &'static str,
+    selector: &BrowseSelector,
+) -> Result<Option<Vec<MpdLibraryEntry>>, VerbError> {
+    let selector_value = selector.value.trim();
+    let tiles = resolve_album_tiles(conn, verb_name).await?;
+    let matching: Vec<&AlbumTile> = tiles
+        .iter()
+        .filter(|t| {
+            t.canonical_folder == selector_value
+                || t.display_title.eq_ignore_ascii_case(selector_value)
+        })
+        .collect();
+    if matching.is_empty() {
+        return Ok(None);
+    }
+    // Optional parent-context filter: when the operator UI
+    // passes a parent artist (e.g. drill from an artist tile →
+    // an album under that artist), narrow the matched tiles by
+    // artist fold-key so same-titled albums by different artists
+    // disambiguate.
+    let parent_ctx = build_parent_field(selector, verb_name)?;
+    let filtered: Vec<&AlbumTile> = match &parent_ctx {
+        None => matching,
+        Some((field, value)) => {
+            let target_key = match field {
+                MpdSearchField::AlbumArtist | MpdSearchField::Artist => {
+                    artist_fold_key(value)
+                }
+                _ => String::new(),
+            };
+            if target_key.is_empty() {
+                matching
+            } else {
+                matching
+                    .into_iter()
+                    .filter(|t| {
+                        artist_fold_key(&t.display_artist) == target_key
+                    })
+                    .collect()
+            }
+        }
+    };
+    let mut all: Vec<MpdLibraryEntry> = Vec::new();
+    for tile in &filtered {
+        all.extend(tile.tracks.iter().cloned());
+    }
+    Ok(Some(dedupe_entries_by_path(all)))
+}
+
+/// `library.forget_album` request payload. `album` is the
+/// identity `library.browse_by_album` already drills — the
+/// tile's `album_id` or its display title; `parent` the same
+/// optional artist context the drill takes.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ForgetAlbumPayload {
+    pub(crate) v: u32,
+    pub(crate) album: String,
+    #[serde(default)]
+    pub(crate) parent: Option<BrowseSelectorParent>,
+}
+
+/// `library.forget_album` — every track the album drill would
+/// list now leaves the library the operator browses, through the
+/// one forgotten set `library.forget_track` keeps.
+///
+/// The files stay on disk, the source stays, the live queue is
+/// left as it is: the only MPD traffic is the read the drill
+/// itself makes. A file added to the album later is not
+/// forgotten — the set holds URIs, not the folder. An empty
+/// identity, and an album that resolves to no track, are refused
+/// before anything is forgotten.
+pub(crate) async fn handle_forget_album(
+    ctx: &LibraryContext,
+    conn: &mut MpdConnection,
+    payload: ForgetAlbumPayload,
+) -> Result<serde_json::Value, VerbError> {
+    check_version(payload.v, "library.forget_album")?;
+    let album = payload.album.trim();
+    if album.is_empty() {
+        return Err(VerbError::ForgetAlbumEmpty);
+    }
+    let selector = BrowseSelector {
+        value: album.to_string(),
+        parent: payload.parent,
+    };
+    let tracks =
+        album_tracks_for_selector(conn, "library.forget_album", &selector)
+            .await?
+            .ok_or_else(|| VerbError::ForgetAlbumUnknown {
+                album: album.to_string(),
+            })?;
+    let uris: Vec<String> = tracks
+        .into_iter()
+        .filter_map(|e| match e {
+            MpdLibraryEntry::File { path, .. } => Some(path),
+            _ => None,
+        })
+        .collect();
+    if uris.is_empty() {
+        return Err(VerbError::ForgetAlbumUnknown {
+            album: album.to_string(),
+        });
+    }
+    let mut newly = 0usize;
+    for uri in &uris {
+        if ctx.forgotten.forget(uri).await {
+            newly += 1;
+        }
+    }
+    tracing::info!(
+        plugin = PLUGIN_NAME,
+        album,
+        tracks = uris.len(),
+        newly_forgotten = newly,
+        "album forgotten"
+    );
+    Ok(json!({
+        "v": LIBRARY_PAYLOAD_VERSION,
+        "status": "ok",
+        "album": album,
+        "forgotten": uris,
+        "newly_forgotten": newly,
+        "already_forgotten": uris.len() - newly,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drill_by_tag(
     conn: &mut MpdConnection,
@@ -2894,64 +3055,20 @@ async fn drill_by_tag(
         }
         dedupe_entries_by_path(all)
     } else if tag == "album" {
-        // Album facet drill — folder-anchored.
-        //
-        // The enumeration path grouped tracks by
-        // [`AlbumTile::canonical_folder`]. The selector may
-        // carry the tile's `album_id` (canonical folder path,
-        // when the UI emits it) or the tile's `album` display
-        // title (backward-compatible path). Match tiles by
-        // whichever the selector value equals, then return the
-        // tracks the tile already carries — no second MPD
-        // roundtrip.
-        let tiles = resolve_album_tiles(conn, verb_name).await?;
-        let matching: Vec<&AlbumTile> = tiles
-            .iter()
-            .filter(|t| {
-                t.canonical_folder == selector_value
-                    || t.display_title.eq_ignore_ascii_case(selector_value)
-            })
-            .collect();
-        if matching.is_empty() {
-            return Err(VerbError::Mpd {
-                verb: verb_name.to_string(),
-                reason: format!(
-                    "no album matched selector value {selector_value:?}"
-                ),
-            });
-        }
-        // Optional parent-context filter: when the operator UI
-        // passes a parent artist (e.g. drill from an artist
-        // tile → an album under that artist), narrow the
-        // matched tiles by artist fold-key so same-titled
-        // albums by different artists disambiguate.
-        let parent_ctx = build_parent_field(selector, verb_name)?;
-        let filtered: Vec<&AlbumTile> = match &parent_ctx {
-            None => matching,
-            Some((field, value)) => {
-                let target_key = match field {
-                    MpdSearchField::AlbumArtist | MpdSearchField::Artist => {
-                        artist_fold_key(value)
-                    }
-                    _ => String::new(),
-                };
-                if target_key.is_empty() {
-                    matching
-                } else {
-                    matching
-                        .into_iter()
-                        .filter(|t| {
-                            artist_fold_key(&t.display_artist) == target_key
-                        })
-                        .collect()
-                }
+        // Album facet drill — folder-anchored. The identity and
+        // the tracks are the ones `album_tracks_for_selector`
+        // resolves; `library.forget_album` uses the same.
+        match album_tracks_for_selector(conn, verb_name, selector).await? {
+            Some(tracks) => tracks,
+            None => {
+                return Err(VerbError::Mpd {
+                    verb: verb_name.to_string(),
+                    reason: format!(
+                        "no album matched selector value {selector_value:?}"
+                    ),
+                });
             }
-        };
-        let mut all: Vec<MpdLibraryEntry> = Vec::new();
-        for tile in &filtered {
-            all.extend(tile.tracks.iter().cloned());
         }
-        dedupe_entries_by_path(all)
     } else {
         let field = match tag {
             "artist" => MpdSearchField::Artist,

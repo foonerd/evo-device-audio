@@ -111,6 +111,7 @@ request_types = [
     "library.recently_played",
     "library.most_played",
     "library.forget_track",
+    "library.forget_album",
 ]
 
 [kind]
@@ -298,6 +299,7 @@ request_types = [
     "library.recently_played",
     "library.most_played",
     "library.forget_track",
+    "library.forget_album",
 ]
 # USB Remove waits here for detach + MPD prune. See
 # manifest.toml for the 2 s → 30 s reason.

@@ -114,6 +114,7 @@ request_types = [
     "library.recently_played",
     "library.most_played",
     "library.forget_track",
+    "library.forget_album",
 ]
 
 [kind]
@@ -301,6 +302,7 @@ request_types = [
     "library.recently_played",
     "library.most_played",
     "library.forget_track",
+    "library.forget_album",
 ]
 # USB Remove on this shelf waits for storage.usb to detach
 # then for MPD to prune. 2 s was the glass 400: the nested

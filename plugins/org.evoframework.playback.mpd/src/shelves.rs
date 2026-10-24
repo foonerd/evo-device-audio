@@ -781,6 +781,18 @@ impl ShelfBundle {
                 .map_err(library_verb_to_plugin_error)?;
                 Ok(Some(encode_json_response(req, &body)?))
             }
+            "library.forget_album" => {
+                let payload: library::ForgetAlbumPayload = parse_json(req)?;
+                let mut conn = self.open_conn().await?;
+                let body = library::handle_forget_album(
+                    &self.library,
+                    &mut conn,
+                    payload,
+                )
+                .await
+                .map_err(library_verb_to_plugin_error)?;
+                Ok(Some(encode_json_response(req, &body)?))
+            }
             "library.forget_track" => {
                 let payload: crate::forgotten_tracks::ForgetTrackPayload =
                     parse_json(req)?;
@@ -1575,7 +1587,11 @@ fn library_verb_to_plugin_error(e: library::VerbError) -> PluginError {
         | VerbError::RewritePrefixInvalid
         | VerbError::RewritePrefixUnchanged
         | VerbError::ParkPrefixInvalid
-        | VerbError::ForgetUriEmpty => PluginError::Permanent(e.to_string()),
+        | VerbError::ForgetUriEmpty
+        | VerbError::ForgetAlbumEmpty
+        | VerbError::ForgetAlbumUnknown { .. } => {
+            PluginError::Permanent(e.to_string())
+        }
         // WorkAggregateNotReady is transient — the next
         // Database / Update idle event populates the cache.
         // Operator retry succeeds; treat as transient so
@@ -1750,6 +1766,25 @@ mod tests {
             }
             other => panic!(
                 "forget_track must dispatch and refuse an empty uri: {other:?}"
+            ),
+        }
+        bundle.shutdown().await;
+    }
+
+    /// `library.forget_album` is reachable on this shelf: an
+    /// empty album is refused by the verb, not dropped as
+    /// unmatched.
+    #[tokio::test]
+    async fn forget_album_dispatches_on_the_library_shelf() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = live_bundle(dir.path()).await;
+        let req = request("library.forget_album", r#"{"v":1,"album":" "}"#);
+        match bundle.dispatch_request(&req).await {
+            Err(PluginError::Permanent(msg)) => {
+                assert!(msg.contains("album must not be empty"), "{msg}")
+            }
+            other => panic!(
+                "forget_album must dispatch and refuse an empty album: {other:?}"
             ),
         }
         bundle.shutdown().await;
