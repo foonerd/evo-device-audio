@@ -73,24 +73,62 @@ const PLUGIN_NAME: &str = "org.evoframework.playback.mpd";
 /// within one cycle.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 
-/// Handle to the ambient observer task. Dropping the handle (or
-/// notifying via the cloned shutdown) terminates the task at the
-/// next reconnect-or-shutdown branch.
+/// A stop that stays stopped.
+///
+/// A `Notify` permit is consumed by whichever wait sees it first.
+/// The idle loop's select saw it, returned, and the outer loop
+/// then asked a fresh `notified()` that had nothing to give — so
+/// the observer reconnected and `stop` never returned. The flag
+/// is what every later check reads: once set, the idle loop
+/// leaves, the outer loop finds the same stop and leaves, and a
+/// backoff sleep cut short by the stop does not go round again.
+#[derive(Default)]
+struct Shutdown {
+    stopped: std::sync::atomic::AtomicBool,
+    notify: Notify,
+}
+
+impl Shutdown {
+    fn stop(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Wake a parked waiter, and leave a permit for one that
+        // is between its flag check and its wait.
+        self.notify.notify_waiters();
+        self.notify.notify_one();
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Resolves once stopped, now or later. Checks the flag
+    /// before every wait, so a stop that landed first is seen.
+    async fn cancelled(&self) {
+        loop {
+            if self.is_stopped() {
+                return;
+            }
+            self.notify.notified().await;
+        }
+    }
+}
+
+/// Handle to the ambient observer task. `stop` asks the task to
+/// leave wherever it is — the idle wait, a backoff sleep, a
+/// connect — and awaits its exit.
 pub(crate) struct AmbientObserverHandle {
     task: JoinHandle<()>,
-    shutdown: Arc<Notify>,
+    shutdown: Arc<Shutdown>,
 }
 
 impl AmbientObserverHandle {
-    /// Notify the task to shut down and await its exit. Idempotent
-    /// — calling twice is safe; the second call's await returns
-    /// immediately on the already-completed task.
-    ///
-    /// See the note on [`super::startup_volume`]: `notify_one`
-    /// is race-safe against a `stop()` fired before the task
-    /// parks at `.notified().await`; `notify_waiters` is not.
+    /// Stop the task and await its exit. Returns while the
+    /// observer is in its idle loop: the stop stays set, so the
+    /// loop leaves and the task does not reconnect. Idempotent —
+    /// a second call's await returns on the completed task.
     pub(crate) async fn stop(self) {
-        self.shutdown.notify_one();
+        self.shutdown.stop();
         let _ = self.task.await;
     }
 }
@@ -112,7 +150,7 @@ pub(crate) fn spawn(
     subject_emitter: SubjectEmitter,
     inputs: AmbientInputs,
 ) -> AmbientObserverHandle {
-    let shutdown = Arc::new(Notify::new());
+    let shutdown = Arc::new(Shutdown::default());
     let task_shutdown = Arc::clone(&shutdown);
 
     let task = tokio::spawn(async move {
@@ -146,7 +184,7 @@ async fn run(
     timeouts: ConnectTimeouts,
     subject_emitter: SubjectEmitter,
     inputs: AmbientInputs,
-    shutdown: Arc<Notify>,
+    shutdown: Arc<Shutdown>,
 ) {
     let AmbientInputs {
         music_directory,
@@ -168,7 +206,7 @@ async fn run(
     // Outer reconnect loop: connect, run the inner loop until it
     // errors out, sleep + retry.
     loop {
-        if shutdown_requested(&shutdown).await {
+        if shutdown.is_stopped() {
             tracing::info!(
                 plugin = PLUGIN_NAME,
                 "ambient observer: shutdown received; exiting"
@@ -275,7 +313,7 @@ async fn run_inner(
     music_directory: Option<&std::path::Path>,
     last_probed_file: &mut Option<String>,
     watch: Watch<'_>,
-    shutdown: &Arc<Notify>,
+    shutdown: &Arc<Shutdown>,
 ) {
     // The supervisor uses the same idle subsystems + a 24-hour
     // budget; mirror the choice so both observers wake on the
@@ -292,7 +330,7 @@ async fn run_inner(
 
     loop {
         tokio::select! {
-            _ = shutdown.notified() => {
+            _ = shutdown.cancelled() => {
                 tracing::info!(
                     plugin = PLUGIN_NAME,
                     "ambient observer: shutdown received from idle loop; exiting"
@@ -499,19 +537,10 @@ pub(super) async fn maybe_probe_source_format(
     }
 }
 
-async fn shutdown_requested(shutdown: &Arc<Notify>) -> bool {
-    // Non-blocking check via tokio's select with a fired notify.
-    // Used at the top of the outer loop to avoid a sleep+reconnect
-    // cycle when shutdown fires before connect.
+/// Back off before a reconnect, unless stopped first.
+async fn sleep_or_shutdown(shutdown: &Arc<Shutdown>, dur: Duration) {
     tokio::select! {
-        _ = shutdown.notified() => true,
-        _ = std::future::ready(()) => false,
-    }
-}
-
-async fn sleep_or_shutdown(shutdown: &Arc<Notify>, dur: Duration) {
-    tokio::select! {
-        _ = shutdown.notified() => {}
+        _ = shutdown.cancelled() => {}
         _ = tokio::time::sleep(dur) => {}
     }
 }
@@ -691,13 +720,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        // Not `handle.stop().await`: `stop` fires one notify, the
-        // inner idle loop consumes it, and the outer loop's
-        // re-check finds no permit and reconnects forever — so a
-        // stop issued while the observer is in its idle loop never
-        // returns. That is the observer's, not this row's; the
-        // task is dropped with the test runtime instead.
-        drop(handle);
+        handle.stop().await;
         assert_eq!(recent.len(), 1, "one finish, recorded once: {recent:?}");
         assert_eq!(
             recent[0].uri, "INTERNAL/a.flac",
@@ -708,6 +731,59 @@ mod tests {
         assert_eq!(
             (most[0].uri.as_str(), most[0].count),
             ("INTERNAL/a.flac", 1)
+        );
+    }
+
+    /// `stop` returns while the observer waits in its idle loop,
+    /// and the task does not reconnect afterwards.
+    ///
+    /// The command connection answers; the idle connection never
+    /// wakes, so after its first snapshot the observer is parked
+    /// in the idle select. A stop fired there used to be consumed
+    /// by that select alone, and the outer loop reconnected for
+    /// ever — unload then burned its whole budget here and never
+    /// reached the shelves' shutdown.
+    #[tokio::test]
+    async fn stop_returns_from_the_idle_loop() {
+        use crate::playback_supervisor::test_mock::{
+            capturing_emitter, short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let (endpoint, _mock) = spawn_mock_mpd(vec![
+            ConnBehaviour::Standard,
+            ConnBehaviour::HoldAfterWelcome,
+        ])
+        .await;
+        let (subjects, _relations, emitter) = capturing_emitter();
+        let handle = spawn(
+            endpoint,
+            short_timeouts(),
+            emitter,
+            AmbientInputs {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                history: PlayHistory::disabled(),
+            },
+        );
+        // The first snapshot is published just before the idle
+        // loop is entered; wait for it, then a beat.
+        for _ in 0..60 {
+            if subjects.state_update_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            subjects.state_update_count() > 0,
+            "the observer never came up"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let stopped =
+            tokio::time::timeout(Duration::from_secs(5), handle.stop()).await;
+        assert!(
+            stopped.is_ok(),
+            "stop must return while the observer waits in its idle loop"
         );
     }
 

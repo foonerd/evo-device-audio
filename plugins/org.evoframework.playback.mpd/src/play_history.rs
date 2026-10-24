@@ -6,7 +6,10 @@
 //! stopped, because the song ended. A skip is not a play — next,
 //! previous, choosing another row, clear, an operator stop. A
 //! pause is not a play. A stream with no end never finishes. The
-//! same track finishing again is another play.
+//! same track finishing again is another play. One window is
+//! accepted as the limit of reading `status`: a stop, or a seek
+//! back to the start, inside the last two seconds plus the
+//! crossfade counts as a finish, because from outside it is one.
 //!
 //! MPD does not say why the player moved on, so the tracker
 //! decides from what it saw: at each wake it notes where the
