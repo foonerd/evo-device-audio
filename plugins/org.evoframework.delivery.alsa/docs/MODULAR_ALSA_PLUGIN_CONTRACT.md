@@ -130,6 +130,14 @@ holds, in the order given.
 - `zone.list {}`: every zone, in id order; an empty set is an
   empty list. Reads only.
 
+`zone.add` and `zone.update` hold the logical-output read lock
+from the membership check through the zone write, and
+`remove_logical_output` holds the logical-output write lock from
+its zone check through the removal; both take locks
+logical-then-zones. A logical output therefore cannot be removed
+between a zone's membership check and its write, and a zone
+cannot take an id between the removal's check and its removal.
+
 Zones move no audio, no mixer and no drop-in. No EQ is attached
 to a zone and no scene is stored; `eq_only` stays the one EQ.
 Zones survive a restart in `<state_dir>/zones.toml`. No subject

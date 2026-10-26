@@ -2277,31 +2277,33 @@ impl AlsaDeliveryPlugin {
     }
 
     /// The logical output ids the plugin has, for the zone verbs
-    /// to check a list against. Read only.
-    async fn known_logical_ids(&self) -> Vec<String> {
-        self.logical
-            .read()
-            .await
-            .list()
-            .into_iter()
-            .map(|l| l.id)
-            .collect()
+    /// to check a list against. Read only. Takes the ids from a
+    /// guard the caller holds, so the membership check and the
+    /// zone write happen under one logical read lock: a logical
+    /// output cannot be removed between the two.
+    fn known_logical_ids(logical: &LogicalOutputs) -> Vec<String> {
+        logical.list().into_iter().map(|l| l.id).collect()
     }
 
     /// `zone.add` — a name over one or more logical outputs.
-    /// Answers the new zone with its minted id.
+    /// Answers the new zone with its minted id. The logical read
+    /// lock is held from the membership check through the zone
+    /// write; locks are taken logical-then-zones, the order
+    /// `delivery.remove_logical_output` takes too.
     async fn handle_zone_add(
         &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: ZoneAddRequest = parse_versioned_payload(req)?;
-        let known = self.known_logical_ids().await;
-        let zone = self
-            .zones
-            .write()
-            .await
-            .add(&known, &payload.name, &payload.logical_output_ids)
-            .map_err(|r| Self::zone_refused(req, r))?;
+        let zone = {
+            let logical = self.logical.read().await;
+            let known = Self::known_logical_ids(&logical);
+            self.zones
+                .write()
+                .await
+                .add(&known, &payload.name, &payload.logical_output_ids)
+                .map_err(|r| Self::zone_refused(req, r))?
+        };
         self.persist_zones().await;
         tracing::info!(
             plugin = PLUGIN_NAME,
@@ -2320,24 +2322,28 @@ impl AlsaDeliveryPlugin {
     }
 
     /// `zone.update` — a new name, a new list of logical outputs,
-    /// or both; the id stays. Answers the zone as it is now.
+    /// or both; the id stays. Answers the zone as it is now. The
+    /// logical read lock is held from the membership check
+    /// through the zone write, as in `zone.add`.
     async fn handle_zone_update(
         &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: ZoneUpdateRequest = parse_versioned_payload(req)?;
-        let known = self.known_logical_ids().await;
-        let zone = self
-            .zones
-            .write()
-            .await
-            .update(
-                &known,
-                &payload.id,
-                payload.name.as_deref(),
-                payload.logical_output_ids.as_deref(),
-            )
-            .map_err(|r| Self::zone_refused(req, r))?;
+        let zone = {
+            let logical = self.logical.read().await;
+            let known = Self::known_logical_ids(&logical);
+            self.zones
+                .write()
+                .await
+                .update(
+                    &known,
+                    &payload.id,
+                    payload.name.as_deref(),
+                    payload.logical_output_ids.as_deref(),
+                )
+                .map_err(|r| Self::zone_refused(req, r))?
+        };
         self.persist_zones().await;
         tracing::info!(
             plugin = PLUGIN_NAME,
@@ -4993,5 +4999,58 @@ pcm.evo {
             .await
             .unwrap();
         assert_eq!(listed["logical_outputs"], json!([]));
+    }
+
+    /// `zone.add` and `zone.update` hold the logical read lock
+    /// from the membership check through the zone write. With
+    /// the zone lock held from outside, each verb is parked at
+    /// the zone write, and the logical registry cannot be taken
+    /// for writing while it waits: a removal cannot slip between
+    /// the check and the write. Once the zone lock is released
+    /// the verb completes and the logical lock is free again.
+    #[tokio::test]
+    async fn zone_add_and_update_hold_the_logical_lock_until_the_zone_is_written(
+    ) {
+        let rig = Arc::new(OutputRig::new().await.with_zones().await);
+        rig.call("zone.add", json!({ "v": 1, "name": "Seed", "logical_output_ids": ["logical:2"] }))
+            .await
+            .unwrap();
+        for (verb, payload) in [
+            (
+                "zone.add",
+                json!({ "v": 1, "name": "Down", "logical_output_ids": ["logical:1"] }),
+            ),
+            (
+                "zone.update",
+                json!({ "v": 1, "id": "zone:1", "name": "Seed renamed" }),
+            ),
+        ] {
+            let zones_held = rig.plugin.zones.write().await;
+            let task = {
+                let rig = Arc::clone(&rig);
+                let verb = verb.to_string();
+                tokio::spawn(async move { rig.call(&verb, payload).await })
+            };
+            // Let the verb run up to the zone write it cannot take.
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                !task.is_finished(),
+                "{verb} must be parked at the zone write"
+            );
+            assert!(
+                rig.plugin.logical.try_write().is_err(),
+                "{verb} released the logical lock before the zone write"
+            );
+            drop(zones_held);
+            task.await
+                .unwrap()
+                .unwrap_or_else(|e| panic!("{verb}: {e}"));
+            assert!(
+                rig.plugin.logical.try_write().is_ok(),
+                "{verb} keeps the logical lock after answering"
+            );
+        }
     }
 }
