@@ -79,6 +79,10 @@ request_types = [
     "delivery.update_logical_output",
     "delivery.remove_logical_output",
     "delivery.list_logical_outputs",
+    "zone.add",
+    "zone.update",
+    "zone.remove",
+    "zone.list",
 ]
 response_budget_ms = 5000
 

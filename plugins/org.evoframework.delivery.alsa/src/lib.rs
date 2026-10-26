@@ -84,6 +84,7 @@
 mod logical_outputs;
 mod options_render;
 mod outputs;
+mod zones;
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -107,6 +108,7 @@ use options_render::OptionsSettings;
 use outputs::{
     Effect, GlobalMixer, OutputPolicy, OutputSnapshot, OutputStateStore,
 };
+use zones::{Zone, ZoneStore, Zones};
 
 pub mod alsa_cards;
 pub mod import;
@@ -167,6 +169,10 @@ const REQUEST_TYPES: &[&str] = &[
     "delivery.update_logical_output",
     "delivery.remove_logical_output",
     "delivery.list_logical_outputs",
+    "zone.add",
+    "zone.update",
+    "zone.remove",
+    "zone.list",
 ];
 
 /// Subject scheme + value for the resolved-outputs surface.
@@ -294,6 +300,12 @@ pub struct AlsaDeliveryPlugin {
     /// Persistence for the named outputs. `Some` after load
     /// named the state directory.
     logical_state: Option<LogicalOutputStore>,
+    /// Zones: a name over one or more logical outputs, with a
+    /// stable minted id.
+    zones: Arc<RwLock<Zones>>,
+    /// Persistence for the zones. `Some` after load named the
+    /// state directory.
+    zones_state: Option<ZoneStore>,
 }
 
 /// The operator's options as last observed, and where from.
@@ -694,6 +706,8 @@ impl AlsaDeliveryPlugin {
             mixer: Arc::new(AmixerSetter),
             logical: Arc::new(RwLock::new(LogicalOutputs::default())),
             logical_state: None,
+            zones: Arc::new(RwLock::new(Zones::default())),
+            zones_state: None,
         }
     }
 
@@ -741,6 +755,33 @@ impl AlsaDeliveryPlugin {
                 error = %e,
                 "logical outputs could not be written; names will not \
                  survive a restart"
+            );
+        }
+    }
+
+    /// Point the zones file somewhere and read it.
+    async fn install_zones(&mut self, path: PathBuf) {
+        let store = ZoneStore::at(path);
+        let persisted = store.load().await;
+        *self.zones.write().await = Zones::from_persisted(persisted);
+        self.zones_state = Some(store);
+    }
+
+    /// Write the zones. A failed write is logged, not refused:
+    /// the registry already moved and the answer says what it is
+    /// now.
+    async fn persist_zones(&self) {
+        let Some(store) = self.zones_state.as_ref() else {
+            return;
+        };
+        let zones = self.zones.read().await;
+        if let Err(e) = store.save(zones.persisted()).await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                path = %store.path().display(),
+                error = %e,
+                "zones could not be written; zones will not survive a \
+                 restart"
             );
         }
     }
@@ -1646,6 +1687,8 @@ impl Plugin for AlsaDeliveryPlugin {
                 ctx.state_dir.join(LogicalOutputStore::FILE_NAME),
             )
             .await;
+            self.install_zones(ctx.state_dir.join(ZoneStore::FILE_NAME))
+                .await;
             // Spawn the route-change reactor. The framework's
             // audio_topology_store publishes topology rewires
             // via every plugin's RouteChangeCallback; the
@@ -1794,6 +1837,10 @@ impl Respondent for AlsaDeliveryPlugin {
                 "delivery.list_logical_outputs" => {
                     self.handle_list_logical_outputs(req).await
                 }
+                "zone.add" => self.handle_zone_add(req).await,
+                "zone.update" => self.handle_zone_update(req).await,
+                "zone.remove" => self.handle_zone_remove(req).await,
+                "zone.list" => self.handle_zone_list(req).await,
                 other => Err(PluginError::Permanent(format!(
                     "request type {other:?} declared but no handler wired; \
                      manifest/runtime drift bug"
@@ -2199,6 +2246,135 @@ impl AlsaDeliveryPlugin {
         )
     }
 
+    fn zone_refused(req: &Request, r: zones::Refusal) -> PluginError {
+        PluginError::Permanent(format!("{}: {r}", req.request_type))
+    }
+
+    /// The logical output ids the plugin has, for the zone verbs
+    /// to check a list against. Read only.
+    async fn known_logical_ids(&self) -> Vec<String> {
+        self.logical
+            .read()
+            .await
+            .list()
+            .into_iter()
+            .map(|l| l.id)
+            .collect()
+    }
+
+    /// `zone.add` — a name over one or more logical outputs.
+    /// Answers the new zone with its minted id.
+    async fn handle_zone_add(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: ZoneAddRequest = parse_versioned_payload(req)?;
+        let known = self.known_logical_ids().await;
+        let zone = self
+            .zones
+            .write()
+            .await
+            .add(&known, &payload.name, &payload.logical_output_ids)
+            .map_err(|r| Self::zone_refused(req, r))?;
+        self.persist_zones().await;
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            id = %zone.id,
+            name = %zone.name,
+            logical_outputs = zone.logical_output_ids.len(),
+            "zone added"
+        );
+        encode(
+            req,
+            &ZoneResponse {
+                v: PAYLOAD_VERSION,
+                zone,
+            },
+        )
+    }
+
+    /// `zone.update` — a new name, a new list of logical outputs,
+    /// or both; the id stays. Answers the zone as it is now.
+    async fn handle_zone_update(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: ZoneUpdateRequest = parse_versioned_payload(req)?;
+        let known = self.known_logical_ids().await;
+        let zone = self
+            .zones
+            .write()
+            .await
+            .update(
+                &known,
+                &payload.id,
+                payload.name.as_deref(),
+                payload.logical_output_ids.as_deref(),
+            )
+            .map_err(|r| Self::zone_refused(req, r))?;
+        self.persist_zones().await;
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            id = %zone.id,
+            name = %zone.name,
+            logical_outputs = zone.logical_output_ids.len(),
+            "zone updated"
+        );
+        encode(
+            req,
+            &ZoneResponse {
+                v: PAYLOAD_VERSION,
+                zone,
+            },
+        )
+    }
+
+    /// `zone.remove` — the zone taken away. Answers it. Its
+    /// logical outputs and the physical outputs are untouched.
+    async fn handle_zone_remove(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: ZoneRemoveRequest = parse_versioned_payload(req)?;
+        let zone = self
+            .zones
+            .write()
+            .await
+            .remove(&payload.id)
+            .map_err(|r| Self::zone_refused(req, r))?;
+        self.persist_zones().await;
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            id = %zone.id,
+            name = %zone.name,
+            "zone removed"
+        );
+        encode(
+            req,
+            &ZoneResponse {
+                v: PAYLOAD_VERSION,
+                zone,
+            },
+        )
+    }
+
+    /// `zone.list` — every zone, in id order. Reads the registry
+    /// and changes nothing.
+    async fn handle_zone_list(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        parse_versioned_payload::<EmptyPayload>(req)?;
+        let zones = self.zones.read().await.list();
+        encode(
+            req,
+            &ZoneListResponse {
+                v: PAYLOAD_VERSION,
+                zones,
+            },
+        )
+    }
+
     /// Load the embedded ALSA card catalog, enumerate the host's
     /// ALSA outputs via `aplay -l`, cache the resolved list, and
     /// publish the snapshot on `evo.audio.delivery:outputs`. The
@@ -2394,6 +2570,68 @@ struct LogicalOutputResponse {
 struct ListLogicalOutputsResponse {
     v: u32,
     logical_outputs: Vec<LogicalOutput>,
+}
+
+/// `zone.add` request.
+#[derive(Debug, Deserialize)]
+struct ZoneAddRequest {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    name: String,
+    logical_output_ids: Vec<String>,
+}
+
+impl HasPayloadVersion for ZoneAddRequest {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+/// `zone.update` request: the id, and what changes.
+#[derive(Debug, Deserialize)]
+struct ZoneUpdateRequest {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    logical_output_ids: Option<Vec<String>>,
+}
+
+impl HasPayloadVersion for ZoneUpdateRequest {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+/// `zone.remove` request.
+#[derive(Debug, Deserialize)]
+struct ZoneRemoveRequest {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    id: String,
+}
+
+impl HasPayloadVersion for ZoneRemoveRequest {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+/// `zone.add`, `zone.update` and `zone.remove` answer with the
+/// zone.
+#[derive(Debug, Serialize)]
+struct ZoneResponse {
+    v: u32,
+    zone: Zone,
+}
+
+/// `zone.list` answers every zone, in id order.
+#[derive(Debug, Serialize)]
+struct ZoneListResponse {
+    v: u32,
+    zones: Vec<Zone>,
 }
 
 // ===== wire payload types =====
@@ -4384,5 +4622,277 @@ pcm.evo {
         assert_eq!(physical_after["outputs"].as_array().unwrap().len(), 2);
         assert!(rig.mixer.calls.lock().unwrap().is_empty());
         assert_eq!(rig.drop_in().await, "");
+    }
+
+    // ----- zones: a name over one or more logical outputs -----
+
+    impl OutputRig {
+        /// Logical state plus zone state, with two named outputs
+        /// already there: `logical:1` on DAC and `logical:2` on
+        /// HDMI.
+        async fn with_zones(mut self) -> Self {
+            self = self.with_logical_state().await;
+            self.plugin
+                .install_zones(self.dir.path().join(ZoneStore::FILE_NAME))
+                .await;
+            for (name, out) in [("Kitchen", "hw:0,0"), ("Hall", "hw:1,0")] {
+                self.call(
+                    "delivery.add_logical_output",
+                    json!({ "v": 1, "name": name, "output_id": out }),
+                )
+                .await
+                .unwrap();
+            }
+            self
+        }
+
+        async fn snapshot_outputs(&self) -> (Value, Value) {
+            (
+                self.call("delivery.list_outputs", json!({ "v": 1 }))
+                    .await
+                    .unwrap(),
+                self.call("delivery.list_logical_outputs", json!({ "v": 1 }))
+                    .await
+                    .unwrap(),
+            )
+        }
+    }
+
+    /// A zone with no logical output is refused, on add and on
+    /// update; nothing is minted or changed.
+    #[tokio::test]
+    async fn a_zone_with_no_logical_output_is_refused() {
+        let rig = OutputRig::new().await.with_zones().await;
+        let err = rig
+            .call(
+                "zone.add",
+                json!({ "v": 1, "name": "Empty", "logical_output_ids": [] }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("at least one logical output"), "{err}");
+        let listed = rig.call("zone.list", json!({ "v": 1 })).await.unwrap();
+        assert_eq!(listed, json!({ "v": 1, "zones": [] }));
+        assert!(!rig.dir.path().join(ZoneStore::FILE_NAME).exists());
+
+        let z = rig
+            .call("zone.add", json!({ "v": 1, "name": "Down", "logical_output_ids": ["logical:1"] }))
+            .await
+            .unwrap();
+        assert_eq!(
+            z["zone"],
+            json!({ "id": "zone:1", "name": "Down", "logical_output_ids": ["logical:1"] })
+        );
+        let err = rig
+            .call(
+                "zone.update",
+                json!({ "v": 1, "id": "zone:1", "logical_output_ids": [] }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("at least one logical output"), "{err}");
+        let listed = rig.call("zone.list", json!({ "v": 1 })).await.unwrap();
+        assert_eq!(
+            listed["zones"][0]["logical_output_ids"],
+            json!(["logical:1"])
+        );
+    }
+
+    /// One logical output cannot sit in two zones: refused on add
+    /// and on update, and the refused zone is not kept.
+    #[tokio::test]
+    async fn one_logical_output_cannot_sit_in_two_zones() {
+        let rig = OutputRig::new().await.with_zones().await;
+        rig.call("zone.add", json!({ "v": 1, "name": "Down", "logical_output_ids": ["logical:1"] }))
+            .await
+            .unwrap();
+        let err = rig
+            .call("zone.add", json!({ "v": 1, "name": "Up", "logical_output_ids": ["logical:2", "logical:1"] }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("already sits in zone \\\"zone:1\\\""), "{err}");
+        let listed = rig.call("zone.list", json!({ "v": 1 })).await.unwrap();
+        assert_eq!(
+            listed["zones"].as_array().unwrap().len(),
+            1,
+            "the refused zone was not kept"
+        );
+
+        rig.call("zone.add", json!({ "v": 1, "name": "Up", "logical_output_ids": ["logical:2"] }))
+            .await
+            .unwrap();
+        let err = rig
+            .call("zone.update", json!({ "v": 1, "id": "zone:2", "logical_output_ids": ["logical:2", "logical:1"] }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("already sits in zone \\\"zone:1\\\""), "{err}");
+        let listed = rig.call("zone.list", json!({ "v": 1 })).await.unwrap();
+        assert_eq!(
+            listed["zones"],
+            json!([
+                { "id": "zone:1", "name": "Down", "logical_output_ids": ["logical:1"] },
+                { "id": "zone:2", "name": "Up", "logical_output_ids": ["logical:2"] },
+            ])
+        );
+        // Named twice in one list is refused too.
+        let err = rig
+            .call("zone.update", json!({ "v": 1, "id": "zone:2", "logical_output_ids": ["logical:2", "logical:2"] }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("named twice"), "{err}");
+    }
+
+    /// Remove takes the zone away and leaves the logical outputs
+    /// and the physical outputs exactly as they were; the freed
+    /// logical output can join another zone.
+    #[tokio::test]
+    async fn remove_drops_no_logical_output_and_no_physical_output() {
+        let rig = OutputRig::new().await.with_zones().await;
+        let before = rig.snapshot_outputs().await;
+        rig.call("zone.add", json!({ "v": 1, "name": "Down", "logical_output_ids": ["logical:1", "logical:2"] }))
+            .await
+            .unwrap();
+        let removed = rig
+            .call("zone.remove", json!({ "v": 1, "id": "zone:1" }))
+            .await
+            .unwrap();
+        assert_eq!(
+            removed["zone"],
+            json!({ "id": "zone:1", "name": "Down", "logical_output_ids": ["logical:1", "logical:2"] })
+        );
+        assert_eq!(
+            rig.snapshot_outputs().await,
+            before,
+            "logical and physical outputs untouched"
+        );
+        assert_eq!(before.1["logical_outputs"].as_array().unwrap().len(), 2);
+        assert_eq!(before.0["outputs"].as_array().unwrap().len(), 2);
+        let listed = rig.call("zone.list", json!({ "v": 1 })).await.unwrap();
+        assert_eq!(listed, json!({ "v": 1, "zones": [] }));
+        let err = rig
+            .call("zone.remove", json!({ "v": 1, "id": "zone:1" }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown zone"), "{err}");
+        let again = rig
+            .call("zone.add", json!({ "v": 1, "name": "Up", "logical_output_ids": ["logical:2"] }))
+            .await
+            .unwrap();
+        assert_eq!(
+            again["zone"]["id"], "zone:2",
+            "a removed id is never reused"
+        );
+        assert!(rig.mixer.calls.lock().unwrap().is_empty());
+        assert_eq!(rig.drop_in().await, "");
+    }
+
+    /// An unknown logical id, a physical id, an unknown zone, a
+    /// taken name and an empty update are refused; update keeps
+    /// the id.
+    #[tokio::test]
+    async fn zone_refusals_and_update_keeps_the_id() {
+        let rig = OutputRig::new().await.with_zones().await;
+        let err = rig
+            .call("zone.add", json!({ "v": 1, "name": "Down", "logical_output_ids": ["logical:9"] }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("unknown logical output \\\"logical:9\\\""),
+            "{err}"
+        );
+        let err = rig
+            .call("zone.add", json!({ "v": 1, "name": "Down", "logical_output_ids": ["hw:0,0"] }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("unknown logical output \\\"hw:0,0\\\""),
+            "{err}"
+        );
+        rig.call("zone.add", json!({ "v": 1, "name": "Down", "logical_output_ids": ["logical:1"] }))
+            .await
+            .unwrap();
+        let err = rig
+            .call("zone.add", json!({ "v": 1, "name": "down", "logical_output_ids": ["logical:2"] }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("already carried by \\\"zone:1\\\""), "{err}");
+        let err = rig
+            .call("zone.update", json!({ "v": 1, "id": "zone:1" }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("neither"), "{err}");
+        let err = rig
+            .call(
+                "zone.update",
+                json!({ "v": 1, "id": "zone:7", "name": "X" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown zone"), "{err}");
+        let u = rig
+            .call("zone.update", json!({ "v": 1, "id": "zone:1", "name": "Ground", "logical_output_ids": ["logical:2", "logical:1"] }))
+            .await
+            .unwrap();
+        assert_eq!(
+            u["zone"],
+            json!({ "id": "zone:1", "name": "Ground", "logical_output_ids": ["logical:2", "logical:1"] })
+        );
+    }
+
+    /// Zones survive a restart on the same state directory, in id
+    /// order, and a removed id is never minted again.
+    #[tokio::test]
+    async fn zones_survive_a_restart() {
+        let rig = OutputRig::new().await.with_zones().await;
+        rig.call("zone.add", json!({ "v": 1, "name": "Down", "logical_output_ids": ["logical:1"] }))
+            .await
+            .unwrap();
+        rig.call("zone.add", json!({ "v": 1, "name": "Up", "logical_output_ids": ["logical:2"] }))
+            .await
+            .unwrap();
+        rig.call("zone.remove", json!({ "v": 1, "id": "zone:1" }))
+            .await
+            .unwrap();
+
+        let mut again = loaded_plugin().await;
+        again
+            .install_logical_outputs(
+                rig.dir.path().join(LogicalOutputStore::FILE_NAME),
+            )
+            .await;
+        again
+            .install_zones(rig.dir.path().join(ZoneStore::FILE_NAME))
+            .await;
+        *again.cached_outputs.write().await =
+            rig.plugin.cached_outputs.read().await.clone();
+        let listed: Value = serde_json::from_slice(
+            &again
+                .handle_request(&request("zone.list", json!({ "v": 1 })))
+                .await
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
+        assert_eq!(
+            listed["zones"],
+            json!([{ "id": "zone:2", "name": "Up", "logical_output_ids": ["logical:2"] }])
+        );
+        let err = again
+            .handle_request(&request("zone.add", json!({ "v": 1, "name": "Porch", "logical_output_ids": ["logical:2"] })))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("already sits in zone \\\"zone:2\\\""),
+            "{err:?}"
+        );
+        let added: Value = serde_json::from_slice(
+            &again
+                .handle_request(&request("zone.add", json!({ "v": 1, "name": "Porch", "logical_output_ids": ["logical:1"] })))
+                .await
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
+        assert_eq!(added["zone"]["id"], "zone:3");
     }
 }

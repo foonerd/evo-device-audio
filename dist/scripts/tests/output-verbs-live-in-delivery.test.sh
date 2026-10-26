@@ -7,12 +7,14 @@
 # `delivery.pause_output` act on one ALSA output each;
 # `delivery.add_logical_output`, `delivery.update_logical_output`
 # and `delivery.remove_logical_output` name one, and
-# `delivery.list_logical_outputs` reads the names back. The delivery
+# `delivery.list_logical_outputs` reads the names back;
+# `zone.add`, `zone.update`, `zone.remove` and `zone.list` keep a
+# name over one or more logical outputs. The delivery
 # plugin owns the chain definition those verbs steer and the
 # names the operator gives its outputs; no steward crate and no
 # other plugin carries an output policy, a second copy of a
-# verb, or a parallel truth about which output is playing or
-# what it is called. This test goes red the moment one of the
+# verb, or a parallel truth about which output is playing,
+# what it is called, or which zone it is in. This test goes red the moment one of the
 # names appears in a Rust source, a manifest or a privileges
 # file outside `plugins/org.evoframework.delivery.alsa`.
 #
@@ -35,6 +37,10 @@ VERBS=(
     "delivery.update_logical_output"
     "delivery.remove_logical_output"
     "delivery.list_logical_outputs"
+    "zone.add"
+    "zone.update"
+    "zone.remove"
+    "zone.list"
 )
 
 PASS=0

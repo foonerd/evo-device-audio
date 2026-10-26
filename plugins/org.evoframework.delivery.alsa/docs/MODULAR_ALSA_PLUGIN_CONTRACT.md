@@ -107,6 +107,35 @@ refuse it. Names move no audio, no mixer and no drop-in. They
 survive a restart in `<state_dir>/logical-outputs.toml`. No
 subject is published and `delivery.list_outputs` is unchanged.
 
+## Zones
+
+A zone is a name over one or more logical outputs. It is not an
+ALSA device and not an EQ. It has a stable id the plugin mints
+(`zone:<n>`, never reused), a name, and the `logical:<n>` ids it
+holds, in the order given.
+
+- `zone.add { name, logical_output_ids }`: a new zone. The name
+  is trimmed, non-empty, at most 64 characters, and unique among
+  zones case-insensitively. The list holds at least one id; each
+  id is a logical output the plugin has, named once, and in no
+  other zone. A logical output sits in one zone at most.
+- `zone.update { id, name?, logical_output_ids? }`: a new name,
+  a new list, or both; the id stays. An update that names
+  neither is refused. A refused update changes nothing.
+- `zone.remove { id }`: the zone taken away; answers it. Its
+  logical outputs and the physical outputs are untouched, and
+  the freed logical outputs may join another zone.
+- `zone.list {}`: every zone, in id order; an empty set is an
+  empty list. Reads only.
+
+Zones move no audio, no mixer and no drop-in. No EQ is attached
+to a zone and no scene is stored; `eq_only` stays the one EQ.
+Zones survive a restart in `<state_dir>/zones.toml`. No subject
+is published. The four verbs dispatch under this plugin's
+`audio.delivery` stocking until the `audio.zones` shelf is
+declared in the rack catalogue and the schemas repository; the
+request types are the shelf's own (`zone.*`) already.
+
 ## On-disk contract
 
 - Baseline config: `/etc/asound.conf` (bootstrap-owned)
@@ -116,6 +145,8 @@ subject is published and `delivery.list_outputs` is unchanged.
   enabled flags and last-set volumes, never the binding)
 - Logical outputs: `<state_dir>/logical-outputs.toml`
   (plugin-owned; names, ids and the next id to mint)
+- Zones: `<state_dir>/zones.toml` (plugin-owned; names, ids,
+  logical output ids and the next id to mint)
 
 One writer per surface is mandatory. The options observer and
 the output verbs write the drop-in through one renderer under
@@ -143,6 +174,12 @@ one lock.
   - refuse at responder boundary; nothing moves
 - unreadable or malformed `logical-outputs.toml`:
   - warn, start with no names
+- unknown zone, empty or taken name, no logical outputs, unknown
+  or twice-named logical output, logical output in another
+  zone, empty update:
+  - refuse at responder boundary; nothing moves
+- unreadable or malformed `zones.toml`:
+  - warn, start with no zones
 
 ## Verification expectations
 
@@ -155,12 +192,15 @@ For plugin-level verification, confirm:
 5. deterministic render output (snapshot-stable tests)
 6. changing one output leaves the other as it was
 7. an unknown output is refused by every output verb
-8. the five output verbs and the four logical-output verbs
-   are named only in this plugin
+8. the five output verbs, the four logical-output verbs and the
+   four zone verbs are named only in this plugin
    (`dist/scripts/tests/output-verbs-live-in-delivery.test.sh`)
 9. a logical id is refused by the five output verbs
 10. `list_logical_outputs` lists what was added, drops what
     was removed, and leaves `list_outputs` unchanged
+11. a zone is refused with no logical output; one logical
+    output cannot sit in two zones; `zone.remove` drops no
+    logical output and no physical output
 
 ## Cross-reference map
 

@@ -33,6 +33,11 @@ capability_intent:
     access_path: filesystem/service-owned
     failure_mode: the verb answers from the in-memory registry and warns that the file could not be written; names are lost at the next restart and nothing else changes.
 
+  - id: zone_names
+    need: keep the zones the operator defines (`zone.add` / `zone.update` / `zone.remove`, read back by `zone.list`) in `zones.toml` under the plugin's state directory, written atomically, so a zone survives a restart. A zone is a name over one or more logical outputs and moves no audio, no mixer and no drop-in.
+    access_path: filesystem/service-owned
+    failure_mode: the verb answers from the in-memory registry and warns that the file could not be written; zones are lost at the next restart and nothing else changes.
+
 required_binaries:
   - name: aplay
     failure_mode: hardware-probing verbs respond with structured empty list + diagnostic; plugin admits but operator-visible card-selection is empty.
