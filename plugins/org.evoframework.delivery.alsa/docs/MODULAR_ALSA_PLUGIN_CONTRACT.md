@@ -98,6 +98,9 @@ it points at.
   update that names neither is refused.
 - `remove_logical_output { id }`: the row taken away; answers
   it.
+- `list_logical_outputs {}`: every row, in id order; an empty
+  set is an empty list. Reads only: no row, no file and no
+  physical output changes.
 
 A logical id is not a physical output: the five output verbs
 refuse it. Names move no audio, no mixer and no drop-in. They
@@ -152,10 +155,12 @@ For plugin-level verification, confirm:
 5. deterministic render output (snapshot-stable tests)
 6. changing one output leaves the other as it was
 7. an unknown output is refused by every output verb
-8. the five output verbs and the three logical-output verbs
+8. the five output verbs and the four logical-output verbs
    are named only in this plugin
    (`dist/scripts/tests/output-verbs-live-in-delivery.test.sh`)
 9. a logical id is refused by the five output verbs
+10. `list_logical_outputs` lists what was added, drops what
+    was removed, and leaves `list_outputs` unchanged
 
 ## Cross-reference map
 

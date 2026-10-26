@@ -166,6 +166,7 @@ const REQUEST_TYPES: &[&str] = &[
     "delivery.add_logical_output",
     "delivery.update_logical_output",
     "delivery.remove_logical_output",
+    "delivery.list_logical_outputs",
 ];
 
 /// Subject scheme + value for the resolved-outputs surface.
@@ -1790,6 +1791,9 @@ impl Respondent for AlsaDeliveryPlugin {
                 "delivery.remove_logical_output" => {
                     self.handle_remove_logical_output(req).await
                 }
+                "delivery.list_logical_outputs" => {
+                    self.handle_list_logical_outputs(req).await
+                }
                 other => Err(PluginError::Permanent(format!(
                     "request type {other:?} declared but no handler wired; \
                      manifest/runtime drift bug"
@@ -2177,6 +2181,24 @@ impl AlsaDeliveryPlugin {
         )
     }
 
+    /// `delivery.list_logical_outputs` — every named output, in
+    /// id order. Reads the registry and changes nothing: no row,
+    /// no file, no physical output.
+    async fn handle_list_logical_outputs(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        parse_versioned_payload::<EmptyPayload>(req)?;
+        let logical_outputs = self.logical.read().await.list();
+        encode(
+            req,
+            &ListLogicalOutputsResponse {
+                v: PAYLOAD_VERSION,
+                logical_outputs,
+            },
+        )
+    }
+
     /// Load the embedded ALSA card catalog, enumerate the host's
     /// ALSA outputs via `aplay -l`, cache the resolved list, and
     /// publish the snapshot on `evo.audio.delivery:outputs`. The
@@ -2364,6 +2386,14 @@ impl HasPayloadVersion for RemoveLogicalOutputRequest {
 struct LogicalOutputResponse {
     v: u32,
     logical_output: LogicalOutput,
+}
+
+/// `delivery.list_logical_outputs` answers every row, in id
+/// order.
+#[derive(Debug, Serialize)]
+struct ListLogicalOutputsResponse {
+    v: u32,
+    logical_outputs: Vec<LogicalOutput>,
 }
 
 // ===== wire payload types =====
@@ -4270,5 +4300,89 @@ pcm.evo {
         )
         .unwrap();
         assert_eq!(v["logical_output"]["id"], "logical:3");
+    }
+
+    /// The read lists what was added, drops what was removed,
+    /// answers an empty set as an empty list, and leaves the
+    /// physical output list, the rows and the state file as they
+    /// were.
+    #[tokio::test]
+    async fn list_logical_outputs_reads_the_names_back_and_changes_nothing() {
+        let rig = OutputRig::new().await.with_logical_state().await;
+        let physical_before = rig
+            .call("delivery.list_outputs", json!({ "v": 1 }))
+            .await
+            .unwrap();
+        let empty = rig
+            .call("delivery.list_logical_outputs", json!({ "v": 1 }))
+            .await
+            .unwrap();
+        assert_eq!(empty, json!({ "v": 1, "logical_outputs": [] }));
+
+        rig.call(
+            "delivery.add_logical_output",
+            json!({ "v": 1, "name": "Kitchen", "output_id": "hw:0,0" }),
+        )
+        .await
+        .unwrap();
+        rig.call(
+            "delivery.add_logical_output",
+            json!({ "v": 1, "name": "Hall", "output_id": "hw:1,0" }),
+        )
+        .await
+        .unwrap();
+        let listed = rig
+            .call("delivery.list_logical_outputs", json!({ "v": 1 }))
+            .await
+            .unwrap();
+        assert_eq!(
+            listed["logical_outputs"],
+            json!([
+                { "id": "logical:1", "name": "Kitchen", "output_id": "hw:0,0" },
+                { "id": "logical:2", "name": "Hall", "output_id": "hw:1,0" },
+            ]),
+            "an added name is listed, in id order"
+        );
+
+        rig.call(
+            "delivery.remove_logical_output",
+            json!({ "v": 1, "id": "logical:1" }),
+        )
+        .await
+        .unwrap();
+        let state_path = rig.dir.path().join(LogicalOutputStore::FILE_NAME);
+        let file_before = tokio::fs::read(&state_path).await.unwrap();
+        let listed = rig
+            .call("delivery.list_logical_outputs", json!({ "v": 1 }))
+            .await
+            .unwrap();
+        assert_eq!(
+            listed["logical_outputs"],
+            json!([{ "id": "logical:2", "name": "Hall", "output_id": "hw:1,0" }]),
+            "a removed name is not listed"
+        );
+        // Reading twice answers the same and moves nothing.
+        let again = rig
+            .call("delivery.list_logical_outputs", json!({ "v": 1 }))
+            .await
+            .unwrap();
+        assert_eq!(again, listed);
+        assert_eq!(
+            tokio::fs::read(&state_path).await.unwrap(),
+            file_before,
+            "the state file was not rewritten"
+        );
+        assert_eq!(rig.plugin.logical.read().await.rows().len(), 1);
+        let physical_after = rig
+            .call("delivery.list_outputs", json!({ "v": 1 }))
+            .await
+            .unwrap();
+        assert_eq!(
+            physical_after, physical_before,
+            "the physical output list is unchanged"
+        );
+        assert_eq!(physical_after["outputs"].as_array().unwrap().len(), 2);
+        assert!(rig.mixer.calls.lock().unwrap().is_empty());
+        assert_eq!(rig.drop_in().await, "");
     }
 }

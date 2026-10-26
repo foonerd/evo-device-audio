@@ -78,6 +78,7 @@ request_types = [
     "delivery.add_logical_output",
     "delivery.update_logical_output",
     "delivery.remove_logical_output",
+    "delivery.list_logical_outputs",
 ]
 response_budget_ms = 5000
 

@@ -6,7 +6,8 @@
 # `delivery.set_output_volume`, `delivery.play_output` and
 # `delivery.pause_output` act on one ALSA output each;
 # `delivery.add_logical_output`, `delivery.update_logical_output`
-# and `delivery.remove_logical_output` name one. The delivery
+# and `delivery.remove_logical_output` name one, and
+# `delivery.list_logical_outputs` reads the names back. The delivery
 # plugin owns the chain definition those verbs steer and the
 # names the operator gives its outputs; no steward crate and no
 # other plugin carries an output policy, a second copy of a
@@ -33,6 +34,7 @@ VERBS=(
     "delivery.add_logical_output"
     "delivery.update_logical_output"
     "delivery.remove_logical_output"
+    "delivery.list_logical_outputs"
 )
 
 PASS=0

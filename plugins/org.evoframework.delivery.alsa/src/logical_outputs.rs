@@ -8,7 +8,9 @@
 //! physical output it points at. `delivery.add_logical_output`
 //! makes one, `delivery.update_logical_output` renames it or
 //! points it elsewhere without changing its id, and
-//! `delivery.remove_logical_output` takes it away.
+//! `delivery.remove_logical_output` takes it away, and
+//! `delivery.list_logical_outputs` reads them all back in id
+//! order without touching any.
 //!
 //! A name is trimmed, non-empty, at most [`NAME_MAX_CHARS`]
 //! characters, and unique among logical outputs case-
@@ -147,6 +149,18 @@ fn known_output(
     }
 }
 
+/// The number in a `logical:<n>` id; an id without one sorts
+/// last, by its text.
+fn id_number(id: &str) -> (u64, String) {
+    match id
+        .strip_prefix(ID_PREFIX)
+        .and_then(|n| n.parse::<u64>().ok())
+    {
+        Some(n) => (n, String::new()),
+        None => (u64::MAX, id.to_string()),
+    }
+}
+
 /// Trim and bound a name.
 fn clean_name(name: &str) -> Result<String, Refusal> {
     let name = name.trim();
@@ -175,6 +189,16 @@ impl LogicalOutputs {
     #[cfg(test)]
     pub(crate) fn rows(&self) -> &[LogicalOutput] {
         &self.state.outputs
+    }
+
+    /// `delivery.list_logical_outputs`: every row, in id order.
+    /// Ids are minted in creation order, so this is creation
+    /// order too unless the state file was reordered by hand;
+    /// the id decides either way. Reads only.
+    pub(crate) fn list(&self) -> Vec<LogicalOutput> {
+        let mut rows = self.state.outputs.clone();
+        rows.sort_by_key(|l| id_number(&l.id));
+        rows
     }
 
     fn position(&self, id: &str) -> Result<usize, Refusal> {
@@ -476,6 +500,33 @@ mod tests {
             Err(Refusal::UnknownLogicalOutput(k.id.clone()))
         );
         assert_eq!(r.rows(), &[h]);
+    }
+
+    /// The list is every row in id order, whatever order the
+    /// state file held them in, and reading changes nothing.
+    #[test]
+    fn list_is_every_row_in_id_order_and_reads_only() {
+        let outs = two();
+        let mut r = LogicalOutputs::default();
+        assert!(r.list().is_empty(), "an empty set is an empty list");
+        let k = r.add(&outs, "Kitchen", "hw:0,0").unwrap();
+        let h = r.add(&outs, "Hall", "hw:1,0").unwrap();
+        assert_eq!(r.list(), vec![k.clone(), h.clone()]);
+        r.remove(&k.id).unwrap();
+        assert_eq!(r.list(), vec![h.clone()], "a removed name is not listed");
+
+        // A state file holding the rows out of id order.
+        let mut persisted = r.persisted().clone();
+        let p = LogicalOutput {
+            id: "logical:1".to_string(),
+            name: "Pantry".to_string(),
+            output_id: "hw:0,0".to_string(),
+        };
+        persisted.outputs.push(p.clone());
+        let r = LogicalOutputs::from_persisted(persisted.clone());
+        assert_eq!(r.rows(), &[h.clone(), p.clone()], "stored out of order");
+        assert_eq!(r.list(), vec![p, h], "listed in id order");
+        assert_eq!(r.persisted(), &persisted, "reading changed nothing");
     }
 
     /// The store round-trips, keeps `next_id`, and tolerates an
