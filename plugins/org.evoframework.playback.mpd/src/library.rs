@@ -3803,6 +3803,11 @@ pub(crate) async fn handle_search_library(
         }
     }
 
+    // What the operator has forgotten, once for this answer. It
+    // applies to every hit by the URI the hit carries — a library
+    // path from MPD, a `dlna:` identity from a DLNA source.
+    let forgotten = ctx.forgotten.snapshot().await;
+
     // One MPD search for everything MPD serves, each hit stamped
     // with the source whose mount it lies under.
     let mut by_source: HashMap<Option<String>, Vec<serde_json::Value>> =
@@ -3818,7 +3823,6 @@ pub(crate) async fn handle_search_library(
         let render_ctx = RenderCtx {
             music_directory: &ctx.music_directory,
         };
-        let forgotten = ctx.forgotten.snapshot().await;
         let in_play: std::collections::HashSet<&str> =
             mpd_backed.iter().map(|r| r.id.as_str()).collect();
         for e in entries {
@@ -3871,16 +3875,20 @@ pub(crate) async fn handle_search_library(
         .await
         {
             Ok((hits, cut_short)) => {
-                let stamped: Vec<serde_json::Value> = hits
-                    .into_iter()
-                    .map(|mut h| {
-                        h.as_object_mut().unwrap().insert(
-                            "source_id".to_string(),
-                            serde_json::Value::String(record.id.clone()),
-                        );
-                        h
-                    })
-                    .collect();
+                // A forgotten DLNA track is not a result either:
+                // the same set, matched on the `dlna:` identity
+                // the hit carries.
+                let stamped: Vec<serde_json::Value> =
+                    crate::forgotten_tracks::omit_forgotten(hits, &forgotten)
+                        .into_iter()
+                        .map(|mut h| {
+                            h.as_object_mut().unwrap().insert(
+                                "source_id".to_string(),
+                                serde_json::Value::String(record.id.clone()),
+                            );
+                            h
+                        })
+                        .collect();
                 by_source
                     .entry(Some(record.id.clone()))
                     .or_default()
@@ -7137,6 +7145,26 @@ mod search_tests {
         let v = search(&mut h, false).await;
         assert!(stamps(&v).iter().all(|(uri, _)| uri != LOCAL_HIT), "{v}");
         assert_eq!(stamps(&v).len(), 2);
+    }
+
+    /// A forgotten DLNA track is not a result either: the same
+    /// set, matched on the `dlna:` identity the hit carries.
+    /// Searching for it does not put it back.
+    #[tokio::test]
+    async fn a_forgotten_dlna_uri_is_omitted() {
+        let mut h = harness(vec![dlna("dlna-1", "svc-1")]).await;
+        h.ctx.forgotten.forget("dlna:svc-1/i1").await;
+        let v = search(&mut h, false).await;
+        let dlna_hits: Vec<String> = stamps(&v)
+            .into_iter()
+            .filter(|(_, id)| id == "dlna-1")
+            .map(|(uri, _)| uri)
+            .collect();
+        assert_eq!(dlna_hits, vec!["dlna:svc-1/i2"], "{v}");
+        assert!(
+            stamps(&v).iter().all(|(uri, _)| uri != "dlna:svc-1/i1"),
+            "a forgotten DLNA hit must not come back through search: {v}"
+        );
     }
 
     /// An offline source stays out: its hits are not in the list,
