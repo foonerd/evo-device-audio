@@ -97,7 +97,9 @@ it points at.
   name, a new physical output, or both; the id stays. An
   update that names neither is refused.
 - `remove_logical_output { id }`: the row taken away; answers
-  it.
+  it. Refused, naming the zone, while a zone holds the id: the
+  logical output, the zone and the physical output stay. Take
+  the logical output out of the zone first.
 - `list_logical_outputs {}`: every row, in id order; an empty
   set is an empty list. Reads only: no row, no file and no
   physical output changes.
@@ -174,6 +176,8 @@ one lock.
   - refuse at responder boundary; nothing moves
 - unreadable or malformed `logical-outputs.toml`:
   - warn, start with no names
+- a logical output a zone holds, asked to be removed:
+  - refuse at responder boundary, naming the zone; nothing moves
 - unknown zone, empty or taken name, no logical outputs, unknown
   or twice-named logical output, logical output in another
   zone, empty update:
@@ -201,6 +205,8 @@ For plugin-level verification, confirm:
 11. a zone is refused with no logical output; one logical
     output cannot sit in two zones; `zone.remove` drops no
     logical output and no physical output
+12. a logical output a zone holds cannot be removed, and the
+    refusal names the zone
 
 ## Cross-reference map
 

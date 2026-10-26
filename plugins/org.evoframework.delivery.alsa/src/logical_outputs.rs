@@ -60,6 +60,14 @@ pub(crate) enum Refusal {
     },
     /// An update that names neither a new name nor a new output.
     NothingToUpdate,
+    /// A zone holds this logical output; it cannot be removed
+    /// while it does.
+    HeldByZone {
+        /// The logical output asked about.
+        logical_output_id: String,
+        /// The zone that holds it.
+        zone: String,
+    },
 }
 
 impl std::fmt::Display for Refusal {
@@ -82,6 +90,14 @@ impl std::fmt::Display for Refusal {
             Refusal::NothingToUpdate => {
                 write!(f, "update names neither a new name nor a new output")
             }
+            Refusal::HeldByZone {
+                logical_output_id,
+                zone,
+            } => write!(
+                f,
+                "logical output {logical_output_id:?} is held by zone \
+                 {zone:?}; take it out of the zone first"
+            ),
         }
     }
 }
@@ -283,7 +299,14 @@ impl LogicalOutputs {
         Ok(row.clone())
     }
 
-    /// `delivery.remove_logical_output`: the row taken away.
+    /// Whether a logical output with this id exists.
+    pub(crate) fn has(&self, id: &str) -> bool {
+        self.state.outputs.iter().any(|l| l.id == id)
+    }
+
+    /// `delivery.remove_logical_output`: the row taken away. The
+    /// handler refuses first when a zone holds the id; this
+    /// registry does not know zones.
     pub(crate) fn remove(
         &mut self,
         id: &str,

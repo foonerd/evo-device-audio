@@ -2200,18 +2200,44 @@ impl AlsaDeliveryPlugin {
 
     /// `delivery.remove_logical_output` — the name taken away.
     /// Answers the row that was removed. The physical output is
-    /// untouched.
+    /// untouched. Refused, naming the zone, while a zone holds
+    /// the id: the logical output, the zone and the physical
+    /// output all stay. Locks are taken logical-then-zones, the
+    /// order every zone verb uses.
     async fn handle_remove_logical_output(
         &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: RemoveLogicalOutputRequest = parse_versioned_payload(req)?;
-        let row = self
-            .logical
-            .write()
-            .await
-            .remove(&payload.id)
-            .map_err(|r| Self::logical_refused(req, r))?;
+        let row = {
+            let mut logical = self.logical.write().await;
+            if !logical.has(&payload.id) {
+                return Err(Self::logical_refused(
+                    req,
+                    logical_outputs::Refusal::UnknownLogicalOutput(
+                        payload.id.clone(),
+                    ),
+                ));
+            }
+            let held_by = self
+                .zones
+                .read()
+                .await
+                .holder_of(&payload.id)
+                .map(|z| z.id.clone());
+            if let Some(zone) = held_by {
+                return Err(Self::logical_refused(
+                    req,
+                    logical_outputs::Refusal::HeldByZone {
+                        logical_output_id: payload.id.clone(),
+                        zone,
+                    },
+                ));
+            }
+            logical
+                .remove(&payload.id)
+                .map_err(|r| Self::logical_refused(req, r))?
+        };
         self.persist_logical_outputs().await;
         tracing::info!(
             plugin = PLUGIN_NAME,
@@ -4894,5 +4920,78 @@ pcm.evo {
         )
         .unwrap();
         assert_eq!(added["zone"]["id"], "zone:3");
+    }
+
+    /// A logical output a zone holds cannot be removed: the
+    /// refusal names the zone; the logical output, the zone and
+    /// the physical outputs stay. An unzoned one is removed as
+    /// before, and so is the zoned one once its zone is gone.
+    #[tokio::test]
+    async fn a_zoned_logical_output_cannot_be_removed() {
+        let rig = OutputRig::new().await.with_zones().await;
+        rig.call("zone.add", json!({ "v": 1, "name": "Down", "logical_output_ids": ["logical:1"] }))
+            .await
+            .unwrap();
+        let before = rig.snapshot_outputs().await;
+        let zones_before =
+            rig.call("zone.list", json!({ "v": 1 })).await.unwrap();
+
+        let err = rig
+            .call(
+                "delivery.remove_logical_output",
+                json!({ "v": 1, "id": "logical:1" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("is held by zone \\\"zone:1\\\""), "{err}");
+        assert_eq!(
+            rig.snapshot_outputs().await,
+            before,
+            "logical and physical outputs stay"
+        );
+        assert_eq!(before.1["logical_outputs"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            rig.call("zone.list", json!({ "v": 1 })).await.unwrap(),
+            zones_before,
+            "the zone stays"
+        );
+
+        // Unknown is still unknown, zoned or not.
+        let err = rig
+            .call(
+                "delivery.remove_logical_output",
+                json!({ "v": 1, "id": "logical:9" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown logical output"), "{err}");
+
+        // An unzoned logical output is removed as before.
+        let r = rig
+            .call(
+                "delivery.remove_logical_output",
+                json!({ "v": 1, "id": "logical:2" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r["logical_output"]["id"], "logical:2");
+
+        // Once the zone is gone, the logical output can go.
+        rig.call("zone.remove", json!({ "v": 1, "id": "zone:1" }))
+            .await
+            .unwrap();
+        let r = rig
+            .call(
+                "delivery.remove_logical_output",
+                json!({ "v": 1, "id": "logical:1" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r["logical_output"]["id"], "logical:1");
+        let listed = rig
+            .call("delivery.list_logical_outputs", json!({ "v": 1 }))
+            .await
+            .unwrap();
+        assert_eq!(listed["logical_outputs"], json!([]));
     }
 }

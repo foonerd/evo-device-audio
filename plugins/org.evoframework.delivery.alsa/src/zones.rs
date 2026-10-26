@@ -320,6 +320,14 @@ impl Zones {
         Ok(zone.clone())
     }
 
+    /// The zone holding this logical output, if any. Reads only;
+    /// `delivery.remove_logical_output` consults it to refuse.
+    pub(crate) fn holder_of(&self, logical_output_id: &str) -> Option<&Zone> {
+        self.state.zones.iter().find(|z| {
+            z.logical_output_ids.iter().any(|l| l == logical_output_id)
+        })
+    }
+
     /// `zone.remove`: the zone taken away. Its logical outputs are
     /// not touched; they are simply in no zone now.
     pub(crate) fn remove(&mut self, id: &str) -> Result<Zone, Refusal> {
@@ -634,6 +642,27 @@ mod tests {
         assert_eq!(z.rows(), &[u.clone(), p.clone()]);
         assert_eq!(z.list(), vec![p, u]);
         assert_eq!(z.persisted(), &persisted);
+    }
+
+    /// The holder of a logical output is the one zone listing it,
+    /// found by id and not by name; an unzoned id has none.
+    #[test]
+    fn holder_of_finds_the_zone_by_logical_id() {
+        let mut z = Zones::default();
+        let d = z
+            .add(&known(), "logical:3", &s(&["logical:1", "logical:2"]))
+            .unwrap();
+        assert_eq!(
+            z.holder_of("logical:2").map(|h| h.id.as_str()),
+            Some(d.id.as_str())
+        );
+        assert_eq!(
+            z.holder_of("logical:3"),
+            None,
+            "a zone's name is not a membership"
+        );
+        z.remove(&d.id).unwrap();
+        assert_eq!(z.holder_of("logical:2"), None);
     }
 
     /// The store round-trips, keeps `next_id`, and tolerates an
