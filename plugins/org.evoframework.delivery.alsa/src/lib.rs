@@ -81,6 +81,7 @@
 // keep it allowed crate-wide.
 #![allow(clippy::manual_async_fn)]
 
+mod logical_outputs;
 mod options_render;
 mod outputs;
 
@@ -101,6 +102,7 @@ use evo_plugin_sdk::contract::{
     SubjectAnnouncer, SubjectStateStreamError,
 };
 use evo_plugin_sdk::Manifest;
+use logical_outputs::{LogicalOutput, LogicalOutputStore, LogicalOutputs};
 use options_render::OptionsSettings;
 use outputs::{
     Effect, GlobalMixer, OutputPolicy, OutputSnapshot, OutputStateStore,
@@ -161,6 +163,9 @@ const REQUEST_TYPES: &[&str] = &[
     "delivery.set_output_volume",
     "delivery.play_output",
     "delivery.pause_output",
+    "delivery.add_logical_output",
+    "delivery.update_logical_output",
+    "delivery.remove_logical_output",
 ];
 
 /// Subject scheme + value for the resolved-outputs surface.
@@ -282,6 +287,12 @@ pub struct AlsaDeliveryPlugin {
     /// How `delivery.set_output_volume` reaches the card's mixer.
     /// `amixer` in production; a recorder in tests.
     mixer: Arc<dyn MixerSetter>,
+    /// Named outputs: a name the operator gave to one physical
+    /// output, with a stable minted id.
+    logical: Arc<RwLock<LogicalOutputs>>,
+    /// Persistence for the named outputs. `Some` after load
+    /// named the state directory.
+    logical_state: Option<LogicalOutputStore>,
 }
 
 /// The operator's options as last observed, and where from.
@@ -680,6 +691,8 @@ impl AlsaDeliveryPlugin {
             happening_emitter: None,
             outputs_state: None,
             mixer: Arc::new(AmixerSetter),
+            logical: Arc::new(RwLock::new(LogicalOutputs::default())),
+            logical_state: None,
         }
     }
 
@@ -702,6 +715,33 @@ impl AlsaDeliveryPlugin {
         let persisted = store.load().await;
         self.outputs.write().await.restore(&persisted);
         self.outputs_state = Some(store);
+    }
+
+    /// Point the logical outputs file somewhere and read it.
+    async fn install_logical_outputs(&mut self, path: PathBuf) {
+        let store = LogicalOutputStore::at(path);
+        let persisted = store.load().await;
+        *self.logical.write().await = LogicalOutputs::from_persisted(persisted);
+        self.logical_state = Some(store);
+    }
+
+    /// Write the named outputs. A failed write is logged, not
+    /// refused: the registry already moved and the answer says
+    /// what it is now.
+    async fn persist_logical_outputs(&self) {
+        let Some(store) = self.logical_state.as_ref() else {
+            return;
+        };
+        let logical = self.logical.read().await;
+        if let Err(e) = store.save(logical.persisted()).await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                path = %store.path().display(),
+                error = %e,
+                "logical outputs could not be written; names will not \
+                 survive a restart"
+            );
+        }
     }
 
     /// Write the enabled flags and volumes. A failed write is
@@ -1601,6 +1641,10 @@ impl Plugin for AlsaDeliveryPlugin {
                 ctx.state_dir.join(OutputStateStore::FILE_NAME),
             )
             .await;
+            self.install_logical_outputs(
+                ctx.state_dir.join(LogicalOutputStore::FILE_NAME),
+            )
+            .await;
             // Spawn the route-change reactor. The framework's
             // audio_topology_store publishes topology rewires
             // via every plugin's RouteChangeCallback; the
@@ -1736,6 +1780,15 @@ impl Respondent for AlsaDeliveryPlugin {
                 | "delivery.pause_output" => self.handle_output_verb(req).await,
                 "delivery.set_output_volume" => {
                     self.handle_set_output_volume(req).await
+                }
+                "delivery.add_logical_output" => {
+                    self.handle_add_logical_output(req).await
+                }
+                "delivery.update_logical_output" => {
+                    self.handle_update_logical_output(req).await
+                }
+                "delivery.remove_logical_output" => {
+                    self.handle_remove_logical_output(req).await
                 }
                 other => Err(PluginError::Permanent(format!(
                     "request type {other:?} declared but no handler wired; \
@@ -2018,6 +2071,112 @@ impl AlsaDeliveryPlugin {
         )
     }
 
+    fn logical_refused(
+        req: &Request,
+        r: logical_outputs::Refusal,
+    ) -> PluginError {
+        PluginError::Permanent(format!("{}: {r}", req.request_type))
+    }
+
+    /// `delivery.add_logical_output` — a name for one physical
+    /// output `delivery.list_outputs` names. Answers the new row
+    /// with its minted id.
+    async fn handle_add_logical_output(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: AddLogicalOutputRequest = parse_versioned_payload(req)?;
+        let outputs = self.cached_outputs.read().await.clone();
+        let row = self
+            .logical
+            .write()
+            .await
+            .add(&outputs, &payload.name, &payload.output_id)
+            .map_err(|r| Self::logical_refused(req, r))?;
+        self.persist_logical_outputs().await;
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            id = %row.id,
+            name = %row.name,
+            output_id = %row.output_id,
+            "logical output added"
+        );
+        encode(
+            req,
+            &LogicalOutputResponse {
+                v: PAYLOAD_VERSION,
+                logical_output: row,
+            },
+        )
+    }
+
+    /// `delivery.update_logical_output` — a new name, a new
+    /// physical output, or both; the id stays. Answers the row
+    /// as it is now.
+    async fn handle_update_logical_output(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: UpdateLogicalOutputRequest = parse_versioned_payload(req)?;
+        let outputs = self.cached_outputs.read().await.clone();
+        let row = self
+            .logical
+            .write()
+            .await
+            .update(
+                &outputs,
+                &payload.id,
+                payload.name.as_deref(),
+                payload.output_id.as_deref(),
+            )
+            .map_err(|r| Self::logical_refused(req, r))?;
+        self.persist_logical_outputs().await;
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            id = %row.id,
+            name = %row.name,
+            output_id = %row.output_id,
+            "logical output updated"
+        );
+        encode(
+            req,
+            &LogicalOutputResponse {
+                v: PAYLOAD_VERSION,
+                logical_output: row,
+            },
+        )
+    }
+
+    /// `delivery.remove_logical_output` — the name taken away.
+    /// Answers the row that was removed. The physical output is
+    /// untouched.
+    async fn handle_remove_logical_output(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: RemoveLogicalOutputRequest = parse_versioned_payload(req)?;
+        let row = self
+            .logical
+            .write()
+            .await
+            .remove(&payload.id)
+            .map_err(|r| Self::logical_refused(req, r))?;
+        self.persist_logical_outputs().await;
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            id = %row.id,
+            name = %row.name,
+            "logical output removed"
+        );
+        encode(
+            req,
+            &LogicalOutputResponse {
+                v: PAYLOAD_VERSION,
+                logical_output: row,
+            },
+        )
+    }
+
     /// Load the embedded ALSA card catalog, enumerate the host's
     /// ALSA outputs via `aplay -l`, cache the resolved list, and
     /// publish the snapshot on `evo.audio.delivery:outputs`. The
@@ -2150,6 +2309,61 @@ impl HasPayloadVersion for OutputVolumeRequest {
 struct OutputResponse {
     v: u32,
     output: OutputSnapshot,
+}
+
+/// `delivery.add_logical_output` request.
+#[derive(Debug, Deserialize)]
+struct AddLogicalOutputRequest {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    name: String,
+    output_id: String,
+}
+
+impl HasPayloadVersion for AddLogicalOutputRequest {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+/// `delivery.update_logical_output` request: the id, and what
+/// changes.
+#[derive(Debug, Deserialize)]
+struct UpdateLogicalOutputRequest {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    output_id: Option<String>,
+}
+
+impl HasPayloadVersion for UpdateLogicalOutputRequest {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+/// `delivery.remove_logical_output` request.
+#[derive(Debug, Deserialize)]
+struct RemoveLogicalOutputRequest {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    id: String,
+}
+
+impl HasPayloadVersion for RemoveLogicalOutputRequest {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+/// The three logical-output verbs answer with the row.
+#[derive(Debug, Serialize)]
+struct LogicalOutputResponse {
+    v: u32,
+    logical_output: LogicalOutput,
 }
 
 // ===== wire payload types =====
@@ -3833,5 +4047,228 @@ pcm.evo {
             1,
             "one writer for the drop-in"
         );
+    }
+
+    // ----- logical outputs: add, update, remove a named output -----
+
+    impl OutputRig {
+        async fn with_logical_state(mut self) -> Self {
+            self.plugin
+                .install_logical_outputs(
+                    self.dir.path().join(LogicalOutputStore::FILE_NAME),
+                )
+                .await;
+            self
+        }
+    }
+
+    /// Add mints a stable id for a name on one physical output;
+    /// an unknown physical output is refused and nothing is kept.
+    #[tokio::test]
+    async fn add_names_one_physical_output_and_refuses_an_unknown_one() {
+        let rig = OutputRig::new().await.with_logical_state().await;
+        let err = rig
+            .call(
+                "delivery.add_logical_output",
+                json!({ "v": 1, "name": "Kitchen", "output_id": "hw:9,9" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown output"), "{err}");
+        assert!(!rig.dir.path().join(LogicalOutputStore::FILE_NAME).exists());
+
+        let a = rig
+            .call(
+                "delivery.add_logical_output",
+                json!({ "v": 1, "name": " Kitchen ", "output_id": "hw:0,0" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            a["logical_output"],
+            json!({ "id": "logical:1", "name": "Kitchen", "output_id": "hw:0,0" })
+        );
+        let err = rig
+            .call(
+                "delivery.add_logical_output",
+                json!({ "v": 1, "name": "kitchen", "output_id": "hw:1,0" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("already carried by \\\"logical:1\\\""),
+            "{err}"
+        );
+        let err = rig
+            .call(
+                "delivery.add_logical_output",
+                json!({ "v": 1, "name": "  ", "output_id": "hw:1,0" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("needs a name"), "{err}");
+    }
+
+    /// Update keeps the id and changes only what was named;
+    /// remove answers the row taken away; both refuse an unknown
+    /// id. The physical output is untouched throughout.
+    #[tokio::test]
+    async fn update_keeps_the_id_and_remove_takes_the_name_away() {
+        let rig = OutputRig::new().await.with_logical_state().await;
+        rig.call(
+            "delivery.add_logical_output",
+            json!({ "v": 1, "name": "Kitchen", "output_id": "hw:0,0" }),
+        )
+        .await
+        .unwrap();
+        let u = rig
+            .call(
+                "delivery.update_logical_output",
+                json!({ "v": 1, "id": "logical:1", "name": "Pantry" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            u["logical_output"],
+            json!({ "id": "logical:1", "name": "Pantry", "output_id": "hw:0,0" })
+        );
+        let u = rig
+            .call(
+                "delivery.update_logical_output",
+                json!({ "v": 1, "id": "logical:1", "output_id": "hw:1,0" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            u["logical_output"],
+            json!({ "id": "logical:1", "name": "Pantry", "output_id": "hw:1,0" })
+        );
+        let err = rig
+            .call(
+                "delivery.update_logical_output",
+                json!({ "v": 1, "id": "logical:1" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("neither"), "{err}");
+        let err = rig
+            .call(
+                "delivery.update_logical_output",
+                json!({ "v": 1, "id": "logical:7", "name": "X" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown logical output"), "{err}");
+
+        let r = rig
+            .call(
+                "delivery.remove_logical_output",
+                json!({ "v": 1, "id": "logical:1" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r["logical_output"]["name"], "Pantry");
+        let err = rig
+            .call(
+                "delivery.remove_logical_output",
+                json!({ "v": 1, "id": "logical:1" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown logical output"), "{err}");
+
+        // The physical outputs are as they were, and the mixer
+        // and drop-in were never touched.
+        let a = rig.verb("delivery.pause_output", "hw:1,0").await.unwrap();
+        assert_eq!(
+            a["output"],
+            json!({ "output_id": "hw:1,0", "enabled": true, "playing": false, "volume": null })
+        );
+        assert!(rig.mixer.calls.lock().unwrap().is_empty());
+        assert_eq!(rig.drop_in().await, "");
+    }
+
+    /// A logical id is not a physical output: the five output
+    /// verbs refuse it.
+    #[tokio::test]
+    async fn the_output_verbs_refuse_a_logical_id() {
+        let rig = OutputRig::new().await.with_logical_state().await;
+        rig.call(
+            "delivery.add_logical_output",
+            json!({ "v": 1, "name": "Kitchen", "output_id": "hw:0,0" }),
+        )
+        .await
+        .unwrap();
+        for verb in [
+            "delivery.enable_output",
+            "delivery.disable_output",
+            "delivery.play_output",
+            "delivery.pause_output",
+        ] {
+            let err = rig.verb(verb, "logical:1").await.unwrap_err();
+            assert!(err.contains("unknown output"), "{verb}: {err}");
+        }
+        let err = rig
+            .call(
+                "delivery.set_output_volume",
+                json!({ "v": 1, "output_id": "logical:1", "volume": 10 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown output"), "{err}");
+    }
+
+    /// Names survive a restart on the same state directory, and
+    /// a removed id is never minted again.
+    #[tokio::test]
+    async fn logical_outputs_survive_a_restart() {
+        let rig = OutputRig::new().await.with_logical_state().await;
+        rig.call(
+            "delivery.add_logical_output",
+            json!({ "v": 1, "name": "Kitchen", "output_id": "hw:0,0" }),
+        )
+        .await
+        .unwrap();
+        rig.call(
+            "delivery.add_logical_output",
+            json!({ "v": 1, "name": "Hall", "output_id": "hw:1,0" }),
+        )
+        .await
+        .unwrap();
+        rig.call(
+            "delivery.remove_logical_output",
+            json!({ "v": 1, "id": "logical:2" }),
+        )
+        .await
+        .unwrap();
+
+        let mut again = loaded_plugin().await;
+        again
+            .install_logical_outputs(
+                rig.dir.path().join(LogicalOutputStore::FILE_NAME),
+            )
+            .await;
+        *again.cached_outputs.write().await =
+            rig.plugin.cached_outputs.read().await.clone();
+        let err = again
+            .handle_request(&request(
+                "delivery.add_logical_output",
+                json!({ "v": 1, "name": "KITCHEN", "output_id": "hw:1,0" }),
+            ))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("already carried"), "{err:?}");
+        let v: Value = serde_json::from_slice(
+            &again
+                .handle_request(&request(
+                    "delivery.add_logical_output",
+                    json!({ "v": 1, "name": "Hall", "output_id": "hw:1,0" }),
+                ))
+                .await
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
+        assert_eq!(v["logical_output"]["id"], "logical:3");
     }
 }

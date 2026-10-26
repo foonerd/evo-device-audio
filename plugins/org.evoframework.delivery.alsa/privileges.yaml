@@ -28,6 +28,11 @@ capability_intent:
     access_path: binary/amixer
     failure_mode: the verb refuses with the card's reason and records no volume; the previous level stays on the card. The operator's other outputs are untouched because each call names one card and one control.
 
+  - id: logical_output_names
+    need: keep the names the operator gives to physical outputs (`delivery.add_logical_output` / `update_logical_output` / `remove_logical_output`) in `logical-outputs.toml` under the plugin's state directory, written atomically, so a name survives a restart. A name points at one `hw:N,M` output and moves no audio, no mixer and no drop-in.
+    access_path: filesystem/service-owned
+    failure_mode: the verb answers from the in-memory registry and warns that the file could not be written; names are lost at the next restart and nothing else changes.
+
 required_binaries:
   - name: aplay
     failure_mode: hardware-probing verbs respond with structured empty list + diagnostic; plugin admits but operator-visible card-selection is empty.

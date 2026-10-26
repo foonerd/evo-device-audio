@@ -75,6 +75,9 @@ request_types = [
     "delivery.set_output_volume",
     "delivery.play_output",
     "delivery.pause_output",
+    "delivery.add_logical_output",
+    "delivery.update_logical_output",
+    "delivery.remove_logical_output",
 ]
 response_budget_ms = 5000
 

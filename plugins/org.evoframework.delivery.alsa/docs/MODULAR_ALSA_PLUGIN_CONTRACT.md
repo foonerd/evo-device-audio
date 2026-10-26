@@ -81,6 +81,29 @@ observer uses, so an options change while an output is bound
 keeps the bound terminus. `ctl.evo` and the softvol control stay
 on the operator's card whatever the binding.
 
+## Logical outputs
+
+A logical output is a name the operator gives to one physical
+`hw:N,M` output. It has a stable id the plugin mints
+(`logical:<n>`, never reused), a name, and the physical output
+it points at.
+
+- `add_logical_output { name, output_id }`: a new row. The
+  physical output must be one `delivery.list_outputs` names.
+  The name is trimmed, non-empty, at most 64 characters, and
+  unique among logical outputs case-insensitively. Two names
+  may point at one physical output.
+- `update_logical_output { id, name?, output_id? }`: a new
+  name, a new physical output, or both; the id stays. An
+  update that names neither is refused.
+- `remove_logical_output { id }`: the row taken away; answers
+  it.
+
+A logical id is not a physical output: the five output verbs
+refuse it. Names move no audio, no mixer and no drop-in. They
+survive a restart in `<state_dir>/logical-outputs.toml`. No
+subject is published and `delivery.list_outputs` is unchanged.
+
 ## On-disk contract
 
 - Baseline config: `/etc/asound.conf` (bootstrap-owned)
@@ -88,6 +111,8 @@ on the operator's card whatever the binding.
   rendered from the operator's settings plus the output binding)
 - Output state: `<state_dir>/outputs-state.toml` (plugin-owned;
   enabled flags and last-set volumes, never the binding)
+- Logical outputs: `<state_dir>/logical-outputs.toml`
+  (plugin-owned; names, ids and the next id to mint)
 
 One writer per surface is mandatory. The options observer and
 the output verbs write the drop-in through one renderer under
@@ -110,6 +135,11 @@ one lock.
   - warn, verb fails transient, prior pipeline remains active
 - unreadable or malformed `outputs-state.toml`:
   - warn, start with every output enabled and no volumes
+- unknown logical output, empty or taken name, unknown
+  physical output on add or update, empty update:
+  - refuse at responder boundary; nothing moves
+- unreadable or malformed `logical-outputs.toml`:
+  - warn, start with no names
 
 ## Verification expectations
 
@@ -122,8 +152,10 @@ For plugin-level verification, confirm:
 5. deterministic render output (snapshot-stable tests)
 6. changing one output leaves the other as it was
 7. an unknown output is refused by every output verb
-8. the five output verbs are named only in this plugin
+8. the five output verbs and the three logical-output verbs
+   are named only in this plugin
    (`dist/scripts/tests/output-verbs-live-in-delivery.test.sh`)
+9. a logical id is refused by the five output verbs
 
 ## Cross-reference map
 
