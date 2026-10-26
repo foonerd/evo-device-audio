@@ -3644,25 +3644,142 @@ fn render_library_entry(
     }
 }
 
+/// Where a source's hits sit in the one list: the local library
+/// first, then USB and NAS, then DLNA, then cloud.
+fn source_rank(kind: &SourceKind) -> u8 {
+    match kind {
+        SourceKind::LocalInternal => 0,
+        SourceKind::LocalUsb { .. }
+        | SourceKind::NetworkNasSmb { .. }
+        | SourceKind::NetworkNasNfs { .. } => 1,
+        SourceKind::NetworkDlna { .. } => 2,
+        SourceKind::CloudGdrive { .. } | SourceKind::CloudOnedrive { .. } => 3,
+    }
+}
+
+/// How many `source.dlna.browse` calls one search may spend on one
+/// DLNA source. The ContentDirectory has no search this plugin
+/// speaks, so a search walks the tree breadth-first; a tree bigger
+/// than this is answered as far as the walk got and the source is
+/// named stale.
+pub(crate) const DLNA_SEARCH_MAX_BROWSES: usize = 32;
+
+/// Whether a DLNA entry matches the query: its name, title, artist
+/// or album contains it, case-insensitively.
+fn dlna_entry_matches(entry: &serde_json::Value, query_lower: &str) -> bool {
+    ["name", "title", "artist", "album"].iter().any(|k| {
+        entry
+            .get(k)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.to_lowercase().contains(query_lower))
+    })
+}
+
+/// Search one online DLNA source through the browse this plugin
+/// already uses: walk containers from the root, breadth-first,
+/// keep the items whose name or tags contain the query, in the
+/// order the server lists them. Returns the hits and whether the
+/// walk was cut short by [`DLNA_SEARCH_MAX_BROWSES`].
+async fn dlna_search_via_browse(
+    dispatcher: &Arc<dyn ShelfRequestDispatcher>,
+    record: &SourceRecord,
+    service_id: &str,
+    query_lower: &str,
+) -> Result<(Vec<serde_json::Value>, bool), VerbError> {
+    let mut hits: Vec<serde_json::Value> = Vec::new();
+    let mut queue: std::collections::VecDeque<String> =
+        std::collections::VecDeque::from([String::new()]);
+    let mut browses = 0usize;
+    while let Some(container) = queue.pop_front() {
+        let mut page = 0usize;
+        loop {
+            if browses >= DLNA_SEARCH_MAX_BROWSES {
+                return Ok((hits, true));
+            }
+            browses += 1;
+            let answer = browse_dlna_via_source_dlna(
+                dispatcher,
+                &record.id,
+                service_id,
+                &container,
+                page,
+                evo_dlna::DLNA_PAGE_HARD_CAP as usize,
+                &record.state,
+            )
+            .await?;
+            let entries = answer
+                .get("entries")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for entry in entries {
+                let kind = entry.get("kind").and_then(|v| v.as_str());
+                match kind {
+                    Some("directory") => {
+                        if let Some(id) =
+                            entry.get("uri").and_then(|v| v.as_str())
+                        {
+                            queue.push_back(id.to_string());
+                        }
+                    }
+                    _ => {
+                        if dlna_entry_matches(&entry, query_lower) {
+                            hits.push(entry);
+                        }
+                    }
+                }
+            }
+            match answer.get("next_page").and_then(|v| v.as_u64()) {
+                Some(next) => page = next as usize,
+                None => break,
+            }
+        }
+    }
+    Ok((hits, false))
+}
+
+/// `library.search_library` — one query, one ranked list.
+///
+/// Every hit is stamped once with the source it came from. MPD is
+/// searched once for all the sources it serves — local, USB, NAS —
+/// and each hit is resolved to its source by the mount it lies
+/// under. An online DLNA source is searched through the browse
+/// this plugin already uses. A cloud source has no search client
+/// here: it is named in `stale_sources`, not skipped and not
+/// filled with invented hits. A source that was asked and failed,
+/// or whose DLNA walk was cut short, is named there too.
+///
+/// Order: the local library, then USB and NAS, then DLNA, then
+/// cloud; two sources of the same rank by source id; within one
+/// source, that source's own order. A forgotten track is omitted.
+/// An offline or retired source stays out, as before.
 pub(crate) async fn handle_search_library(
     ctx: &LibraryContext,
     conn: &mut MpdConnection,
     payload: SearchLibraryPayload,
 ) -> Result<serde_json::Value, VerbError> {
     check_version(payload.v, "library.search_library")?;
-    let max_results = payload.max_results.min(SEARCH_MAX_RESULTS_CAP);
-    let snapshot = ctx.registry.snapshot().await;
+    let max_results = payload.max_results.min(SEARCH_MAX_RESULTS_CAP) as usize;
+    let mut snapshot = ctx.registry.snapshot().await;
+    // The registry hands records back in no particular order; the
+    // list's order must be one order, so ties within a rank go by
+    // source id.
+    snapshot.sort_by(|a, b| {
+        source_rank(&a.kind)
+            .cmp(&source_rank(&b.kind))
+            .then_with(|| a.id.cmp(&b.id))
+    });
     let mut stale_sources: Vec<String> = Vec::new();
-    let mut results: Vec<serde_json::Value> = Vec::new();
-    let mut truncated = false;
+
+    // Which sources are in play.
+    let mut mpd_backed: Vec<&SourceRecord> = Vec::new();
+    let mut dlna: Vec<(&SourceRecord, String)> = Vec::new();
     for record in &snapshot {
-        // Optional source-id filter.
         if let Some(ids) = &payload.source_ids {
             if !ids.contains(&record.id) {
                 continue;
             }
         }
-        // Skip Offline sources unless include_offline.
         if matches!(
             record.state,
             SourceState::Offline { .. } | SourceState::Retired
@@ -3672,17 +3789,25 @@ pub(crate) async fn handle_search_library(
             }
             continue;
         }
-        // Skip cloud + DLNA — cloud-native search substrate is a
-        // follow-on primitive; for now those source kinds don't
-        // appear in the search results.
-        if matches!(
-            record.kind,
+        match &record.kind {
+            SourceKind::NetworkDlna { service_id, .. } => {
+                dlna.push((record, service_id.clone()));
+            }
             SourceKind::CloudGdrive { .. }
-                | SourceKind::CloudOnedrive { .. }
-                | SourceKind::NetworkDlna { .. }
-        ) {
-            continue;
+            | SourceKind::CloudOnedrive { .. } => {
+                // No cloud search client in this plugin: named,
+                // not skipped, not invented.
+                stale_sources.push(record.id.clone());
+            }
+            _ => mpd_backed.push(record),
         }
+    }
+
+    // One MPD search for everything MPD serves, each hit stamped
+    // with the source whose mount it lies under.
+    let mut by_source: HashMap<Option<String>, Vec<serde_json::Value>> =
+        HashMap::new();
+    if !mpd_backed.is_empty() {
         let entries = conn
             .search(MpdSearchField::Any, &payload.query)
             .await
@@ -3694,29 +3819,106 @@ pub(crate) async fn handle_search_library(
             music_directory: &ctx.music_directory,
         };
         let forgotten = ctx.forgotten.snapshot().await;
+        let in_play: std::collections::HashSet<&str> =
+            mpd_backed.iter().map(|r| r.id.as_str()).collect();
         for e in entries {
-            // A forgotten track is not a result, and does not
-            // count toward the cap.
-            if let crate::mpd::MpdLibraryEntry::File { path, .. } = &e {
-                if forgotten.contains(path) {
+            let MpdLibraryEntry::File { path, .. } = &e else {
+                continue;
+            };
+            // A forgotten track is not a result.
+            if forgotten.contains(path) {
+                continue;
+            }
+            let source_id = crate::queue::resolve_source(
+                &ctx.music_directory,
+                path,
+                &ctx.registry,
+            )
+            .await;
+            // A hit under a source that is not in play — filtered
+            // out, offline — is not a result either. One under no
+            // registered source is kept, stamped with no source.
+            if let Some(id) = source_id.as_deref() {
+                if !in_play.contains(id) {
                     continue;
                 }
             }
             let mut item = render_library_entry(&e, Some(render_ctx));
             item.as_object_mut().unwrap().insert(
                 "source_id".to_string(),
-                serde_json::Value::String(record.id.clone()),
+                source_id
+                    .clone()
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Null),
             );
-            results.push(item);
-            if results.len() >= max_results as usize {
-                truncated = true;
-                break;
-            }
-        }
-        if truncated {
-            break;
+            by_source.entry(source_id).or_default().push(item);
         }
     }
+
+    // DLNA, through its own browse.
+    let query_lower = payload.query.to_lowercase();
+    for (record, service_id) in &dlna {
+        let Some(dispatcher) = ctx.shelf_dispatcher.as_ref() else {
+            stale_sources.push(record.id.clone());
+            continue;
+        };
+        match dlna_search_via_browse(
+            dispatcher,
+            record,
+            service_id,
+            &query_lower,
+        )
+        .await
+        {
+            Ok((hits, cut_short)) => {
+                let stamped: Vec<serde_json::Value> = hits
+                    .into_iter()
+                    .map(|mut h| {
+                        h.as_object_mut().unwrap().insert(
+                            "source_id".to_string(),
+                            serde_json::Value::String(record.id.clone()),
+                        );
+                        h
+                    })
+                    .collect();
+                by_source
+                    .entry(Some(record.id.clone()))
+                    .or_default()
+                    .extend(stamped);
+                if cut_short {
+                    stale_sources.push(record.id.clone());
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    source_id = %record.id,
+                    error = %e,
+                    "search_library: dlna source asked and failed; named stale"
+                );
+                stale_sources.push(record.id.clone());
+            }
+        }
+    }
+
+    // The one list: by rank, then source id, then the source's
+    // own order; hits under no source after the local library.
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    for record in &snapshot {
+        if let Some(hits) = by_source.remove(&Some(record.id.clone())) {
+            results.extend(hits);
+        }
+        if record.kind == SourceKind::LocalInternal {
+            if let Some(hits) = by_source.remove(&None) {
+                results.extend(hits);
+            }
+        }
+    }
+    if let Some(hits) = by_source.remove(&None) {
+        results.extend(hits);
+    }
+    let truncated = results.len() > max_results;
+    results.truncate(max_results);
     Ok(json!({
         "v":             LIBRARY_PAYLOAD_VERSION,
         "results":       results,
@@ -6565,5 +6767,410 @@ mod artist_image_container_tests {
         let url = pick_directory_cover_url("Container Name", music_dir);
         assert!(url.contains("Container%20Name"), "got {url}");
         assert!(!url.contains("First%20Album"), "got {url}");
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    //! One query, one ranked list — pinned against a mock MPD, a
+    //! registry of every source kind, and a mock DLNA peer.
+
+    use super::*;
+    use crate::playback_supervisor::test_mock::{
+        short_timeouts, spawn_mock_mpd, CapturingSubjectAnnouncer,
+        ConnBehaviour,
+    };
+    use crate::source_registry::{ScanPolicy, SourceRecord, SourceRegistry};
+    use evo_plugin_sdk::contract::{ShelfDispatchError, SubjectAnnouncer};
+    use std::collections::BTreeMap;
+
+    const LOCAL_HIT: &str = "INTERNAL/Low/trust.flac";
+    const USB_HIT: &str = "USB/Stick/song trust.flac";
+    const NOWHERE_HIT: &str = "Other/elsewhere trust.flac";
+    const NAS_OFF_HIT: &str = "NAS/Box/trust at sea.flac";
+    const MISS: &str = "INTERNAL/Low/other.flac";
+
+    /// A DLNA peer with a small tree under service `svc-1`: the
+    /// root holds one container and one matching item; the
+    /// container holds one matching and one non-matching item.
+    /// Service `svc-fail` refuses every browse. Service
+    /// `svc-deep` answers every container with another container
+    /// and a matching item, for ever.
+    #[derive(Default)]
+    struct TreeDispatcher {
+        browses: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ShelfRequestDispatcher for TreeDispatcher {
+        fn dispatch<'a>(
+            &'a self,
+            _shelf: &'a str,
+            request_type: &'a str,
+            payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Vec<u8>, ShelfDispatchError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let req: serde_json::Value =
+                serde_json::from_slice(&payload).unwrap_or_default();
+            let service = req["service_id"].as_str().unwrap_or("").to_string();
+            let object = req["object_id"].as_str().unwrap_or("0").to_string();
+            self.browses
+                .lock()
+                .unwrap()
+                .push(format!("{request_type} {service} {object}"));
+            Box::pin(async move {
+                if service == "svc-fail" {
+                    return Err(ShelfDispatchError::NoPluginOnShelf {
+                        shelf: "audio.dlna".to_string(),
+                    });
+                }
+                let entries = if service == "svc-deep" {
+                    vec![
+                        json!({ "kind": "directory", "name": "deeper", "path": format!("{object}/d"), "uri": format!("{object}/d") }),
+                        json!({ "kind": "item", "name": "Trust forever", "path": format!("{object}/i"), "uri": format!("dlna:svc-deep/{object}/i") }),
+                    ]
+                } else if object == "0" {
+                    vec![
+                        json!({ "kind": "directory", "name": "Albums", "path": "c1", "uri": "c1" }),
+                        json!({ "kind": "item", "name": "Trust (live)", "path": "i1", "uri": "dlna:svc-1/i1" }),
+                    ]
+                } else if object == "c1" {
+                    vec![
+                        json!({ "kind": "item", "name": "Words", "title": "Words", "album": "Trust", "path": "i2", "uri": "dlna:svc-1/i2" }),
+                        json!({ "kind": "item", "name": "Nothing here", "path": "i3", "uri": "dlna:svc-1/i3" }),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                let body = json!({
+                    "v": 1, "status": "ok", "service_id": service,
+                    "path": object, "entries": entries,
+                    "page": 0, "page_size": 100, "total": 2,
+                    "truncated": false, "next_page": null,
+                });
+                Ok(serde_json::to_vec(&body).unwrap())
+            })
+        }
+    }
+
+    fn record(
+        id: &str,
+        kind: SourceKind,
+        mount: &str,
+        state: SourceState,
+    ) -> SourceRecord {
+        SourceRecord {
+            id: id.into(),
+            display_name: id.into(),
+            kind,
+            mount_path: PathBuf::from(mount),
+            mpd_storage_name: None,
+            state,
+            last_seen_online_at_ms: Some(1),
+            probe_cadence_ms: 60_000,
+            scan_policy: ScanPolicy::EagerIncremental {
+                on_online: true,
+                on_mount_event: false,
+            },
+            track_count: 0,
+            track_count_available: 0,
+            last_scan_at_ms: None,
+        }
+    }
+
+    struct Harness {
+        ctx: LibraryContext,
+        conn: MpdConnection,
+        commands: Arc<std::sync::Mutex<Vec<String>>>,
+        dispatcher: Arc<TreeDispatcher>,
+    }
+
+    async fn harness(extra: Vec<SourceRecord>) -> Harness {
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // USB before local in MPD's own order, so rank is seen to
+        // win over the order MPD answered in.
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::StoredPlaylists {
+                commands: Arc::clone(&commands),
+                playlists: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+                library: vec![(
+                    String::new(),
+                    Vec::new(),
+                    vec![
+                        USB_HIT.to_string(),
+                        NAS_OFF_HIT.to_string(),
+                        NOWHERE_HIT.to_string(),
+                        LOCAL_HIT.to_string(),
+                        MISS.to_string(),
+                    ],
+                )],
+                queue: Vec::new(),
+            }])
+            .await;
+        let conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+        let registry = SourceRegistry::new();
+        let m = "/m";
+        registry
+            .upsert(record(
+                "local-internal",
+                SourceKind::LocalInternal,
+                "/m/INTERNAL",
+                SourceState::Online,
+            ))
+            .await;
+        registry
+            .upsert(record(
+                "usb-1",
+                SourceKind::LocalUsb {
+                    device_node: "/dev/sda1".into(),
+                    label: "Stick".into(),
+                },
+                "/m/USB/Stick",
+                SourceState::Online,
+            ))
+            .await;
+        registry
+            .upsert(record(
+                "nas-off",
+                SourceKind::NetworkNasSmb {
+                    server: "box".into(),
+                    share: "music".into(),
+                    username: "u".into(),
+                },
+                "/m/NAS/Box",
+                SourceState::Offline {
+                    reason: "gone".into(),
+                    since_ms: 1,
+                },
+            ))
+            .await;
+        for r in extra {
+            registry.upsert(r).await;
+        }
+        let dispatcher = Arc::new(TreeDispatcher::default());
+        let ctx = LibraryContext::new(
+            PathBuf::from(m),
+            registry,
+            Arc::new(CapturingSubjectAnnouncer::default())
+                as Arc<dyn SubjectAnnouncer>,
+            Some(Arc::clone(&dispatcher) as Arc<dyn ShelfRequestDispatcher>),
+        );
+        Harness {
+            ctx,
+            conn,
+            commands,
+            dispatcher,
+        }
+    }
+
+    fn dlna(id: &str, service: &str) -> SourceRecord {
+        record(
+            id,
+            SourceKind::NetworkDlna {
+                service_id: service.into(),
+                control_url: String::new(),
+                base_url: String::new(),
+            },
+            "/nowhere",
+            SourceState::Online,
+        )
+    }
+
+    fn cloud(id: &str) -> SourceRecord {
+        record(
+            id,
+            SourceKind::CloudGdrive {
+                account_ref: "acct".into(),
+            },
+            "/nowhere",
+            SourceState::Online,
+        )
+    }
+
+    async fn search(
+        h: &mut Harness,
+        include_offline: bool,
+    ) -> serde_json::Value {
+        handle_search_library(
+            &h.ctx,
+            &mut h.conn,
+            SearchLibraryPayload {
+                v: 1,
+                query: "trust".into(),
+                source_ids: None,
+                include_offline,
+                max_results: 50,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    fn stamps(v: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
+        v["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["uri"].as_str().unwrap().to_string(),
+                    r["source_id"].clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// MPD is searched once for every source it serves, and each
+    /// hit carries the one source whose mount it lies under; a
+    /// hit under no registered source is stamped with none.
+    #[tokio::test]
+    async fn one_mpd_search_stamps_each_hit_once() {
+        let mut h = harness(vec![]).await;
+        let v = search(&mut h, false).await;
+        let searches = h
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.starts_with("search "))
+            .count();
+        assert_eq!(searches, 1, "one MPD search, not one per source");
+        let s = stamps(&v);
+        assert_eq!(
+            s,
+            vec![
+                (LOCAL_HIT.to_string(), json!("local-internal")),
+                (NOWHERE_HIT.to_string(), serde_json::Value::Null),
+                (USB_HIT.to_string(), json!("usb-1")),
+            ],
+            "{v}"
+        );
+        assert!(v["stale_sources"].as_array().unwrap().is_empty(), "{v}");
+    }
+
+    /// The list is ranked: the local library, then USB and NAS,
+    /// then DLNA, then cloud — whatever order MPD or the registry
+    /// answered in. Within a source, that source's own order.
+    #[tokio::test]
+    async fn the_list_is_ranked_local_then_usb_then_dlna() {
+        let mut h =
+            harness(vec![dlna("dlna-1", "svc-1"), cloud("cloud-1")]).await;
+        let v = search(&mut h, false).await;
+        let ids: Vec<serde_json::Value> =
+            stamps(&v).into_iter().map(|(_, id)| id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                json!("local-internal"),
+                serde_json::Value::Null,
+                json!("usb-1"),
+                json!("dlna-1"),
+                json!("dlna-1"),
+            ],
+            "{v}"
+        );
+    }
+
+    /// An online DLNA source is searched through its browse: the
+    /// matching items from the root and from a container are in
+    /// the list, in the order the server listed them, stamped
+    /// with the source, carrying the stable `dlna:` identity.
+    #[tokio::test]
+    async fn a_dlna_hit_from_an_online_source_is_in_the_list() {
+        let mut h = harness(vec![dlna("dlna-1", "svc-1")]).await;
+        let v = search(&mut h, false).await;
+        let dlna_hits: Vec<String> = stamps(&v)
+            .into_iter()
+            .filter(|(_, id)| id == "dlna-1")
+            .map(|(uri, _)| uri)
+            .collect();
+        assert_eq!(dlna_hits, vec!["dlna:svc-1/i1", "dlna:svc-1/i2"], "{v}");
+        let browses = h.dispatcher.browses.lock().unwrap().clone();
+        assert_eq!(
+            browses,
+            vec!["source.dlna.browse svc-1 0", "source.dlna.browse svc-1 c1"],
+            "root, then the container, through the browse verb"
+        );
+        assert!(v["stale_sources"].as_array().unwrap().is_empty());
+    }
+
+    /// A cloud source is named in `stale_sources` — not silently
+    /// skipped, not filled with invented hits.
+    #[tokio::test]
+    async fn a_cloud_source_is_named_and_not_invented() {
+        let mut h = harness(vec![cloud("cloud-1")]).await;
+        let v = search(&mut h, false).await;
+        assert_eq!(v["stale_sources"], json!(["cloud-1"]), "{v}");
+        assert!(
+            stamps(&v).iter().all(|(_, id)| id != "cloud-1"),
+            "no invented cloud hits: {v}"
+        );
+    }
+
+    /// A DLNA source that was asked and failed is named stale,
+    /// and the rest of the list is still answered.
+    #[tokio::test]
+    async fn a_dlna_source_that_fails_is_named_stale() {
+        let mut h =
+            harness(vec![dlna("dlna-1", "svc-1"), dlna("dlna-2", "svc-fail")])
+                .await;
+        let v = search(&mut h, false).await;
+        assert_eq!(v["stale_sources"], json!(["dlna-2"]), "{v}");
+        assert!(stamps(&v).iter().any(|(_, id)| id == "dlna-1"));
+        assert!(stamps(&v).iter().all(|(_, id)| id != "dlna-2"));
+    }
+
+    /// A forgotten track is not a result.
+    #[tokio::test]
+    async fn a_forgotten_uri_is_omitted() {
+        let mut h = harness(vec![]).await;
+        h.ctx.forgotten.forget(LOCAL_HIT).await;
+        let v = search(&mut h, false).await;
+        assert!(stamps(&v).iter().all(|(uri, _)| uri != LOCAL_HIT), "{v}");
+        assert_eq!(stamps(&v).len(), 2);
+    }
+
+    /// An offline source stays out: its hits are not in the list,
+    /// and it is named stale only when the caller asks to include
+    /// offline sources.
+    #[tokio::test]
+    async fn an_offline_source_stays_out() {
+        let mut h = harness(vec![]).await;
+        let v = search(&mut h, false).await;
+        assert!(stamps(&v).iter().all(|(uri, _)| uri != NAS_OFF_HIT), "{v}");
+        assert!(v["stale_sources"].as_array().unwrap().is_empty());
+        let v = search(&mut h, true).await;
+        assert!(stamps(&v).iter().all(|(uri, _)| uri != NAS_OFF_HIT), "{v}");
+        assert_eq!(v["stale_sources"], json!(["nas-off"]));
+    }
+
+    /// A DLNA tree deeper than the walk's budget is answered as
+    /// far as the walk got, and the source is named stale.
+    #[tokio::test]
+    async fn a_bottomless_dlna_tree_is_cut_short_and_named_stale() {
+        let mut h = harness(vec![dlna("dlna-deep", "svc-deep")]).await;
+        let v = search(&mut h, false).await;
+        let hits = stamps(&v)
+            .iter()
+            .filter(|(_, id)| id == "dlna-deep")
+            .count();
+        assert_eq!(
+            hits, DLNA_SEARCH_MAX_BROWSES,
+            "one hit per browse, then stop"
+        );
+        assert_eq!(
+            h.dispatcher.browses.lock().unwrap().len(),
+            DLNA_SEARCH_MAX_BROWSES
+        );
+        assert_eq!(v["stale_sources"], json!(["dlna-deep"]), "{v}");
     }
 }
