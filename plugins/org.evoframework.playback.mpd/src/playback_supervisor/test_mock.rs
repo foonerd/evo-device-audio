@@ -1017,10 +1017,41 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                         }
                         out.push_str("OK\n");
                         out
+                    } else if cmd.starts_with("list ") {
+                        // `list "artist"` / `list "album"`: the
+                        // distinct values, path-derived — the first
+                        // segment is the artist, the second the
+                        // album, the stem the title.
+                        let tag =
+                            args(&cmd).first().cloned().unwrap_or_default();
+                        let mut seen: Vec<String> = Vec::new();
+                        for (_, _, files) in library.iter() {
+                            for f in files {
+                                let segs: Vec<&str> = f.split('/').collect();
+                                let v = match (tag.as_str(), segs.len()) {
+                                    ("artist", n) if n >= 3 => segs[0],
+                                    ("album", n) if n >= 3 => segs[1],
+                                    _ => continue,
+                                };
+                                if !seen.iter().any(|s| s == v) {
+                                    seen.push(v.to_string());
+                                }
+                            }
+                        }
+                        let mut out = String::new();
+                        let key =
+                            if tag == "artist" { "Artist" } else { "Album" };
+                        for v in seen {
+                            out.push_str(&format!("{key}: {v}\n"));
+                        }
+                        out.push_str("OK\n");
+                        out
                     } else if cmd.starts_with("search ") {
-                        // `search any "<q>"`: every file in the
-                        // library whose path contains the query,
-                        // case-insensitively.
+                        // `search "<field>" "<q>"`: every file in
+                        // the library whose path contains the
+                        // query, case-insensitively, with its
+                        // path-derived tags when the path has an
+                        // artist / album / title shape.
                         let q = args(&cmd)
                             .get(1)
                             .cloned()
@@ -1031,6 +1062,18 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                             for f in files {
                                 if f.to_lowercase().contains(&q) {
                                     out.push_str(&format!("file: {f}\n"));
+                                    let segs: Vec<&str> =
+                                        f.split('/').collect();
+                                    if segs.len() >= 3 {
+                                        let stem = segs[segs.len() - 1]
+                                            .rsplit_once('.')
+                                            .map(|(s, _)| s)
+                                            .unwrap_or(segs[segs.len() - 1]);
+                                        out.push_str(&format!(
+                                            "Artist: {}\nAlbum: {}\nTitle: {}\n",
+                                            segs[0], segs[1], stem
+                                        ));
+                                    }
                                 }
                             }
                         }

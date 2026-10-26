@@ -781,6 +781,18 @@ impl ShelfBundle {
                 .map_err(library_verb_to_plugin_error)?;
                 Ok(Some(encode_json_response(req, &body)?))
             }
+            "library.suggest" => {
+                let payload: crate::suggest::SuggestPayload = parse_json(req)?;
+                let mut conn = self.open_conn().await?;
+                let body = crate::suggest::handle_suggest(
+                    &self.library,
+                    &mut conn,
+                    payload,
+                )
+                .await
+                .map_err(library_verb_to_plugin_error)?;
+                Ok(Some(encode_json_response(req, &body)?))
+            }
             "library.forget_album" => {
                 let payload: library::ForgetAlbumPayload = parse_json(req)?;
                 let mut conn = self.open_conn().await?;
@@ -1787,6 +1799,21 @@ mod tests {
                 "forget_album must dispatch and refuse an empty album: {other:?}"
             ),
         }
+        bundle.shutdown().await;
+    }
+
+    /// `library.suggest` is reachable on this shelf: an empty
+    /// prefix is answered with an empty list by the verb, not
+    /// dropped as unmatched.
+    #[tokio::test]
+    async fn suggest_dispatches_on_the_library_shelf() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = live_bundle(dir.path()).await;
+        let req = request("library.suggest", r#"{"v":1,"prefix":""}"#);
+        let resp = bundle.dispatch_request(&req).await.unwrap().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v["suggestions"], serde_json::json!([]), "{v}");
         bundle.shutdown().await;
     }
 

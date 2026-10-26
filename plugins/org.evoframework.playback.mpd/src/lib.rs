@@ -139,6 +139,7 @@ mod skip_traversal;
 mod source_probe;
 mod source_registry;
 mod sticker_reconciler;
+mod suggest;
 mod works;
 
 #[cfg(test)]
@@ -311,6 +312,7 @@ const SOURCE_REQUEST_TYPES: &[&str] = &[
     "library.most_played",
     "library.forget_track",
     "library.forget_album",
+    "library.suggest",
 ];
 
 /// Wire-protocol payload version every source-verb request
