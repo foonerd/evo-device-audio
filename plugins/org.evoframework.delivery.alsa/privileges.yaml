@@ -23,6 +23,11 @@ capability_intent:
     access_path: filesystem/service-owned
     failure_mode: settings-state update is observed (the `delivery.options_observed` happening still fires) but the drop-in write fails with a structured warn log; the previous drop-in remains on disk and the operator's prior pipeline keeps audio flowing. Operator diagnoses via `delivery.options_rendered` happening's `write_ok = false` field + the journal warn line naming the failed path. The grant is filesystem ownership of the `/etc/asound.d/` directory (created by `bootstrap.sh` as `mode 0775 owner <service-user>`), NOT sudoers — there is no command escalation needed; the plugin writes to its own directory.
 
+  - id: alsa_output_mixer_set
+    need: set one simple mixer control on one card via `amixer -M -c <N> sset <control> <percent>%` when the operator moves one output's volume through `delivery.set_output_volume`. The control is the card's default mixer control from the outputs catalog; the chain's own hardware mixer (the global volume) is refused here and stays with the playback.options surface. The plugin's state directory holds the per-output enabled flags and last-set volumes (`outputs-state.toml`) so a disabled output stays disabled across a restart.
+    access_path: binary/amixer
+    failure_mode: the verb refuses with the card's reason and records no volume; the previous level stays on the card. The operator's other outputs are untouched because each call names one card and one control.
+
 required_binaries:
   - name: aplay
     failure_mode: hardware-probing verbs respond with structured empty list + diagnostic; plugin admits but operator-visible card-selection is empty.

@@ -22,6 +22,10 @@ never lost when investigating routing/rendering behavior.
 - atomically writing `/etc/asound.d/evo-options.conf`
 - exposing delivery inventory and endpoint views (`delivery.*` verbs)
 - selecting render target based on active baseline topology
+- steering one output at a time through the five output verbs
+  (`delivery.enable_output`, `delivery.disable_output`,
+  `delivery.set_output_volume`, `delivery.play_output`,
+  `delivery.pause_output`)
 
 It is not responsible for:
 
@@ -46,12 +50,48 @@ This preserves source-host invariant:
 - producer path (`pcm.evo`) remains loopback-only
 - options changes affect source local renderer path only
 
+## Output verbs
+
+Each of the five output verbs names one output by the `hw:N,M`
+id `delivery.list_outputs` gives it, and touches that output
+only. An id `list_outputs` does not name is refused.
+
+- `enable_output` / `disable_output`: whether the output may
+  play. Disabling the playing output pauses it; no other output
+  starts. The flag survives a restart.
+- `set_output_volume { volume: 0..=100 }`: one `amixer` call
+  against the output's own default mixer control. Refused when
+  the output has no control, and when that control is the
+  chain's hardware mixer: that is the global volume, which stays
+  with `playback.options`. The last accepted level survives a
+  restart.
+- `play_output` / `pause_output`: the chain has one terminus, so
+  an output is playing when the chain terminates at it. With no
+  output verb spoken the chain follows the operator's
+  `output_device`, and that output is the one playing. `play`
+  binds the chain to the named output; a second `play` while
+  another output is playing is refused and the first keeps
+  playing. `pause` on the playing output renders a `null`
+  terminus so it goes quiet and no other output starts. The
+  binding is not persisted: the plugin releases it at unload,
+  and the drop-in follows the operator's settings again.
+
+The binding is rendered by the same renderer the options
+observer uses, so an options change while an output is bound
+keeps the bound terminus. `ctl.evo` and the softvol control stay
+on the operator's card whatever the binding.
+
 ## On-disk contract
 
 - Baseline config: `/etc/asound.conf` (bootstrap-owned)
-- Runtime options: `/etc/asound.d/evo-options.conf` (plugin-owned)
+- Runtime options: `/etc/asound.d/evo-options.conf` (plugin-owned;
+  rendered from the operator's settings plus the output binding)
+- Output state: `<state_dir>/outputs-state.toml` (plugin-owned;
+  enabled flags and last-set volumes, never the binding)
 
-One writer per surface is mandatory.
+One writer per surface is mandatory. The options observer and
+the output verbs write the drop-in through one renderer under
+one lock.
 
 ## Failure semantics
 
@@ -61,6 +101,15 @@ One writer per surface is mandatory.
   - warn, prior pipeline remains active
 - malformed settings payload:
   - refuse at responder boundary with structured error
+- unknown output, disabled output asked to play, second play,
+  volume out of range, no mixer control, global mixer:
+  - refuse at responder boundary; nothing moves
+- `amixer` refuses a level:
+  - the verb fails with the card's reason; no volume is recorded
+- drop-in write failure after a rebind:
+  - warn, verb fails transient, prior pipeline remains active
+- unreadable or malformed `outputs-state.toml`:
+  - warn, start with every output enabled and no volumes
 
 ## Verification expectations
 
@@ -71,6 +120,10 @@ For plugin-level verification, confirm:
 3. main baseline triggers `Main` rendering
 4. no source-host rewrite of producer `pcm.evo`
 5. deterministic render output (snapshot-stable tests)
+6. changing one output leaves the other as it was
+7. an unknown output is refused by every output verb
+8. the five output verbs are named only in this plugin
+   (`dist/scripts/tests/output-verbs-live-in-delivery.test.sh`)
 
 ## Cross-reference map
 

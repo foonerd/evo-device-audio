@@ -70,6 +70,11 @@ request_types = [
     "delivery.list_mixers",
     "delivery.active_endpoint",
     "delivery.list_outputs",
+    "delivery.enable_output",
+    "delivery.disable_output",
+    "delivery.set_output_volume",
+    "delivery.play_output",
+    "delivery.pause_output",
 ]
 response_budget_ms = 5000
 

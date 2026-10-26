@@ -82,6 +82,7 @@
 #![allow(clippy::manual_async_fn)]
 
 mod options_render;
+mod outputs;
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -94,12 +95,16 @@ use evo_plugin_sdk::contract::audio_routing::{
     RouteChangeCallback,
 };
 use evo_plugin_sdk::contract::{
-    BuildInfo, ExternalAddressing, HealthReport, LoadContext, Plugin,
-    PluginDescription, PluginError, PluginIdentity, Request, Respondent,
-    Response, RuntimeCapabilities, SubjectAnnouncement, SubjectAnnouncer,
-    SubjectStateStreamError,
+    BuildInfo, ExternalAddressing, HappeningEmitter, HealthReport, LoadContext,
+    Plugin, PluginDescription, PluginError, PluginIdentity, Request,
+    Respondent, Response, RuntimeCapabilities, SubjectAnnouncement,
+    SubjectAnnouncer, SubjectStateStreamError,
 };
 use evo_plugin_sdk::Manifest;
+use options_render::OptionsSettings;
+use outputs::{
+    Effect, GlobalMixer, OutputPolicy, OutputSnapshot, OutputStateStore,
+};
 
 pub mod alsa_cards;
 pub mod import;
@@ -151,6 +156,11 @@ const REQUEST_TYPES: &[&str] = &[
     "delivery.list_mixers",
     "delivery.active_endpoint",
     "delivery.list_outputs",
+    "delivery.enable_output",
+    "delivery.disable_output",
+    "delivery.set_output_volume",
+    "delivery.play_output",
+    "delivery.pause_output",
 ];
 
 /// Subject scheme + value for the resolved-outputs surface.
@@ -209,7 +219,7 @@ pub struct AlsaDeliveryPlugin {
     /// state updates from the
     /// `(scheme: "evo.audio.options", value: "settings")`
     /// subject. On each update the observer renders the
-    /// `pcm.evo` drop-in via `options_render::render_drop_in`,
+    /// `pcm.evo` drop-in via [`DropInRenderer`],
     /// atomic-writes it to the drop-in path, and emits both
     /// `delivery.options_observed` (the observer-visibility
     /// signal) and `delivery.options_rendered` (the on-disk
@@ -249,6 +259,286 @@ pub struct AlsaDeliveryPlugin {
     /// hot-plug re-enumeration is out of scope of this load-time
     /// surface.
     cached_outputs: Arc<RwLock<Vec<ResolvedAlsaOutput>>>,
+    /// Per-output state and the chain binding the five output
+    /// verbs steer. Shared with the drop-in renderer so the
+    /// options observer renders through the same binding.
+    outputs: Arc<RwLock<OutputPolicy>>,
+    /// The operator's settings as last observed on the options
+    /// subject, with the subject's canonical id. The output verbs
+    /// render from these; `None` before the first update renders
+    /// the bootstrap defaults.
+    last_options: Arc<RwLock<Option<LastOptions>>>,
+    /// The one lock every drop-in write takes. The options
+    /// observer and the output verbs both render through
+    /// [`DropInRenderer`]; this is what makes them one writer.
+    drop_in_writer: Arc<tokio::sync::Mutex<()>>,
+    /// Happening emitter captured at load; `None` before load, so
+    /// renders triggered without a load context write the file
+    /// and emit nothing.
+    happening_emitter: Option<Arc<dyn HappeningEmitter>>,
+    /// Persistence for enabled flags and volumes. `Some` after
+    /// load named the state directory.
+    outputs_state: Option<OutputStateStore>,
+    /// How `delivery.set_output_volume` reaches the card's mixer.
+    /// `amixer` in production; a recorder in tests.
+    mixer: Arc<dyn MixerSetter>,
+}
+
+/// The operator's options as last observed, and where from.
+#[derive(Debug, Clone)]
+struct LastOptions {
+    settings: OptionsSettings,
+    subject_canonical_id: String,
+}
+
+/// Sets one simple mixer control on one card. The only way the
+/// plugin moves a volume.
+trait MixerSetter: Send + Sync {
+    /// `amixer -c <card_idx> sset <control> <percent>%`, or its
+    /// test double. `Err` carries the reason the card refused.
+    fn set_volume<'a>(
+        &'a self,
+        card_idx: u32,
+        control: &'a str,
+        percent: u8,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+}
+
+/// The production mixer setter: one `amixer` call.
+struct AmixerSetter;
+
+impl MixerSetter for AmixerSetter {
+    fn set_volume<'a>(
+        &'a self,
+        card_idx: u32,
+        control: &'a str,
+        percent: u8,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // `-M` maps the percentage the way alsamixer shows
+            // it, so 50 means half as loud, not half the raw
+            // register range.
+            let output = tokio::process::Command::new("amixer")
+                .arg("-M")
+                .arg("-c")
+                .arg(card_idx.to_string())
+                .arg("sset")
+                .arg(control)
+                .arg(format!("{percent}%"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output()
+                .await
+                .map_err(|e| format!("amixer could not run: {e}"))?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "amixer -c {card_idx} sset {control:?} {percent}% \
+                     failed ({}): {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ))
+            }
+        })
+    }
+}
+
+/// What one drop-in render did.
+#[derive(Debug, Clone)]
+struct RenderOutcome {
+    /// The subject the rendered settings came from, when they
+    /// came from one.
+    subject_canonical_id: Option<String>,
+    /// Bytes rendered.
+    render_bytes: usize,
+    /// `Some` when the file was written; `None` when the bytes on
+    /// disk already matched, or could not be read.
+    write_outcome: Option<Result<(), String>>,
+    /// The drop-in could not be read to compare, so it was left
+    /// alone and its freshness is unknown.
+    read_failed: bool,
+}
+
+impl RenderOutcome {
+    /// True when the drop-in on disk is what was just rendered,
+    /// whether this render wrote it or found it already matching.
+    /// A read that could not be performed leaves that unknown,
+    /// and unknown is not ok.
+    fn write_ok(&self) -> bool {
+        match &self.write_outcome {
+            Some(r) => r.is_ok(),
+            None => !self.read_failed,
+        }
+    }
+}
+
+/// The one path that renders and writes the options drop-in.
+/// The options observer and the output verbs both hold a clone;
+/// every render reads the same last-seen settings and the same
+/// output binding, and every write takes the same lock.
+#[derive(Clone)]
+struct DropInRenderer {
+    drop_in_path: PathBuf,
+    asound_conf_path: PathBuf,
+    last_options: Arc<RwLock<Option<LastOptions>>>,
+    outputs: Arc<RwLock<OutputPolicy>>,
+    writer: Arc<tokio::sync::Mutex<()>>,
+    emitter: Option<Arc<dyn HappeningEmitter>>,
+}
+
+impl DropInRenderer {
+    /// Render the drop-in from the last-seen settings and the
+    /// current binding; write it when the bytes differ from what
+    /// is on disk.
+    async fn render_and_write(&self) -> RenderOutcome {
+        let (settings, subject_canonical_id) =
+            match self.last_options.read().await.as_ref() {
+                Some(last) => (
+                    last.settings.clone(),
+                    Some(last.subject_canonical_id.clone()),
+                ),
+                None => (OptionsSettings::default(), None),
+            };
+        let binding = self.outputs.read().await.binding().clone();
+        let render_target = AlsaDeliveryPlugin::detect_options_render_target(
+            &self.asound_conf_path,
+        );
+        let body = options_render::render_drop_in_bound(
+            &settings,
+            render_target,
+            &binding,
+        );
+        let render_bytes = body.len();
+        let drop_in_path = &self.drop_in_path;
+
+        // One writer: compare and write under the lock, so an
+        // options update and an output verb cannot interleave
+        // their compare-then-write.
+        let _writing = self.writer.lock().await;
+        // Compare before rewriting. Every rewrite is an
+        // operator-visible "the pipeline definition changed"
+        // happening and a reason for consumers to re-read; an
+        // update that left this file alone should not look like
+        // one that changed it. A read that fails for any reason
+        // other than absence leaves the file alone, because
+        // without the current bytes there is no evidence a
+        // rewrite is needed.
+        let mut read_failed = false;
+        let rewrite =
+            match options_render::drop_in_needs_rewrite(drop_in_path, &body)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        drop_in_path = %drop_in_path.display(),
+                        error = %e,
+                        "audio-options drop-in could not be read; prior \
+                         pipeline retained. LOGGING.md §2: the on-disk \
+                         pipeline may be stale and this names why."
+                    );
+                    read_failed = true;
+                    false
+                }
+            };
+        if !rewrite {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                drop_in_path = %drop_in_path.display(),
+                "audio-options drop-in unchanged; not rewritten"
+            );
+        }
+        let write_outcome = if rewrite {
+            Some(
+                options_render::atomic_write_drop_in(drop_in_path, &body)
+                    .await
+                    .map_err(|e| e.to_string()),
+            )
+        } else {
+            None
+        };
+        match &write_outcome {
+            // Nothing was written, so nothing is reported as
+            // written.
+            None => {}
+            Some(Ok(())) => {
+                // LOGGING.md §2: info (operator-visible lifecycle
+                // narrative — the pcm.evo pipeline definition
+                // changed on disk).
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    drop_in_path = %drop_in_path.display(),
+                    render_bytes,
+                    binding = ?binding,
+                    "audio-options drop-in rewritten"
+                );
+            }
+            Some(Err(e)) => {
+                // LOGGING.md §2: warn (recoverable; the previous
+                // drop-in remains on disk, the operator's prior
+                // pipeline keeps audio flowing).
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    drop_in_path = %drop_in_path.display(),
+                    error = %e,
+                    "audio-options drop-in write failed; prior pipeline \
+                     retained"
+                );
+            }
+        }
+        RenderOutcome {
+            subject_canonical_id,
+            render_bytes,
+            write_outcome,
+            read_failed,
+        }
+    }
+
+    /// Emit `delivery.options_rendered` for a render: the on-disk
+    /// drop-in's freshness signal subscribers serialise their
+    /// re-bind work against.
+    async fn emit_rendered(
+        &self,
+        outcome: &RenderOutcome,
+        observed_at_ms: u64,
+    ) {
+        let Some(emitter) = self.emitter.as_ref() else {
+            return;
+        };
+        let rendered_payload = serde_json::json!({
+            "subject_canonical_id": outcome.subject_canonical_id,
+            "observed_at_ms": observed_at_ms,
+            "drop_in_path": self.drop_in_path.display().to_string(),
+            "render_bytes": outcome.render_bytes,
+            "write_ok": outcome.write_ok(),
+        });
+        if let Err(e) = emitter
+            .emit_plugin_event(
+                "delivery.options_rendered".to_string(),
+                rendered_payload,
+            )
+            .await
+        {
+            // LOGGING.md §2: warn (recoverable; diagnostic
+            // surface).
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "emit delivery.options_rendered failed"
+            );
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Handle on the route-change reactor task spawned at load.
@@ -384,7 +674,65 @@ impl AlsaDeliveryPlugin {
             card_catalog: None,
             subject_announcer: None,
             cached_outputs: Arc::new(RwLock::new(Vec::new())),
+            outputs: Arc::new(RwLock::new(OutputPolicy::default())),
+            last_options: Arc::new(RwLock::new(None)),
+            drop_in_writer: Arc::new(tokio::sync::Mutex::new(())),
+            happening_emitter: None,
+            outputs_state: None,
+            mixer: Arc::new(AmixerSetter),
         }
+    }
+
+    /// The renderer every drop-in write goes through.
+    fn drop_in_renderer(&self) -> DropInRenderer {
+        DropInRenderer {
+            drop_in_path: self.asound_options_drop_in_path.clone(),
+            asound_conf_path: self.asound_conf_path.clone(),
+            last_options: Arc::clone(&self.last_options),
+            outputs: Arc::clone(&self.outputs),
+            writer: Arc::clone(&self.drop_in_writer),
+            emitter: self.happening_emitter.clone(),
+        }
+    }
+
+    /// Point the outputs state file somewhere and read it. Load
+    /// does this with the state directory; tests with a tempdir.
+    async fn install_outputs_state(&mut self, path: PathBuf) {
+        let store = OutputStateStore::at(path);
+        let persisted = store.load().await;
+        self.outputs.write().await.restore(&persisted);
+        self.outputs_state = Some(store);
+    }
+
+    /// Write the enabled flags and volumes. A failed write is
+    /// logged, not refused: the verb's effect already happened.
+    async fn persist_outputs(&self) {
+        let Some(store) = self.outputs_state.as_ref() else {
+            return;
+        };
+        let persisted = self.outputs.read().await.persisted();
+        if let Err(e) = store.save(&persisted).await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                path = %store.path().display(),
+                error = %e,
+                "outputs state could not be written; enabled flags and \
+                 volumes will not survive a restart"
+            );
+        }
+    }
+
+    /// Let the chain follow the operator's settings again and
+    /// render once if a binding was in force, so the disk never
+    /// carries a binding past the plugin's lifetime.
+    async fn release_output_binding(&self) {
+        let released = self.outputs.write().await.release_binding();
+        if !released {
+            return;
+        }
+        let renderer = self.drop_in_renderer();
+        let outcome = renderer.render_and_write().await;
+        renderer.emit_rendered(&outcome, now_ms()).await;
     }
 
     /// Replace the asound.conf path. Used by tests to point at a
@@ -404,6 +752,17 @@ impl AlsaDeliveryPlugin {
         path: PathBuf,
     ) -> Self {
         self.asound_options_drop_in_path = path;
+        self
+    }
+
+    /// Replace the mixer setter. Tests record the calls instead
+    /// of running `amixer`.
+    #[cfg(test)]
+    pub(crate) fn with_mixer_setter(
+        mut self,
+        mixer: Arc<dyn MixerSetter>,
+    ) -> Self {
+        self.mixer = mixer;
         self
     }
 
@@ -586,10 +945,8 @@ impl AlsaDeliveryPlugin {
             );
             return;
         };
+        let renderer = self.drop_in_renderer();
         let happening_emitter = Arc::clone(&ctx.happening_emitter);
-        let drop_in_path = self.asound_options_drop_in_path.clone();
-        let render_target =
-            Self::detect_options_render_target(&self.asound_conf_path);
         let addressing = ExternalAddressing {
             scheme: "evo.audio.options".to_string(),
             value: "settings".to_string(),
@@ -642,23 +999,25 @@ impl AlsaDeliveryPlugin {
                     update = stream.recv() => {
                         match update {
                             Ok(state_update) => {
-                                let observed_at_ms = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_millis() as u64)
-                                    .unwrap_or(0);
+                                let observed_at_ms = now_ms();
 
-                                // Extract → render → write. The
-                                // observer-observed happening
-                                // (kept for diagnostic-replay
-                                // consumers) fires alongside the
-                                // newer options_rendered happening
+                                // Extract → remember → render →
+                                // write. The observer-observed
+                                // happening (kept for diagnostic-
+                                // replay consumers) fires alongside
+                                // the options_rendered happening
                                 // (which signals subscribers that
                                 // the on-disk pipeline definition
                                 // has changed). Both happenings
                                 // carry the canonical subject id
                                 // so a single subscriber can
                                 // correlate observer activity
-                                // against pipeline rewrites.
+                                // against pipeline rewrites. The
+                                // render goes through the same
+                                // DropInRenderer the output verbs
+                                // use, so the output binding is
+                                // honoured here and the file has
+                                // one writer.
                                 let settings_state =
                                     state_update.state.unwrap_or(
                                         serde_json::Value::Null,
@@ -667,112 +1026,13 @@ impl AlsaDeliveryPlugin {
                                     options_render::extract_options_settings_from_state(
                                         &settings_state,
                                     );
-                                let body = match render_target {
-                                    options_render::RenderTarget::Main => {
-                                        options_render::render_drop_in(&settings)
-                                    }
-                                    options_render::RenderTarget::SourceLocal => {
-                                        options_render::render_drop_in_for_target(
-                                            &settings,
-                                            render_target,
-                                        )
-                                    }
-                                };
-                                let render_bytes = body.len();
-                                // Compare before rewriting. Every
-                                // rewrite is an operator-visible
-                                // "the pipeline definition
-                                // changed" happening and a reason
-                                // for consumers to re-read; an
-                                // options update that left this
-                                // file alone should not look like
-                                // one that changed it. A read that
-                                // fails for any reason other than
-                                // absence leaves the file alone,
-                                // because without the current
-                                // bytes there is no evidence a
-                                // rewrite is needed.
-                                let mut read_failed = false;
-                                let rewrite = match options_render::drop_in_needs_rewrite(
-                                    &drop_in_path,
-                                    &body,
-                                )
-                                .await
-                                {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            plugin = PLUGIN_NAME,
-                                            drop_in_path = %drop_in_path.display(),
-                                            error = %e,
-                                            "audio-options drop-in could not be \
-                                             read; prior pipeline retained. \
-                                             LOGGING.md §2: the on-disk pipeline \
-                                             may be stale and this names why."
-                                        );
-                                        read_failed = true;
-                                        false
-                                    }
-                                };
-                                if !rewrite {
-                                    tracing::debug!(
-                                        plugin = PLUGIN_NAME,
-                                        drop_in_path = %drop_in_path.display(),
-                                        "audio-options drop-in unchanged; \
-                                         not rewritten"
-                                    );
-                                }
-                                // The observation below is still
-                                // emitted either way: it records
-                                // that the settings were seen, not
-                                // that the file moved.
-                                let write_outcome = if rewrite {
-                                    Some(
-                                        options_render::atomic_write_drop_in(
-                                            &drop_in_path,
-                                            &body,
-                                        )
-                                        .await,
-                                    )
-                                } else {
-                                    None
-                                };
-                                match &write_outcome {
-                                    // Nothing was written, so
-                                    // nothing is reported as
-                                    // written.
-                                    None => {}
-                                    Some(Ok(())) => {
-                                        // LOGGING.md §2: info
-                                        // (operator-visible
-                                        // lifecycle narrative —
-                                        // the pcm.evo pipeline
-                                        // definition changed on
-                                        // disk).
-                                        tracing::info!(
-                                            plugin = PLUGIN_NAME,
-                                            drop_in_path = %drop_in_path.display(),
-                                            render_bytes,
-                                            "audio-options drop-in rewritten"
-                                        );
-                                    }
-                                    Some(Err(e)) => {
-                                        // LOGGING.md §2: warn
-                                        // (recoverable; the
-                                        // previous drop-in
-                                        // remains on disk, the
-                                        // operator's prior
-                                        // pipeline keeps audio
-                                        // flowing).
-                                        tracing::warn!(
-                                            plugin = PLUGIN_NAME,
-                                            drop_in_path = %drop_in_path.display(),
-                                            error = %e,
-                                            "audio-options drop-in write failed; \
-                                             prior pipeline retained"
-                                        );
-                                    }
-                                }
+                                *renderer.last_options.write().await =
+                                    Some(LastOptions {
+                                        settings,
+                                        subject_canonical_id:
+                                            state_update.canonical_id.clone(),
+                                    });
+                                let outcome = renderer.render_and_write().await;
 
                                 let observed_payload = serde_json::json!({
                                     "subject_canonical_id":
@@ -800,42 +1060,7 @@ impl AlsaDeliveryPlugin {
                                     );
                                 }
 
-                                let rendered_payload = serde_json::json!({
-                                    "subject_canonical_id":
-                                        state_update.canonical_id,
-                                    "observed_at_ms": observed_at_ms,
-                                    "drop_in_path":
-                                        drop_in_path.display().to_string(),
-                                    "render_bytes": render_bytes,
-                                    // True when the drop-in on disk is
-                                    // what we just rendered —
-                                    // whether this update wrote it
-                                    // or found it already matching.
-                                    // A read we could not perform
-                                    // leaves that unknown, and
-                                    // unknown is not ok.
-                                    "write_ok": match &write_outcome {
-                                        Some(r) => r.is_ok(),
-                                        None => !read_failed,
-                                    },
-                                });
-                                if let Err(e) = happening_emitter
-                                    .emit_plugin_event(
-                                        "delivery.options_rendered"
-                                            .to_string(),
-                                        rendered_payload,
-                                    )
-                                    .await
-                                {
-                                    // LOGGING.md §2: warn
-                                    // (recoverable; diagnostic
-                                    // surface).
-                                    tracing::warn!(
-                                        plugin = PLUGIN_NAME,
-                                        error = %e,
-                                        "emit delivery.options_rendered failed"
-                                    );
-                                }
+                                renderer.emit_rendered(&outcome, observed_at_ms).await;
 
                                 // Mixer-transition lifecycle is
                                 // owned by the orchestrator
@@ -1368,6 +1593,14 @@ impl Plugin for AlsaDeliveryPlugin {
                 "plugin load beginning"
             );
             self.install_routing(ctx.audio_routing.clone())?;
+            self.happening_emitter = Some(Arc::clone(&ctx.happening_emitter));
+            // Enabled flags and volumes the output verbs set
+            // last time around; the chain binding is not
+            // persisted and starts as Follow.
+            self.install_outputs_state(
+                ctx.state_dir.join(OutputStateStore::FILE_NAME),
+            )
+            .await;
             // Spawn the route-change reactor. The framework's
             // audio_topology_store publishes topology rewires
             // via every plugin's RouteChangeCallback; the
@@ -1381,8 +1614,9 @@ impl Plugin for AlsaDeliveryPlugin {
             // the playback.options settings subject; on every
             // operator change to mixer_type / output_device /
             // resampling / etc. drives a re-render of the
-            // pcm.evo drop-in (via render_drop_in +
-            // atomic_write_drop_in) followed by the
+            // pcm.evo drop-in (via render_drop_in_bound +
+            // atomic_write_drop_in, through the same
+            // DropInRenderer the output verbs use) followed by the
             // observer-visibility + drop-in-freshness
             // happenings so cross-plugin consumers can
             // serialise their re-bind work against
@@ -1438,6 +1672,12 @@ impl Plugin for AlsaDeliveryPlugin {
             self.stop_reactor().await;
             self.stop_options_observer().await;
             self.stop_hardware_audio_observer().await;
+            // The observer is stopped, so this is the last
+            // render: the drop-in follows the operator's
+            // settings again and carries no output binding
+            // into the next load.
+            self.release_output_binding().await;
+            self.happening_emitter = None;
             self.audio_routing = None;
             self.loaded = false;
             Ok(())
@@ -1490,6 +1730,13 @@ impl Respondent for AlsaDeliveryPlugin {
                     self.handle_active_endpoint(req).await
                 }
                 "delivery.list_outputs" => self.handle_list_outputs(req).await,
+                "delivery.enable_output"
+                | "delivery.disable_output"
+                | "delivery.play_output"
+                | "delivery.pause_output" => self.handle_output_verb(req).await,
+                "delivery.set_output_volume" => {
+                    self.handle_set_output_volume(req).await
+                }
                 other => Err(PluginError::Permanent(format!(
                     "request type {other:?} declared but no handler wired; \
                      manifest/runtime drift bug"
@@ -1626,6 +1873,151 @@ impl AlsaDeliveryPlugin {
         encode(req, &payload)
     }
 
+    /// The operator's `output_device` as last observed, or the
+    /// bootstrap default: what the chain follows when no output
+    /// verb has bound it.
+    async fn follow_device(&self) -> String {
+        self.last_options
+            .read()
+            .await
+            .as_ref()
+            .and_then(|l| l.settings.output_device.clone())
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| {
+                options_render::DEFAULT_OUTPUT_DEVICE.to_string()
+            })
+    }
+
+    /// `delivery.enable_output`, `delivery.disable_output`,
+    /// `delivery.play_output`, `delivery.pause_output` — one
+    /// output, named by the id `delivery.list_outputs` gave it.
+    /// The policy decides; this runs the one effect it asks for
+    /// (a drop-in render when the chain's terminus moved),
+    /// persists what survives a restart, and answers with that
+    /// output's state.
+    async fn handle_output_verb(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: OutputRequest = parse_versioned_payload(req)?;
+        let outputs = self.cached_outputs.read().await.clone();
+        let follow = self.follow_device().await;
+        let id = payload.output_id.as_str();
+        let (decision, snapshot) = {
+            let mut policy = self.outputs.write().await;
+            let decision = match req.request_type.as_str() {
+                "delivery.enable_output" => policy.enable(&outputs, id),
+                "delivery.disable_output" => {
+                    policy.disable(&outputs, &follow, id)
+                }
+                "delivery.play_output" => policy.play(&outputs, &follow, id),
+                "delivery.pause_output" => policy.pause(&outputs, &follow, id),
+                other => {
+                    return Err(PluginError::Permanent(format!(
+                        "{other:?} is not an output verb"
+                    )))
+                }
+            };
+            (decision, policy.snapshot(&outputs, &follow, id))
+        };
+        let effect = decision.map_err(|refusal| {
+            PluginError::Permanent(format!("{}: {refusal}", req.request_type))
+        })?;
+        match req.request_type.as_str() {
+            "delivery.enable_output" | "delivery.disable_output" => {
+                self.persist_outputs().await;
+            }
+            _ => {}
+        }
+        if effect == Effect::Rebind {
+            let renderer = self.drop_in_renderer();
+            let outcome = renderer.render_and_write().await;
+            renderer.emit_rendered(&outcome, now_ms()).await;
+            if let Some(Err(e)) = &outcome.write_outcome {
+                return Err(PluginError::Transient(format!(
+                    "{}: the chain was rebound but the drop-in could not \
+                     be written: {e}",
+                    req.request_type
+                )));
+            }
+        }
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            verb = %req.request_type,
+            output_id = id,
+            enabled = snapshot.enabled,
+            playing = snapshot.playing,
+            "output verb applied"
+        );
+        encode(
+            req,
+            &OutputResponse {
+                v: PAYLOAD_VERSION,
+                output: snapshot,
+            },
+        )
+    }
+
+    /// `delivery.set_output_volume` — one `amixer` call against
+    /// the output's own mixer control. Refused when the output
+    /// is unknown, has no control, the percentage is out of
+    /// range, or the control is the chain's hardware mixer (the
+    /// global volume). The volume is recorded only once the card
+    /// accepted it.
+    async fn handle_set_output_volume(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: OutputVolumeRequest = parse_versioned_payload(req)?;
+        let outputs = self.cached_outputs.read().await.clone();
+        let follow = self.follow_device().await;
+        let global = self
+            .last_options
+            .read()
+            .await
+            .as_ref()
+            .and_then(|l| GlobalMixer::from_settings(&l.settings));
+        let id = payload.output_id.as_str();
+        let target = self
+            .outputs
+            .read()
+            .await
+            .volume_target(&outputs, global.as_ref(), id, payload.volume)
+            .map_err(|refusal| {
+                PluginError::Permanent(format!(
+                    "{}: {refusal}",
+                    req.request_type
+                ))
+            })?;
+        self.mixer
+            .set_volume(target.card_idx, &target.control, target.percent)
+            .await
+            .map_err(|e| {
+                PluginError::Transient(format!("{}: {e}", req.request_type))
+            })?;
+        let snapshot = {
+            let mut policy = self.outputs.write().await;
+            policy.record_volume(id, target.percent);
+            policy.snapshot(&outputs, &follow, id)
+        };
+        self.persist_outputs().await;
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            output_id = id,
+            card_idx = target.card_idx,
+            control = %target.control,
+            percent = target.percent,
+            "output volume set"
+        );
+        encode(
+            req,
+            &OutputResponse {
+                v: PAYLOAD_VERSION,
+                output: snapshot,
+            },
+        )
+    }
+
     /// Load the embedded ALSA card catalog, enumerate the host's
     /// ALSA outputs via `aplay -l`, cache the resolved list, and
     /// publish the snapshot on `evo.audio.delivery:outputs`. The
@@ -1720,6 +2112,44 @@ impl AlsaDeliveryPlugin {
 struct ListOutputsResponse {
     v: u32,
     outputs: Vec<ResolvedAlsaOutput>,
+}
+
+/// `delivery.enable_output` / `disable_output` / `play_output` /
+/// `pause_output` request: one output.
+#[derive(Debug, Deserialize)]
+struct OutputRequest {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    output_id: String,
+}
+
+impl HasPayloadVersion for OutputRequest {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+/// `delivery.set_output_volume` request: one output, one
+/// percentage.
+#[derive(Debug, Deserialize)]
+struct OutputVolumeRequest {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    output_id: String,
+    volume: u8,
+}
+
+impl HasPayloadVersion for OutputVolumeRequest {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+/// The five output verbs answer with that output's state.
+#[derive(Debug, Serialize)]
+struct OutputResponse {
+    v: u32,
+    output: OutputSnapshot,
 }
 
 // ===== wire payload types =====
@@ -2908,5 +3338,500 @@ pcm.evo {
         let body_off = tokio::fs::read_to_string(&drop_in_path).await.unwrap();
         assert!(!body_off.contains("rate 96000"));
         assert!(!body_off.contains("pcm.evo_rate"));
+    }
+
+    // ----- output verbs: five verbs on one output -----
+
+    use crate::outputs::tests::output as seeded_output;
+
+    /// Records every mixer call instead of running `amixer`.
+    #[derive(Default)]
+    struct RecordingMixer {
+        calls: Mutex<Vec<(u32, String, u8)>>,
+        refuse: Mutex<bool>,
+    }
+
+    impl MixerSetter for RecordingMixer {
+        fn set_volume<'a>(
+            &'a self,
+            card_idx: u32,
+            control: &'a str,
+            percent: u8,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<(), String>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                if *self.refuse.lock().unwrap() {
+                    return Err("card refused".to_string());
+                }
+                self.calls.lock().unwrap().push((
+                    card_idx,
+                    control.to_string(),
+                    percent,
+                ));
+                Ok(())
+            })
+        }
+    }
+
+    /// A loaded plugin with two outputs, a tempdir drop-in and
+    /// state file, and a recording mixer.
+    struct OutputRig {
+        plugin: AlsaDeliveryPlugin,
+        mixer: Arc<RecordingMixer>,
+        dir: tempfile::TempDir,
+    }
+
+    impl OutputRig {
+        async fn new() -> Self {
+            let dir = tempdir().expect("tempdir");
+            let mixer = Arc::new(RecordingMixer::default());
+            let mut plugin = loaded_plugin()
+                .await
+                .with_asound_conf_path(dir.path().join("asound.conf"))
+                .with_asound_options_drop_in_path(
+                    dir.path().join("evo-options.conf"),
+                )
+                .with_mixer_setter(Arc::clone(&mixer) as Arc<dyn MixerSetter>);
+            plugin
+                .install_outputs_state(dir.path().join("outputs-state.toml"))
+                .await;
+            *plugin.cached_outputs.write().await = vec![
+                seeded_output(0, "DAC", Some("Digital")),
+                seeded_output(1, "HDMI", Some("PCM")),
+            ];
+            Self { plugin, mixer, dir }
+        }
+
+        async fn with_options(self, settings: OptionsSettings) -> Self {
+            *self.plugin.last_options.write().await = Some(LastOptions {
+                settings,
+                subject_canonical_id: "options-1".to_string(),
+            });
+            self
+        }
+
+        async fn call(
+            &self,
+            verb: &str,
+            payload: Value,
+        ) -> Result<Value, String> {
+            match self.plugin.handle_request(&request(verb, payload)).await {
+                Ok(resp) => Ok(serde_json::from_slice(&resp.payload).unwrap()),
+                Err(e) => Err(format!("{e:?}")),
+            }
+        }
+
+        async fn verb(&self, verb: &str, id: &str) -> Result<Value, String> {
+            self.call(verb, json!({ "v": 1, "output_id": id })).await
+        }
+
+        async fn drop_in(&self) -> String {
+            tokio::fs::read_to_string(&self.plugin.asound_options_drop_in_path)
+                .await
+                .unwrap_or_default()
+        }
+    }
+
+    fn hardware_mixer_on_dac() -> OptionsSettings {
+        OptionsSettings {
+            mixer_type: Some(options_render::MixerType::Hardware),
+            mixer_control: Some("Digital".to_string()),
+            output_device: Some("hw:CARD=DAC,DEV=0".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// The five verbs refuse an output `list_outputs` does not
+    /// name, and leave the mixer and the drop-in untouched.
+    #[tokio::test]
+    async fn an_unknown_output_is_refused_by_the_five_verbs() {
+        let rig = OutputRig::new().await;
+        for verb in [
+            "delivery.enable_output",
+            "delivery.disable_output",
+            "delivery.play_output",
+            "delivery.pause_output",
+        ] {
+            let err = rig.verb(verb, "hw:9,9").await.unwrap_err();
+            assert!(err.contains("unknown output"), "{verb}: {err}");
+        }
+        let err = rig
+            .call(
+                "delivery.set_output_volume",
+                json!({ "v": 1, "output_id": "hw:9,9", "volume": 10 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown output"), "{err}");
+        assert!(rig.mixer.calls.lock().unwrap().is_empty());
+        assert_eq!(rig.drop_in().await, "", "no drop-in rendered");
+        assert!(!rig.dir.path().join("outputs-state.toml").exists());
+    }
+
+    /// Enabling, disabling or setting the volume of output A
+    /// changes nothing about output B: B's reported state is the
+    /// same before and after, and the one mixer call names A's
+    /// card and control.
+    #[tokio::test]
+    async fn changing_one_output_leaves_the_other_as_it_was() {
+        let rig = OutputRig::new().await;
+        // B is read through pause_output: a no-op on an output
+        // that is not playing, answering with its state unchanged.
+        let b_before =
+            rig.verb("delivery.pause_output", "hw:1,0").await.unwrap();
+        assert_eq!(
+            b_before["output"],
+            json!({ "output_id": "hw:1,0", "enabled": true, "playing": false, "volume": null })
+        );
+
+        let a = rig.verb("delivery.disable_output", "hw:0,0").await.unwrap();
+        assert_eq!(a["output"]["enabled"], false);
+        let b = rig.verb("delivery.pause_output", "hw:1,0").await.unwrap();
+        assert_eq!(
+            b["output"], b_before["output"],
+            "B untouched by A's disable"
+        );
+
+        let a = rig
+            .call(
+                "delivery.set_output_volume",
+                json!({ "v": 1, "output_id": "hw:0,0", "volume": 40 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(a["output"]["volume"], 40);
+        assert_eq!(
+            *rig.mixer.calls.lock().unwrap(),
+            vec![(0, "Digital".to_string(), 40)],
+            "one call, A's card and control"
+        );
+        let b = rig.verb("delivery.pause_output", "hw:1,0").await.unwrap();
+        assert_eq!(
+            b["output"], b_before["output"],
+            "B untouched by A's volume"
+        );
+
+        let a = rig.verb("delivery.enable_output", "hw:0,0").await.unwrap();
+        assert_eq!(a["output"]["enabled"], true);
+        assert_eq!(a["output"]["volume"], 40, "A's volume kept");
+        let b = rig.verb("delivery.pause_output", "hw:1,0").await.unwrap();
+        assert_eq!(
+            b["output"], b_before["output"],
+            "B untouched by A's enable"
+        );
+
+        // Both disabled: enabling A leaves B disabled.
+        rig.verb("delivery.disable_output", "hw:0,0").await.unwrap();
+        rig.verb("delivery.disable_output", "hw:1,0").await.unwrap();
+        rig.verb("delivery.enable_output", "hw:0,0").await.unwrap();
+        let b = rig.verb("delivery.pause_output", "hw:1,0").await.unwrap();
+        assert_eq!(b["output"]["enabled"], false, "B stays disabled");
+    }
+
+    /// The chain plays one output at a time. The operator's
+    /// device plays until it is paused; a second play is refused
+    /// and the first keeps playing; pausing the playing output
+    /// renders a null terminus and starts no other.
+    #[tokio::test]
+    async fn the_second_play_is_refused_and_the_first_keeps_playing() {
+        let rig = OutputRig::new()
+            .await
+            .with_options(hardware_mixer_on_dac())
+            .await;
+        // DAC plays by the operator's choice.
+        let a = rig.verb("delivery.enable_output", "hw:0,0").await.unwrap();
+        assert_eq!(a["output"]["playing"], true);
+
+        let err = rig
+            .verb("delivery.play_output", "hw:1,0")
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("cannot play while \\\"hw:0,0\\\" is playing"),
+            "{err}"
+        );
+        let a = rig.verb("delivery.enable_output", "hw:0,0").await.unwrap();
+        assert_eq!(a["output"]["playing"], true, "the first keeps playing");
+        assert_eq!(rig.drop_in().await, "", "a refused play renders nothing");
+
+        // Pause DAC: the chain goes silent; HDMI did not start.
+        let a = rig.verb("delivery.pause_output", "hw:0,0").await.unwrap();
+        assert_eq!(a["output"]["playing"], false);
+        let body = rig.drop_in().await;
+        assert!(
+            body.contains("pcm.evo_terminus {\n    type null\n}"),
+            "{body}"
+        );
+        assert!(!body.contains("card \"1\""), "HDMI did not start: {body}");
+        assert!(
+            body.contains("ctl.evo {\n    type hw\n    card \"DAC\""),
+            "global volume stays on the operator's card: {body}"
+        );
+        let b = rig.verb("delivery.enable_output", "hw:1,0").await.unwrap();
+        assert_eq!(b["output"]["playing"], false);
+
+        // Now HDMI may play, and DAC may not.
+        let b = rig.verb("delivery.play_output", "hw:1,0").await.unwrap();
+        assert_eq!(b["output"]["playing"], true);
+        let body = rig.drop_in().await;
+        assert!(body.contains("pcm.evo_terminus {\n    type hw\n    card \"1\"\n    device 0\n}"), "{body}");
+        let err = rig
+            .verb("delivery.play_output", "hw:0,0")
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("cannot play while \\\"hw:1,0\\\" is playing"),
+            "{err}"
+        );
+        assert!(
+            rig.drop_in().await.contains("card \"1\""),
+            "HDMI keeps playing"
+        );
+
+        // Pausing the one that is not playing pauses nothing.
+        let a = rig.verb("delivery.pause_output", "hw:0,0").await.unwrap();
+        assert_eq!(a["output"]["playing"], false);
+        let b = rig.verb("delivery.enable_output", "hw:1,0").await.unwrap();
+        assert_eq!(b["output"]["playing"], true, "HDMI still playing");
+        assert!(rig.drop_in().await.contains("card \"1\""));
+    }
+
+    /// A disabled output cannot play; disabling the playing
+    /// output pauses it and starts no other.
+    #[tokio::test]
+    async fn a_disabled_output_cannot_play_and_disabling_the_playing_one_pauses_it(
+    ) {
+        let rig = OutputRig::new()
+            .await
+            .with_options(hardware_mixer_on_dac())
+            .await;
+        rig.verb("delivery.pause_output", "hw:0,0").await.unwrap();
+        rig.verb("delivery.disable_output", "hw:1,0").await.unwrap();
+        let err = rig
+            .verb("delivery.play_output", "hw:1,0")
+            .await
+            .unwrap_err();
+        assert!(err.contains("is disabled"), "{err}");
+
+        rig.verb("delivery.enable_output", "hw:1,0").await.unwrap();
+        let b = rig.verb("delivery.play_output", "hw:1,0").await.unwrap();
+        assert_eq!(b["output"]["playing"], true);
+        let b = rig.verb("delivery.disable_output", "hw:1,0").await.unwrap();
+        assert_eq!(b["output"]["playing"], false);
+        assert_eq!(b["output"]["enabled"], false);
+        let body = rig.drop_in().await;
+        assert!(body.contains("type null"), "{body}");
+        assert!(
+            !body.contains("card \"0\"") && !body.contains("card \"1\"\n"),
+            "no output started: {body}"
+        );
+    }
+
+    /// Volume on the chain's hardware mixer is the global volume
+    /// and is refused; the other card's control is set with one
+    /// call; no control and out of range are refused; a card
+    /// that refuses records nothing.
+    #[tokio::test]
+    async fn volume_on_the_chains_hardware_mixer_is_refused() {
+        let rig = OutputRig::new()
+            .await
+            .with_options(hardware_mixer_on_dac())
+            .await;
+        let err = rig
+            .call(
+                "delivery.set_output_volume",
+                json!({ "v": 1, "output_id": "hw:0,0", "volume": 50 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("global volume"), "{err}");
+        assert!(rig.mixer.calls.lock().unwrap().is_empty());
+
+        let b = rig
+            .call(
+                "delivery.set_output_volume",
+                json!({ "v": 1, "output_id": "hw:1,0", "volume": 50 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(b["output"]["volume"], 50);
+        assert_eq!(
+            *rig.mixer.calls.lock().unwrap(),
+            vec![(1, "PCM".to_string(), 50)]
+        );
+
+        let err = rig
+            .call(
+                "delivery.set_output_volume",
+                json!({ "v": 1, "output_id": "hw:1,0", "volume": 101 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("out of range"), "{err}");
+
+        rig.plugin
+            .cached_outputs
+            .write()
+            .await
+            .push(seeded_output(2, "Bare", None));
+        let err = rig
+            .call(
+                "delivery.set_output_volume",
+                json!({ "v": 1, "output_id": "hw:2,0", "volume": 10 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("no mixer control"), "{err}");
+
+        *rig.mixer.refuse.lock().unwrap() = true;
+        let err = rig
+            .call(
+                "delivery.set_output_volume",
+                json!({ "v": 1, "output_id": "hw:1,0", "volume": 60 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("card refused"), "{err}");
+        let b = rig.verb("delivery.enable_output", "hw:1,0").await.unwrap();
+        assert_eq!(
+            b["output"]["volume"], 50,
+            "a refused volume is not recorded"
+        );
+        assert_eq!(rig.mixer.calls.lock().unwrap().len(), 1);
+    }
+
+    /// Enabled flags and volumes survive a restart on the same
+    /// state directory; the binding does not.
+    #[tokio::test]
+    async fn enabled_and_volume_survive_a_restart_and_the_binding_does_not() {
+        let rig = OutputRig::new().await;
+        rig.verb("delivery.disable_output", "hw:1,0").await.unwrap();
+        rig.call(
+            "delivery.set_output_volume",
+            json!({ "v": 1, "output_id": "hw:0,0", "volume": 33 }),
+        )
+        .await
+        .unwrap();
+        rig.verb("delivery.pause_output", "hw:0,0").await.unwrap();
+        rig.verb("delivery.enable_output", "hw:1,0").await.unwrap();
+        rig.verb("delivery.play_output", "hw:1,0").await.unwrap();
+        assert!(rig.drop_in().await.contains("card \"1\""));
+
+        let mut again = loaded_plugin().await;
+        again
+            .install_outputs_state(rig.dir.path().join("outputs-state.toml"))
+            .await;
+        *again.cached_outputs.write().await =
+            rig.plugin.cached_outputs.read().await.clone();
+        let b: Value = serde_json::from_slice(
+            &again
+                .handle_request(&request(
+                    "delivery.enable_output",
+                    json!({ "v": 1, "output_id": "hw:1,0" }),
+                ))
+                .await
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
+        assert_eq!(b["output"]["enabled"], true);
+        assert_eq!(
+            b["output"]["volume"],
+            Value::Null,
+            "HDMI never had a volume"
+        );
+        let persisted =
+            OutputStateStore::at(rig.dir.path().join("outputs-state.toml"))
+                .load()
+                .await;
+        assert!(persisted
+            .outputs
+            .iter()
+            .any(|o| o.output_id == "hw:0,0" && o.volume == Some(33)));
+        assert_eq!(
+            again.outputs.read().await.binding(),
+            &options_render::OutputBinding::Follow
+        );
+    }
+
+    /// A restart finds the disabled flag before any verb runs.
+    #[tokio::test]
+    async fn a_disabled_output_is_still_disabled_after_a_restart() {
+        let rig = OutputRig::new().await;
+        rig.verb("delivery.disable_output", "hw:1,0").await.unwrap();
+        let mut again = loaded_plugin().await;
+        again
+            .install_outputs_state(rig.dir.path().join("outputs-state.toml"))
+            .await;
+        *again.cached_outputs.write().await =
+            rig.plugin.cached_outputs.read().await.clone();
+        let err = again
+            .handle_request(&request(
+                "delivery.play_output",
+                json!({ "v": 1, "output_id": "hw:1,0" }),
+            ))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("is disabled"), "{err:?}");
+    }
+
+    /// Unload releases the binding: the drop-in on disk follows
+    /// the operator's settings again.
+    #[tokio::test]
+    async fn unload_leaves_no_output_binding_on_disk() {
+        let mut rig = OutputRig::new()
+            .await
+            .with_options(hardware_mixer_on_dac())
+            .await;
+        rig.verb("delivery.pause_output", "hw:0,0").await.unwrap();
+        rig.verb("delivery.play_output", "hw:1,0").await.unwrap();
+        assert!(rig.drop_in().await.contains("card \"1\""));
+        rig.plugin.unload().await.unwrap();
+        let body = rig.drop_in().await;
+        assert!(body.contains("pcm.evo_terminus {\n    type hw\n    card \"DAC\"\n    device 0\n}"), "{body}");
+        assert!(!body.contains("type null"), "{body}");
+    }
+
+    /// The options observer and the output verbs render through
+    /// one renderer: a settings change rendered while an output
+    /// is bound keeps the bound terminus, and the production
+    /// source has exactly one drop-in write.
+    #[tokio::test]
+    async fn the_observer_renders_through_the_output_binding() {
+        let rig = OutputRig::new()
+            .await
+            .with_options(hardware_mixer_on_dac())
+            .await;
+        rig.verb("delivery.pause_output", "hw:0,0").await.unwrap();
+        rig.verb("delivery.play_output", "hw:1,0").await.unwrap();
+        // The operator changes the mixer; the observer's render.
+        *rig.plugin.last_options.write().await = Some(LastOptions {
+            settings: OptionsSettings {
+                mixer_type: Some(options_render::MixerType::Software),
+                ..hardware_mixer_on_dac()
+            },
+            subject_canonical_id: "options-2".to_string(),
+        });
+        let outcome = rig.plugin.drop_in_renderer().render_and_write().await;
+        assert!(outcome.write_ok());
+        assert_eq!(outcome.subject_canonical_id.as_deref(), Some("options-2"));
+        let body = rig.drop_in().await;
+        assert!(body.contains("type softvol"), "the new setting: {body}");
+        assert!(
+            body.contains("card \"1\"\n    device 0"),
+            "the bound output: {body}"
+        );
+        assert!(body.contains("control.card \"DAC\""), "{body}");
+
+        let production = include_str!("lib.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        assert_eq!(
+            production.matches("atomic_write_drop_in(").count(),
+            1,
+            "one writer for the drop-in"
+        );
     }
 }

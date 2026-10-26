@@ -181,16 +181,61 @@ pub enum RenderTarget {
 /// Determinism guarantees: same input renders byte-identical
 /// output across calls. The function has no internal state and
 /// no environment dependencies.
+///
+/// Production renders through [`render_drop_in_bound`], which
+/// layers the output binding on; this and
+/// [`render_drop_in_for_target`] are the binding-free shapes the
+/// tests pin.
+#[cfg(test)]
 pub fn render_drop_in(settings: &OptionsSettings) -> String {
     render_drop_in_for_target(settings, RenderTarget::Main)
 }
 
 /// Render the asound.conf drop-in body targeting either the standard
 /// producer PCM (`pcm.evo`) or the source-host local renderer PCM
-/// (`pcm.evo_local`).
+/// (`pcm.evo_local`), with no output binding.
+#[cfg(test)]
 pub fn render_drop_in_for_target(
     settings: &OptionsSettings,
     target: RenderTarget,
+) -> String {
+    render_drop_in_bound(settings, target, &OutputBinding::Follow)
+}
+
+/// Where the chain terminates right now, on top of the operator's
+/// settings. The output verbs (`delivery.play_output` and
+/// `delivery.pause_output`) steer this; the options observer
+/// renders through it too, so the drop-in on disk is one render
+/// of one state whichever path asked for it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum OutputBinding {
+    /// No output verb has spoken: the chain terminates at the
+    /// operator's `output_device`.
+    #[default]
+    Follow,
+    /// The chain terminates at this ALSA output (`hw:N,M`),
+    /// whatever the operator's `output_device` says.
+    Output(String),
+    /// The chain terminates nowhere: a `null` terminus. The
+    /// output that was playing is paused and no other output
+    /// starts in its place.
+    Silent,
+}
+
+/// Render the drop-in for a target with an output binding
+/// layered over the operator's settings.
+///
+/// `Follow` renders exactly what [`render_drop_in_for_target`]
+/// renders. `Output(id)` renders the same chain with `id` as the
+/// terminus. `Silent` renders the chain with a `null` terminus
+/// (and a `null` front PCM in bit-perfect mode, where there is
+/// no terminus node); the `ctl.evo` surface still binds to the
+/// operator's card, because the global volume is not what was
+/// paused.
+pub fn render_drop_in_bound(
+    settings: &OptionsSettings,
+    target: RenderTarget,
+    binding: &OutputBinding,
 ) -> String {
     let mut out = String::new();
     out.push_str(
@@ -210,11 +255,20 @@ pub fn render_drop_in_for_target(
         RenderTarget::SourceLocal => "evo_local",
     };
 
-    let output_device = settings
+    // The operator's card: what `ctl.evo` and the softvol
+    // control bind to, whatever output the chain terminates at.
+    let operator_device = settings
         .output_device
         .as_deref()
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_OUTPUT_DEVICE);
+    // The terminus: the bound output when one is bound, the
+    // operator's device otherwise. `None` is the null terminus.
+    let output_device: Option<&str> = match binding {
+        OutputBinding::Follow => Some(operator_device),
+        OutputBinding::Output(id) => Some(id.as_str()),
+        OutputBinding::Silent => None,
+    };
 
     // Bit-perfect (exclusive / hog) mode short-circuits the
     // conversion-bearing chain: no `plug` front-end, no
@@ -293,9 +347,16 @@ pub fn render_drop_in_for_target(
     let mixer_name = format!("{node_prefix}_mixer");
 
     writeln!(out, "pcm.{terminus_name} {{").unwrap();
-    writeln!(out, "    type hw").unwrap();
-    writeln!(out, "    card \"{}\"", parse_card_name(output_device)).unwrap();
-    writeln!(out, "    device {}", parse_card_device(output_device)).unwrap();
+    match output_device {
+        Some(device) => {
+            writeln!(out, "    type hw").unwrap();
+            writeln!(out, "    card \"{}\"", parse_card_name(device)).unwrap();
+            writeln!(out, "    device {}", parse_card_device(device)).unwrap();
+        }
+        None => {
+            writeln!(out, "    type null").unwrap();
+        }
+    }
     writeln!(out, "}}").unwrap();
     out.push('\n');
 
@@ -332,7 +393,7 @@ pub fn render_drop_in_for_target(
         writeln!(
             out,
             "    control.card \"{}\"",
-            parse_card_name(output_device)
+            parse_card_name(operator_device)
         )
         .unwrap();
         writeln!(out, "}}").unwrap();
@@ -353,11 +414,18 @@ pub fn render_drop_in_for_target(
     //     EBUSY / ENOTSUP), not silent format mangling.
     if exclusive_mode {
         writeln!(out, "pcm.{front_pcm_name} {{").unwrap();
-        writeln!(out, "    type hw").unwrap();
-        writeln!(out, "    card \"{}\"", parse_card_name(output_device))
-            .unwrap();
-        writeln!(out, "    device {}", parse_card_device(output_device))
-            .unwrap();
+        match output_device {
+            Some(device) => {
+                writeln!(out, "    type hw").unwrap();
+                writeln!(out, "    card \"{}\"", parse_card_name(device))
+                    .unwrap();
+                writeln!(out, "    device {}", parse_card_device(device))
+                    .unwrap();
+            }
+            None => {
+                writeln!(out, "    type null").unwrap();
+            }
+        }
         writeln!(out, "    hint {{").unwrap();
         writeln!(out, "        show on").unwrap();
         writeln!(
@@ -395,7 +463,7 @@ pub fn render_drop_in_for_target(
     // softvol node's control, or none).
     writeln!(out, "ctl.evo {{").unwrap();
     writeln!(out, "    type hw").unwrap();
-    writeln!(out, "    card \"{}\"", parse_card_name(output_device)).unwrap();
+    writeln!(out, "    card \"{}\"", parse_card_name(operator_device)).unwrap();
     if let EffectiveMixer::Hardware(ctrl) = mixer_kind {
         // ALSA's `ctl` type does not take a control name —
         // operator gestures pick the named control at runtime
@@ -562,7 +630,7 @@ enum EffectiveMixer<'a> {
 /// Extract the card name from an `hw:CARD=NAME,DEV=N` or
 /// `hw:N,M` descriptor. Returns the verbatim card token; the
 /// renderer quotes it as a string in the asound.conf output.
-fn parse_card_name(descriptor: &str) -> &str {
+pub(crate) fn parse_card_name(descriptor: &str) -> &str {
     if let Some(rest) = descriptor.strip_prefix("hw:CARD=") {
         // hw:CARD=DAC,DEV=0 → DAC
         rest.split(',').next().unwrap_or(rest)
@@ -576,7 +644,7 @@ fn parse_card_name(descriptor: &str) -> &str {
 
 /// Extract the device index from a descriptor; defaults to `0`
 /// when not present (matches alsa convention).
-fn parse_card_device(descriptor: &str) -> u32 {
+pub(crate) fn parse_card_device(descriptor: &str) -> u32 {
     let after_card = if let Some(rest) = descriptor.strip_prefix("hw:CARD=") {
         rest
     } else if let Some(rest) = descriptor.strip_prefix("hw:") {
@@ -1147,5 +1215,83 @@ mod tests {
             .await
             .expect_err("root path has no parent");
         let _ = err; // exact ErrorKind varies by OS; surface-shape only.
+    }
+
+    // ----- output binding -----
+
+    /// `Follow` renders exactly the binding-free shape.
+    #[test]
+    fn follow_renders_what_the_settings_say() {
+        let s = OptionsSettings {
+            mixer_type: Some(MixerType::Software),
+            output_device: Some("hw:CARD=DAC,DEV=0".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_drop_in_bound(
+                &s,
+                RenderTarget::Main,
+                &OutputBinding::Follow
+            ),
+            render_drop_in(&s)
+        );
+    }
+
+    /// A bound output is the terminus; the operator's card keeps
+    /// the control surface and the softvol control.
+    #[test]
+    fn a_bound_output_is_the_terminus_and_the_operators_card_keeps_the_controls(
+    ) {
+        let s = OptionsSettings {
+            mixer_type: Some(MixerType::Software),
+            output_device: Some("hw:CARD=DAC,DEV=0".to_string()),
+            ..Default::default()
+        };
+        let out = render_drop_in_bound(
+            &s,
+            RenderTarget::Main,
+            &OutputBinding::Output("hw:1,0".to_string()),
+        );
+        assert!(out.contains("pcm.evo_terminus {\n    type hw\n    card \"1\"\n    device 0\n}"), "{out}");
+        assert!(out.contains("control.card \"DAC\""), "{out}");
+        assert!(
+            out.contains("ctl.evo {\n    type hw\n    card \"DAC\""),
+            "{out}"
+        );
+    }
+
+    /// `Silent` renders a null terminus and nothing else moves.
+    #[test]
+    fn silent_renders_a_null_terminus() {
+        let s = OptionsSettings {
+            mixer_type: Some(MixerType::Hardware),
+            mixer_control: Some("Digital".to_string()),
+            output_device: Some("hw:CARD=DAC,DEV=0".to_string()),
+            ..Default::default()
+        };
+        let out = render_drop_in_bound(
+            &s,
+            RenderTarget::Main,
+            &OutputBinding::Silent,
+        );
+        assert!(
+            out.contains("pcm.evo_terminus {\n    type null\n}"),
+            "{out}"
+        );
+        assert!(out.contains("slave.pcm \"evo_terminus\""), "{out}");
+        assert!(out.contains("ctl.evo {\n    type hw\n    card \"DAC\"\n    # hardware-mixer control: \"Digital\""), "{out}");
+
+        // Bit-perfect has no terminus node: the front PCM is null.
+        let exclusive = OptionsSettings {
+            exclusive_mode: Some(true),
+            ..s
+        };
+        let out = render_drop_in_bound(
+            &exclusive,
+            RenderTarget::Main,
+            &OutputBinding::Silent,
+        );
+        assert!(out.contains("pcm.evo {\n    type null\n"), "{out}");
+        assert!(!out.contains("card \"DAC\"\n    device"), "{out}");
     }
 }
