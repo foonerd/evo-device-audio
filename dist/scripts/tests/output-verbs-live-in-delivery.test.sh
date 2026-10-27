@@ -9,7 +9,8 @@
 # and `delivery.remove_logical_output` name one, and
 # `delivery.list_logical_outputs` reads the names back;
 # `zone.add`, `zone.update`, `zone.remove` and `zone.list` keep a
-# name over one or more logical outputs. The delivery
+# name over one or more logical outputs, and `zone.set_eq_engaged`
+# and `zone.set_eq_band` keep a zone's own EQ. The delivery
 # plugin owns the chain definition those verbs steer and the
 # names the operator gives its outputs; no steward crate and no
 # other plugin carries an output policy, a second copy of a
@@ -41,6 +42,8 @@ VERBS=(
     "zone.update"
     "zone.remove"
     "zone.list"
+    "zone.set_eq_engaged"
+    "zone.set_eq_band"
 )
 
 PASS=0

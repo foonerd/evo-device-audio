@@ -43,6 +43,8 @@ request_types = [
     "zone.update",
     "zone.remove",
     "zone.list",
+    "zone.set_eq_engaged",
+    "zone.set_eq_band",
 ]
 
 [kind]
@@ -120,6 +122,8 @@ request_types = [
     "zone.update",
     "zone.remove",
     "zone.list",
+    "zone.set_eq_engaged",
+    "zone.set_eq_band",
 ]
 response_budget_ms = 5000
 

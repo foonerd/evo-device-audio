@@ -173,6 +173,8 @@ const REQUEST_TYPES: &[&str] = &[
     "zone.update",
     "zone.remove",
     "zone.list",
+    "zone.set_eq_engaged",
+    "zone.set_eq_band",
 ];
 
 /// Subject scheme + value for the resolved-outputs surface.
@@ -1841,6 +1843,10 @@ impl Respondent for AlsaDeliveryPlugin {
                 "zone.update" => self.handle_zone_update(req).await,
                 "zone.remove" => self.handle_zone_remove(req).await,
                 "zone.list" => self.handle_zone_list(req).await,
+                "zone.set_eq_engaged" => {
+                    self.handle_zone_set_eq_engaged(req).await
+                }
+                "zone.set_eq_band" => self.handle_zone_set_eq_band(req).await,
                 other => Err(PluginError::Permanent(format!(
                     "request type {other:?} declared but no handler wired; \
                      manifest/runtime drift bug"
@@ -2390,6 +2396,72 @@ impl AlsaDeliveryPlugin {
         )
     }
 
+    /// `zone.set_eq_engaged` — the zone's EQ flag. Answers the
+    /// zone. Stores and answers; renders nothing.
+    async fn handle_zone_set_eq_engaged(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: ZoneSetEqEngagedRequest = parse_versioned_payload(req)?;
+        let zone = self
+            .zones
+            .write()
+            .await
+            .set_eq_engaged(&payload.id, payload.engaged)
+            .map_err(|r| Self::zone_refused(req, r))?;
+        self.persist_zones().await;
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            id = %zone.id,
+            engaged = zone.eq.engaged,
+            "zone eq engaged set"
+        );
+        encode(
+            req,
+            &ZoneResponse {
+                v: PAYLOAD_VERSION,
+                zone,
+            },
+        )
+    }
+
+    /// `zone.set_eq_band` — one band of one zone's EQ. Answers
+    /// the zone. Stores and answers; renders nothing.
+    async fn handle_zone_set_eq_band(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: ZoneSetEqBandRequest = parse_versioned_payload(req)?;
+        let zone = self
+            .zones
+            .write()
+            .await
+            .set_eq_band(
+                &payload.id,
+                payload.index,
+                zones::EqBand {
+                    freq_hz: payload.freq_hz,
+                    gain_db: payload.gain_db,
+                    q: payload.q,
+                },
+            )
+            .map_err(|r| Self::zone_refused(req, r))?;
+        self.persist_zones().await;
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            id = %zone.id,
+            index = payload.index,
+            "zone eq band set"
+        );
+        encode(
+            req,
+            &ZoneResponse {
+                v: PAYLOAD_VERSION,
+                zone,
+            },
+        )
+    }
+
     /// `zone.list` — every zone, in id order. Reads the registry
     /// and changes nothing.
     async fn handle_zone_list(
@@ -2664,6 +2736,39 @@ struct ZoneResponse {
 struct ZoneListResponse {
     v: u32,
     zones: Vec<Zone>,
+}
+
+/// `zone.set_eq_engaged` request.
+#[derive(Debug, Deserialize)]
+struct ZoneSetEqEngagedRequest {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    id: String,
+    engaged: bool,
+}
+
+impl HasPayloadVersion for ZoneSetEqEngagedRequest {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+/// `zone.set_eq_band` request: one band of one zone.
+#[derive(Debug, Deserialize)]
+struct ZoneSetEqBandRequest {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    id: String,
+    index: u32,
+    freq_hz: u32,
+    gain_db: f32,
+    q: f32,
+}
+
+impl HasPayloadVersion for ZoneSetEqBandRequest {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
 }
 
 // ===== wire payload types =====
@@ -3107,8 +3212,14 @@ mod tests {
     /// set. Both manifests.
     #[test]
     fn zone_verbs_are_the_zones_stocking_and_not_the_delivery_one() {
-        const ZONE_VERBS: &[&str] =
-            &["zone.add", "zone.update", "zone.remove", "zone.list"];
+        const ZONE_VERBS: &[&str] = &[
+            "zone.add",
+            "zone.update",
+            "zone.remove",
+            "zone.list",
+            "zone.set_eq_engaged",
+            "zone.set_eq_band",
+        ];
         for (name, toml) in [
             ("manifest.toml", MANIFEST_TOML),
             ("manifest.oop.toml", include_str!("../manifest.oop.toml")),
@@ -4771,7 +4882,7 @@ pcm.evo {
             .unwrap();
         assert_eq!(
             z["zone"],
-            json!({ "id": "zone:1", "name": "Down", "logical_output_ids": ["logical:1"] })
+            json!({ "id": "zone:1", "name": "Down", "logical_output_ids": ["logical:1"], "eq": flat_eq() })
         );
         let err = rig
             .call(
@@ -4820,8 +4931,8 @@ pcm.evo {
         assert_eq!(
             listed["zones"],
             json!([
-                { "id": "zone:1", "name": "Down", "logical_output_ids": ["logical:1"] },
-                { "id": "zone:2", "name": "Up", "logical_output_ids": ["logical:2"] },
+                { "id": "zone:1", "name": "Down", "logical_output_ids": ["logical:1"], "eq": flat_eq() },
+                { "id": "zone:2", "name": "Up", "logical_output_ids": ["logical:2"], "eq": flat_eq() },
             ])
         );
         // Named twice in one list is refused too.
@@ -4848,7 +4959,7 @@ pcm.evo {
             .unwrap();
         assert_eq!(
             removed["zone"],
-            json!({ "id": "zone:1", "name": "Down", "logical_output_ids": ["logical:1", "logical:2"] })
+            json!({ "id": "zone:1", "name": "Down", "logical_output_ids": ["logical:1", "logical:2"], "eq": flat_eq() })
         );
         assert_eq!(
             rig.snapshot_outputs().await,
@@ -4925,7 +5036,7 @@ pcm.evo {
             .unwrap();
         assert_eq!(
             u["zone"],
-            json!({ "id": "zone:1", "name": "Ground", "logical_output_ids": ["logical:2", "logical:1"] })
+            json!({ "id": "zone:1", "name": "Ground", "logical_output_ids": ["logical:2", "logical:1"], "eq": flat_eq() })
         );
     }
 
@@ -4965,7 +5076,7 @@ pcm.evo {
         .unwrap();
         assert_eq!(
             listed["zones"],
-            json!([{ "id": "zone:2", "name": "Up", "logical_output_ids": ["logical:2"] }])
+            json!([{ "id": "zone:2", "name": "Up", "logical_output_ids": ["logical:2"], "eq": flat_eq() }])
         );
         let err = again
             .handle_request(&request("zone.add", json!({ "v": 1, "name": "Porch", "logical_output_ids": ["logical:2"] })))
@@ -5108,6 +5219,226 @@ pcm.evo {
             assert!(
                 rig.plugin.logical.try_write().is_ok(),
                 "{verb} keeps the logical lock after answering"
+            );
+        }
+    }
+
+    // ----- zone EQ: stored and answered, not rendered -----
+
+    fn flat_eq() -> Value {
+        let band = json!({ "freq_hz": 1000, "gain_db": 0.0, "q": 1.0 });
+        json!({ "engaged": false, "bands": vec![band; 10] })
+    }
+
+    /// A band write on one zone changes that zone's band and
+    /// nothing else: not the other zone, not the name, not the
+    /// membership, not the other bands, not the options EQ (the
+    /// plugin has no path to it: no mixer call, no drop-in, no
+    /// dispatch). Every zone answer carries the EQ, and a new
+    /// zone starts flat and off.
+    #[tokio::test]
+    async fn a_band_write_on_one_zone_changes_nothing_else() {
+        let rig = OutputRig::new().await.with_zones().await;
+        let d = rig
+            .call("zone.add", json!({ "v": 1, "name": "Down", "logical_output_ids": ["logical:1"] }))
+            .await
+            .unwrap();
+        assert_eq!(
+            d["zone"]["eq"],
+            flat_eq(),
+            "a new zone starts flat and off"
+        );
+        let u = rig
+            .call("zone.add", json!({ "v": 1, "name": "Up", "logical_output_ids": ["logical:2"] }))
+            .await
+            .unwrap();
+
+        let e = rig
+            .call(
+                "zone.set_eq_engaged",
+                json!({ "v": 1, "id": "zone:1", "engaged": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(e["zone"]["eq"]["engaged"], true);
+        assert_eq!(e["zone"]["name"], "Down");
+        let b = rig
+            .call("zone.set_eq_band", json!({ "v": 1, "id": "zone:1", "index": 2, "freq_hz": 120, "gain_db": -3.0, "q": 1.4 }))
+            .await
+            .unwrap();
+        assert_eq!(
+            b["zone"]["eq"]["bands"][2],
+            json!({ "freq_hz": 120, "gain_db": -3.0, "q": 1.4 })
+        );
+        assert_eq!(b["zone"]["eq"]["engaged"], true, "the flag stays");
+        assert_eq!(b["zone"]["name"], "Down");
+        assert_eq!(b["zone"]["logical_output_ids"], json!(["logical:1"]));
+        for i in (0..10).filter(|i| *i != 2) {
+            assert_eq!(
+                b["zone"]["eq"]["bands"][i],
+                json!({ "freq_hz": 1000, "gain_db": 0.0, "q": 1.0 }),
+                "band {i} stays"
+            );
+        }
+
+        let listed = rig.call("zone.list", json!({ "v": 1 })).await.unwrap();
+        assert_eq!(
+            listed["zones"][1], u["zone"],
+            "the other zone is untouched, EQ included"
+        );
+        assert_eq!(listed["zones"][0], b["zone"], "the list carries the EQ");
+
+        // Renaming leaves the EQ; the update answer carries it.
+        let r = rig
+            .call(
+                "zone.update",
+                json!({ "v": 1, "id": "zone:1", "name": "Ground" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r["zone"]["eq"], b["zone"]["eq"]);
+
+        // No path to the options EQ or the chain was taken.
+        assert!(rig.mixer.calls.lock().unwrap().is_empty());
+        assert_eq!(rig.drop_in().await, "");
+    }
+
+    /// Unknown zone, index out of range, and each field out of
+    /// range are refused; the refusal names the field; the zone
+    /// stays as it was.
+    #[tokio::test]
+    async fn an_eq_refusal_names_the_field_and_changes_nothing() {
+        let rig = OutputRig::new().await.with_zones().await;
+        rig.call("zone.add", json!({ "v": 1, "name": "Down", "logical_output_ids": ["logical:1"] }))
+            .await
+            .unwrap();
+        let before = rig.call("zone.list", json!({ "v": 1 })).await.unwrap();
+        let err = rig
+            .call(
+                "zone.set_eq_engaged",
+                json!({ "v": 1, "id": "zone:9", "engaged": true }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown zone"), "{err}");
+        let err = rig
+            .call("zone.set_eq_band", json!({ "v": 1, "id": "zone:1", "index": 10, "freq_hz": 1000, "gain_db": 0.0, "q": 1.0 }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("band index 10 is out of range"), "{err}");
+        for (payload, field) in [
+            (
+                json!({ "freq_hz": 19, "gain_db": 0.0, "q": 1.0 }),
+                "freq_hz",
+            ),
+            (
+                json!({ "freq_hz": 1000, "gain_db": 15.5, "q": 1.0 }),
+                "gain_db",
+            ),
+            (json!({ "freq_hz": 1000, "gain_db": 0.0, "q": 31.0 }), "q"),
+        ] {
+            let mut p = payload.clone();
+            p["v"] = json!(1);
+            p["id"] = json!("zone:1");
+            p["index"] = json!(0);
+            let err = rig.call("zone.set_eq_band", p).await.unwrap_err();
+            assert!(err.contains(&format!("{field} ")), "{field}: {err}");
+            assert!(err.contains("out of range"), "{err}");
+        }
+        assert_eq!(
+            rig.call("zone.list", json!({ "v": 1 })).await.unwrap(),
+            before
+        );
+    }
+
+    /// The EQ survives a restart, and a zones file written before
+    /// the EQ existed loads with the default EQ.
+    #[tokio::test]
+    async fn the_zone_eq_survives_a_restart_and_an_old_file_loads_flat() {
+        let rig = OutputRig::new().await.with_zones().await;
+        rig.call("zone.add", json!({ "v": 1, "name": "Down", "logical_output_ids": ["logical:1"] }))
+            .await
+            .unwrap();
+        rig.call("zone.set_eq_band", json!({ "v": 1, "id": "zone:1", "index": 9, "freq_hz": 12000, "gain_db": 2.5, "q": 0.5 }))
+            .await
+            .unwrap();
+        let again = |dir: PathBuf| async move {
+            let mut p = loaded_plugin().await;
+            p.install_zones(dir.join(ZoneStore::FILE_NAME)).await;
+            p
+        };
+        let p = again(rig.dir.path().to_path_buf()).await;
+        let v: Value = serde_json::from_slice(
+            &p.handle_request(&request("zone.list", json!({ "v": 1 })))
+                .await
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
+        assert_eq!(
+            v["zones"][0]["eq"]["bands"][9],
+            json!({ "freq_hz": 12000, "gain_db": 2.5, "q": 0.5 })
+        );
+
+        tokio::fs::write(
+            rig.dir.path().join(ZoneStore::FILE_NAME),
+            "v = 1\nnext_id = 2\n\n[[zones]]\nid = \"zone:1\"\nname = \"Old\"\nlogical_output_ids = [\"logical:1\"]\n",
+        )
+        .await
+        .unwrap();
+        let p = again(rig.dir.path().to_path_buf()).await;
+        let v: Value = serde_json::from_slice(
+            &p.handle_request(&request("zone.list", json!({ "v": 1 })))
+                .await
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
+        assert_eq!(
+            v["zones"][0]["eq"],
+            flat_eq(),
+            "an old file loads with the default EQ"
+        );
+    }
+
+    /// The zone EQ is stored and answered and nothing more: the
+    /// zone store and the two handlers reach no mixer, no
+    /// drop-in, no dispatcher, no subject and no options verb.
+    #[test]
+    fn the_zone_eq_is_not_rendered() {
+        // Code only: a comment may say "renders nothing".
+        fn code(src: &str) -> String {
+            src.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        let zones = code(
+            include_str!("zones.rs")
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap(),
+        );
+        let lib = include_str!("lib.rs");
+        let start = lib.find("async fn handle_zone_set_eq_engaged").unwrap();
+        let end = lib[start..].find("/// `zone.list` — every zone").unwrap();
+        let handlers = code(&lib[start..start + end]);
+        for forbidden in [
+            "options.",
+            "amixer",
+            "drop_in",
+            "render",
+            "mixer",
+            "dispatch(",
+            "announce(",
+            "emit_plugin_event",
+            "eq_only",
+            "softvol",
+        ] {
+            assert!(!zones.contains(forbidden), "zones.rs names {forbidden:?}");
+            assert!(
+                !handlers.contains(forbidden),
+                "the eq handlers name {forbidden:?}"
             );
         }
     }

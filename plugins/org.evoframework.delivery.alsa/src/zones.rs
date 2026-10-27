@@ -19,9 +19,19 @@
 //! leaves its logical outputs and the physical outputs as they
 //! are.
 //!
+//! A zone also carries its own EQ beside its name and
+//! membership: an `engaged` flag that starts false and exactly
+//! [`EQ_BAND_COUNT`] bands, each a centre frequency, a gain and
+//! a Q in the ranges the global EQ uses, starting flat.
+//! `zone.set_eq_engaged` and `zone.set_eq_band` set it; every
+//! zone answer carries it. This store keeps the EQ and answers
+//! it; nothing here renders it, and `eq_only` stays the one
+//! pipe. A zone file written before the EQ existed loads with
+//! the default EQ.
+//!
 //! Zones survive a restart in `zones.toml` under the plugin's
-//! state directory. No subject is published. No EQ is attached
-//! to a zone and no scene is stored.
+//! state directory. No subject is published. No scene is
+//! stored.
 
 use std::path::{Path, PathBuf};
 
@@ -35,6 +45,23 @@ pub(crate) const NAME_MAX_CHARS: usize = 64;
 
 /// Prefix of every zone id.
 pub(crate) const ID_PREFIX: &str = "zone:";
+
+/// How many bands a zone's EQ has. The same count and the same
+/// ranges as the global EQ on `audio.options`, restated here
+/// because the delivery plugin does not link the options plugin.
+pub(crate) const EQ_BAND_COUNT: usize = 10;
+/// Lowest centre frequency, Hz.
+pub(crate) const EQ_BAND_FREQ_MIN: u32 = 20;
+/// Highest centre frequency, Hz.
+pub(crate) const EQ_BAND_FREQ_MAX: u32 = 20_000;
+/// Lowest gain, dB.
+pub(crate) const EQ_BAND_GAIN_MIN_DB: f32 = -15.0;
+/// Highest gain, dB.
+pub(crate) const EQ_BAND_GAIN_MAX_DB: f32 = 15.0;
+/// Lowest Q.
+pub(crate) const EQ_BAND_Q_MIN: f32 = 0.1;
+/// Highest Q.
+pub(crate) const EQ_BAND_Q_MAX: f32 = 30.0;
 
 /// Why a verb was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +94,17 @@ pub(crate) enum Refusal {
     },
     /// An update that names neither a new name nor new outputs.
     NothingToUpdate,
+    /// A band index outside `0..EQ_BAND_COUNT`.
+    BandIndexOutOfRange(u32),
+    /// A band field outside its range; names the field.
+    BandFieldOutOfRange {
+        /// `freq_hz`, `gain_db` or `q`.
+        field: &'static str,
+        /// What was asked for, as written.
+        got: String,
+        /// The range, as written.
+        range: String,
+    },
 }
 
 impl std::fmt::Display for Refusal {
@@ -103,12 +141,74 @@ impl std::fmt::Display for Refusal {
                 f,
                 "update names neither a new name nor new logical outputs"
             ),
+            Refusal::BandIndexOutOfRange(i) => write!(
+                f,
+                "band index {i} is out of range; 0 through {}",
+                EQ_BAND_COUNT - 1
+            ),
+            Refusal::BandFieldOutOfRange { field, got, range } => {
+                write!(f, "{field} {got} is out of range; {range}")
+            }
         }
     }
 }
 
+/// One EQ band: centre frequency, gain and Q.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub(crate) struct EqBand {
+    /// Centre frequency in Hz, 20 through 20000.
+    pub(crate) freq_hz: u32,
+    /// Gain in dB, -15.0 through 15.0; 0 is flat.
+    pub(crate) gain_db: f32,
+    /// Quality factor, 0.1 through 30.0.
+    pub(crate) q: f32,
+}
+
+impl Default for EqBand {
+    fn default() -> Self {
+        Self {
+            freq_hz: 1000,
+            gain_db: 0.0,
+            q: 1.0,
+        }
+    }
+}
+
+/// A zone's EQ: engaged or not, and its bands.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ZoneEq {
+    /// Whether the EQ is engaged. Starts false.
+    #[serde(default)]
+    pub(crate) engaged: bool,
+    /// Exactly [`EQ_BAND_COUNT`] bands. A file with fewer is
+    /// padded flat; one with more is cut to the count.
+    #[serde(default = "flat_bands")]
+    pub(crate) bands: Vec<EqBand>,
+}
+
+fn flat_bands() -> Vec<EqBand> {
+    vec![EqBand::default(); EQ_BAND_COUNT]
+}
+
+impl Default for ZoneEq {
+    fn default() -> Self {
+        Self {
+            engaged: false,
+            bands: flat_bands(),
+        }
+    }
+}
+
+impl ZoneEq {
+    /// Exactly [`EQ_BAND_COUNT`] bands, whatever the file held.
+    fn normalised(mut self) -> Self {
+        self.bands.resize(EQ_BAND_COUNT, EqBand::default());
+        self
+    }
+}
+
 /// One zone, as persisted and as answered.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Zone {
     /// Stable id the plugin minted: `zone:<n>`.
     pub(crate) id: String,
@@ -116,10 +216,14 @@ pub(crate) struct Zone {
     pub(crate) name: String,
     /// The logical outputs it holds, in the order given.
     pub(crate) logical_output_ids: Vec<String>,
+    /// The zone's own EQ. Absent in a file written before it
+    /// existed, which loads as the default.
+    #[serde(default)]
+    pub(crate) eq: ZoneEq,
 }
 
 /// The persisted registry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PersistedZones {
     /// State-file version.
     #[serde(default = "state_version")]
@@ -183,8 +287,12 @@ fn clean_name(name: &str) -> Result<String, Refusal> {
 }
 
 impl Zones {
-    /// A registry holding what was persisted.
-    pub(crate) fn from_persisted(state: PersistedZones) -> Self {
+    /// A registry holding what was persisted. Every zone's EQ is
+    /// brought to exactly [`EQ_BAND_COUNT`] bands.
+    pub(crate) fn from_persisted(mut state: PersistedZones) -> Self {
+        for z in &mut state.zones {
+            z.eq = std::mem::take(&mut z.eq).normalised();
+        }
         Self { state }
     }
 
@@ -281,6 +389,7 @@ impl Zones {
             id,
             name,
             logical_output_ids: logical_output_ids.to_vec(),
+            eq: ZoneEq::default(),
         };
         self.state.zones.push(zone.clone());
         Ok(zone)
@@ -326,6 +435,63 @@ impl Zones {
         self.state.zones.iter().find(|z| {
             z.logical_output_ids.iter().any(|l| l == logical_output_id)
         })
+    }
+
+    /// `zone.set_eq_engaged`: the flag, nothing else. An unknown
+    /// zone is refused before any write.
+    pub(crate) fn set_eq_engaged(
+        &mut self,
+        id: &str,
+        engaged: bool,
+    ) -> Result<Zone, Refusal> {
+        let at = self.position(id)?;
+        self.state.zones[at].eq.engaged = engaged;
+        Ok(self.state.zones[at].clone())
+    }
+
+    /// `zone.set_eq_band`: one band of one zone. An unknown zone,
+    /// an index outside the count, and a field outside its range
+    /// are each refused before any write, and the refusal names
+    /// the field. The name, the membership and the other bands
+    /// stay.
+    pub(crate) fn set_eq_band(
+        &mut self,
+        id: &str,
+        index: u32,
+        band: EqBand,
+    ) -> Result<Zone, Refusal> {
+        let at = self.position(id)?;
+        if index as usize >= EQ_BAND_COUNT {
+            return Err(Refusal::BandIndexOutOfRange(index));
+        }
+        if !(EQ_BAND_FREQ_MIN..=EQ_BAND_FREQ_MAX).contains(&band.freq_hz) {
+            return Err(Refusal::BandFieldOutOfRange {
+                field: "freq_hz",
+                got: band.freq_hz.to_string(),
+                range: format!(
+                    "{EQ_BAND_FREQ_MIN} through {EQ_BAND_FREQ_MAX} Hz"
+                ),
+            });
+        }
+        if !(EQ_BAND_GAIN_MIN_DB..=EQ_BAND_GAIN_MAX_DB).contains(&band.gain_db)
+        {
+            return Err(Refusal::BandFieldOutOfRange {
+                field: "gain_db",
+                got: band.gain_db.to_string(),
+                range: format!(
+                    "{EQ_BAND_GAIN_MIN_DB} through {EQ_BAND_GAIN_MAX_DB} dB"
+                ),
+            });
+        }
+        if !(EQ_BAND_Q_MIN..=EQ_BAND_Q_MAX).contains(&band.q) {
+            return Err(Refusal::BandFieldOutOfRange {
+                field: "q",
+                got: band.q.to_string(),
+                range: format!("{EQ_BAND_Q_MIN} through {EQ_BAND_Q_MAX}"),
+            });
+        }
+        self.state.zones[at].eq.bands[index as usize] = band;
+        Ok(self.state.zones[at].clone())
     }
 
     /// `zone.remove`: the zone taken away. Its logical outputs are
@@ -432,6 +598,7 @@ mod tests {
                 id: "zone:1".to_string(),
                 name: "Downstairs".to_string(),
                 logical_output_ids: s(&["logical:2", "logical:1"]),
+                eq: ZoneEq::default(),
             }
         );
         let b = z.add(&known(), "Up", &s(&["logical:3"])).unwrap();
@@ -636,6 +803,7 @@ mod tests {
             id: "zone:1".to_string(),
             name: "Porch".to_string(),
             logical_output_ids: s(&["logical:3"]),
+            eq: ZoneEq::default(),
         };
         persisted.zones.push(p.clone());
         let z = Zones::from_persisted(persisted.clone());
@@ -663,6 +831,135 @@ mod tests {
         );
         z.remove(&d.id).unwrap();
         assert_eq!(z.holder_of("logical:2"), None);
+    }
+
+    fn band(freq_hz: u32, gain_db: f32, q: f32) -> EqBand {
+        EqBand {
+            freq_hz,
+            gain_db,
+            q,
+        }
+    }
+
+    /// A new zone starts with the EQ off and ten flat bands; the
+    /// flag and one band are set on that zone alone, and the
+    /// name and membership stay. An unknown zone is refused.
+    #[test]
+    fn a_zone_starts_flat_and_its_eq_is_its_own() {
+        let mut z = Zones::default();
+        let d = z.add(&known(), "Down", &s(&["logical:1"])).unwrap();
+        let u = z.add(&known(), "Up", &s(&["logical:2"])).unwrap();
+        assert!(!d.eq.engaged);
+        assert_eq!(d.eq.bands.len(), EQ_BAND_COUNT);
+        assert!(d.eq.bands.iter().all(|b| *b == EqBand::default()));
+
+        let d2 = z.set_eq_engaged(&d.id, true).unwrap();
+        assert!(d2.eq.engaged);
+        assert_eq!(
+            (&d2.name, &d2.logical_output_ids),
+            (&d.name, &d.logical_output_ids)
+        );
+        let d3 = z.set_eq_band(&d.id, 3, band(250, -4.5, 2.0)).unwrap();
+        assert_eq!(d3.eq.bands[3], band(250, -4.5, 2.0));
+        assert!(d3.eq.engaged, "the flag stays");
+        assert!(
+            d3.eq
+                .bands
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != 3)
+                .all(|(_, b)| *b == EqBand::default()),
+            "the other bands stay"
+        );
+        assert_eq!(z.list()[1], u, "the other zone is untouched");
+
+        assert_eq!(
+            z.set_eq_engaged("zone:9", true),
+            Err(Refusal::UnknownZone("zone:9".to_string()))
+        );
+        assert_eq!(
+            z.set_eq_band("zone:9", 0, band(1000, 0.0, 1.0)),
+            Err(Refusal::UnknownZone("zone:9".to_string()))
+        );
+    }
+
+    /// Index and fields are refused outside their ranges, the
+    /// refusal names the field, and the zone stays as it was.
+    #[test]
+    fn a_band_outside_its_range_is_refused_naming_the_field() {
+        let mut z = Zones::default();
+        let d = z.add(&known(), "Down", &s(&["logical:1"])).unwrap();
+        assert_eq!(
+            z.set_eq_band(&d.id, 10, band(1000, 0.0, 1.0)),
+            Err(Refusal::BandIndexOutOfRange(10))
+        );
+        for (b, field) in [
+            (band(19, 0.0, 1.0), "freq_hz"),
+            (band(20_001, 0.0, 1.0), "freq_hz"),
+            (band(1000, -15.5, 1.0), "gain_db"),
+            (band(1000, 15.5, 1.0), "gain_db"),
+            (band(1000, 0.0, 0.05), "q"),
+            (band(1000, 0.0, 30.5), "q"),
+        ] {
+            match z.set_eq_band(&d.id, 0, b) {
+                Err(Refusal::BandFieldOutOfRange { field: f, .. }) => {
+                    assert_eq!(f, field, "{b:?}")
+                }
+                other => panic!("{b:?}: {other:?}"),
+            }
+        }
+        assert_eq!(z.list()[0], d, "a refused band changes nothing");
+        // The edges are in range.
+        assert!(z.set_eq_band(&d.id, 0, band(20, -15.0, 0.1)).is_ok());
+        assert!(z.set_eq_band(&d.id, 9, band(20_000, 15.0, 30.0)).is_ok());
+    }
+
+    /// Renaming or re-pointing a zone leaves its EQ; the EQ
+    /// survives the store, and a file written before the EQ
+    /// existed loads as the default.
+    #[tokio::test]
+    async fn the_eq_survives_update_and_the_store_and_an_old_file_loads_flat() {
+        let mut z = Zones::default();
+        let d = z.add(&known(), "Down", &s(&["logical:1"])).unwrap();
+        z.set_eq_engaged(&d.id, true).unwrap();
+        z.set_eq_band(&d.id, 1, band(80, 3.0, 0.7)).unwrap();
+        let renamed = z
+            .update(&known(), &d.id, Some("Ground"), Some(&s(&["logical:2"])))
+            .unwrap();
+        assert!(renamed.eq.engaged);
+        assert_eq!(renamed.eq.bands[1], band(80, 3.0, 0.7));
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ZoneStore::at(dir.path().join(ZoneStore::FILE_NAME));
+        store.save(z.persisted()).await.unwrap();
+        let back = Zones::from_persisted(store.load().await);
+        assert_eq!(back.list(), z.list());
+
+        tokio::fs::write(
+            store.path(),
+            "v = 1\nnext_id = 2\n\n[[zones]]\nid = \"zone:1\"\nname = \"Old\"\nlogical_output_ids = [\"logical:1\"]\n",
+        )
+        .await
+        .unwrap();
+        let old = Zones::from_persisted(store.load().await);
+        assert_eq!(old.list().len(), 1);
+        assert_eq!(
+            old.list()[0].eq,
+            ZoneEq::default(),
+            "an old file loads with the default EQ"
+        );
+
+        // A file with too few bands is padded; too many is cut.
+        tokio::fs::write(
+            store.path(),
+            "v = 1\nnext_id = 2\n\n[[zones]]\nid = \"zone:1\"\nname = \"Old\"\nlogical_output_ids = [\"logical:1\"]\n\n[zones.eq]\nengaged = true\nbands = [{ freq_hz = 50, gain_db = 1.0, q = 1.0 }]\n",
+        )
+        .await
+        .unwrap();
+        let short = Zones::from_persisted(store.load().await);
+        assert_eq!(short.list()[0].eq.bands.len(), EQ_BAND_COUNT);
+        assert_eq!(short.list()[0].eq.bands[0], band(50, 1.0, 1.0));
+        assert!(short.list()[0].eq.engaged);
     }
 
     /// The store round-trips, keeps `next_id`, and tolerates an

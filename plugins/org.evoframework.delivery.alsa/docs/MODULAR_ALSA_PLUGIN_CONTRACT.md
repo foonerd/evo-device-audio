@@ -129,6 +129,18 @@ holds, in the order given.
   the freed logical outputs may join another zone.
 - `zone.list {}`: every zone, in id order; an empty set is an
   empty list. Reads only.
+- `zone.set_eq_engaged { id, engaged }` and
+  `zone.set_eq_band { id, index, freq_hz, gain_db, q }`: the
+  zone's own EQ, stored beside its name and membership. The
+  flag starts false; there are exactly 10 bands, each
+  `freq_hz` 20 through 20000, `gain_db` -15.0 through 15.0, `q`
+  0.1 through 30.0 (the global EQ's ranges), starting at 1000
+  Hz, 0 dB, Q 1.0. An unknown zone, an index outside 0 through
+  9, and a field outside its range are refused before any
+  write, naming the field. Every zone answer carries the EQ.
+  A zones file written before the EQ existed loads with the
+  default. The EQ is stored and answered only: nothing here
+  renders it, and `eq_only` stays the one pipe.
 
 `zone.add` and `zone.update` hold the logical-output read lock
 from the membership check through the zone write, and
@@ -138,8 +150,9 @@ logical-then-zones. A logical output therefore cannot be removed
 between a zone's membership check and its write, and a zone
 cannot take an id between the removal's check and its removal.
 
-Zones move no audio, no mixer and no drop-in. No EQ is attached
-to a zone and no scene is stored; `eq_only` stays the one EQ.
+Zones move no audio, no mixer and no drop-in. A zone's EQ is
+stored, not rendered; no scene is stored; `eq_only` stays the one
+pipe.
 Zones survive a restart in `<state_dir>/zones.toml`. No subject
 is published. The four verbs are this plugin's `audio.zones`
 stocking at shape 1; every other verb is its `audio.delivery`
@@ -215,6 +228,8 @@ For plugin-level verification, confirm:
     logical output and no physical output
 12. a logical output a zone holds cannot be removed, and the
     refusal names the zone
+13. a band write on one zone changes no other zone and reaches
+    no mixer, drop-in, dispatcher or options verb
 
 ## Cross-reference map
 
