@@ -744,6 +744,13 @@ name = "audio_multiroom_local_role"
 [[subjects]]
 name = "audio_delivery_outputs"
 
+# Which zone's EQ the one eq_only cascade hears, published by
+# the delivery plugin on evo.audio.zones / eq_claim. The two
+# payload shapes are declared on the audio.zones shelf
+# (zones.v1.toml); this is the name only.
+[[subjects]]
+name = "audio_zone_eq_claim"
+
 # Subject types the hardware.audio-config plugin announces
 # at admission. capabilities carries the resolved DAC class
 # list + per-class instances + per-instance mixer-type
