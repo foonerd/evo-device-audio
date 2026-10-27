@@ -45,6 +45,10 @@ request_types = [
     "zone.list",
     "zone.set_eq_engaged",
     "zone.set_eq_band",
+    "scene.save",
+    "scene.list",
+    "scene.recall",
+    "scene.remove",
 ]
 
 [kind]
@@ -124,6 +128,10 @@ request_types = [
     "zone.list",
     "zone.set_eq_engaged",
     "zone.set_eq_band",
+    "scene.save",
+    "scene.list",
+    "scene.recall",
+    "scene.remove",
 ]
 response_budget_ms = 5000
 

@@ -94,6 +94,14 @@ pub(crate) enum Refusal {
     },
     /// An update that names neither a new name nor new outputs.
     NothingToUpdate,
+    /// A recalled snapshot names one logical output in two of its
+    /// zones.
+    SnapshotSharesLogicalOutput {
+        /// The logical output named twice.
+        logical_output_id: String,
+        /// The two zones that name it.
+        zones: (String, String),
+    },
     /// A band index outside `0..EQ_BAND_COUNT`.
     BandIndexOutOfRange(u32),
     /// A band field outside its range; names the field.
@@ -140,6 +148,15 @@ impl std::fmt::Display for Refusal {
             Refusal::NothingToUpdate => write!(
                 f,
                 "update names neither a new name nor new logical outputs"
+            ),
+            Refusal::SnapshotSharesLogicalOutput {
+                logical_output_id,
+                zones,
+            } => write!(
+                f,
+                "the snapshot names logical output {logical_output_id:?} in \
+                 both {:?} and {:?}; a logical output is in one zone at most",
+                zones.0, zones.1
             ),
             Refusal::BandIndexOutOfRange(i) => write!(
                 f,
@@ -492,6 +509,60 @@ impl Zones {
         }
         self.state.zones[at].eq.bands[index as usize] = band;
         Ok(self.state.zones[at].clone())
+    }
+
+    /// `scene.recall`: replace every live zone with the snapshot.
+    /// Refused before any write when a zone of the snapshot names
+    /// a logical output the plugin does not have, or names one
+    /// twice, or when two zones of the snapshot share one. On a
+    /// refusal the live zones stay as they were. An empty
+    /// snapshot clears the live zones. The restored zones keep
+    /// their ids; `next_id` becomes one past the highest present
+    /// and never moves backward. Every EQ is brought to exactly
+    /// [`EQ_BAND_COUNT`] bands.
+    pub(crate) fn recall(
+        &mut self,
+        known_logical: &[String],
+        snapshot: &[Zone],
+    ) -> Result<(), Refusal> {
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        for z in snapshot {
+            if z.logical_output_ids.is_empty() {
+                return Err(Refusal::NoLogicalOutputs);
+            }
+            for (i, id) in z.logical_output_ids.iter().enumerate() {
+                if !known_logical.iter().any(|k| k == id) {
+                    return Err(Refusal::UnknownLogicalOutput(id.clone()));
+                }
+                if z.logical_output_ids[..i].contains(id) {
+                    return Err(Refusal::DuplicateLogicalOutput(id.clone()));
+                }
+                if let Some((_, holder)) = seen.iter().find(|(l, _)| *l == id) {
+                    return Err(Refusal::SnapshotSharesLogicalOutput {
+                        logical_output_id: id.clone(),
+                        zones: (holder.to_string(), z.id.clone()),
+                    });
+                }
+                seen.push((id.as_str(), z.id.as_str()));
+            }
+        }
+        let highest = snapshot
+            .iter()
+            .map(|z| id_number(&z.id).0)
+            .filter(|n| *n != u64::MAX)
+            .max()
+            .map(|n| n + 1)
+            .unwrap_or(1);
+        self.state.zones = snapshot
+            .iter()
+            .cloned()
+            .map(|mut z| {
+                z.eq = z.eq.normalised();
+                z
+            })
+            .collect();
+        self.state.next_id = self.state.next_id.max(highest);
+        Ok(())
     }
 
     /// `zone.remove`: the zone taken away. Its logical outputs are
@@ -960,6 +1031,82 @@ mod tests {
         assert_eq!(short.list()[0].eq.bands.len(), EQ_BAND_COUNT);
         assert_eq!(short.list()[0].eq.bands[0], band(50, 1.0, 1.0));
         assert!(short.list()[0].eq.engaged);
+    }
+
+    /// Recall replaces the live zones, keeps the snapshot's ids,
+    /// moves `next_id` forward and never backward, and clears the
+    /// zones on an empty snapshot.
+    #[test]
+    fn recall_replaces_the_zones_and_next_id_never_moves_backward() {
+        let mut z = Zones::default();
+        z.add(&known(), "Down", &s(&["logical:1"])).unwrap();
+        z.add(&known(), "Up", &s(&["logical:2"])).unwrap();
+        z.set_eq_engaged("zone:1", true).unwrap();
+        let snapshot = z.list();
+        z.remove("zone:1").unwrap();
+        z.add(&known(), "Porch", &s(&["logical:3"])).unwrap();
+        assert_eq!(z.persisted().next_id, 4);
+        z.recall(&known(), &snapshot).unwrap();
+        assert_eq!(
+            z.list(),
+            snapshot,
+            "the snapshot's zones, ids and eq, are live"
+        );
+        assert_eq!(z.persisted().next_id, 4, "next_id did not move backward");
+        let big = vec![Zone {
+            id: "zone:9".to_string(),
+            name: "Nine".to_string(),
+            logical_output_ids: s(&["logical:1"]),
+            eq: ZoneEq::default(),
+        }];
+        z.recall(&known(), &big).unwrap();
+        assert_eq!(z.persisted().next_id, 10, "one past the highest present");
+        let added = z.add(&known(), "Ten", &s(&["logical:2"])).unwrap();
+        assert_eq!(added.id, "zone:10");
+        z.recall(&known(), &[]).unwrap();
+        assert!(z.list().is_empty(), "an empty snapshot clears the zones");
+        assert_eq!(z.persisted().next_id, 11);
+    }
+
+    /// A snapshot naming an unknown logical output, one twice in
+    /// a zone, or one in two zones is refused before any write.
+    #[test]
+    fn a_bad_snapshot_is_refused_before_any_write() {
+        let mut z = Zones::default();
+        z.add(&known(), "Down", &s(&["logical:1"])).unwrap();
+        let before = z.persisted().clone();
+        let zone = |id: &str, ids: &[&str]| Zone {
+            id: id.to_string(),
+            name: id.to_string(),
+            logical_output_ids: s(ids),
+            eq: ZoneEq::default(),
+        };
+        assert_eq!(
+            z.recall(&known(), &[zone("zone:5", &["logical:9"])]),
+            Err(Refusal::UnknownLogicalOutput("logical:9".to_string()))
+        );
+        assert_eq!(
+            z.recall(&known(), &[zone("zone:5", &["logical:1", "logical:1"])]),
+            Err(Refusal::DuplicateLogicalOutput("logical:1".to_string()))
+        );
+        assert_eq!(
+            z.recall(
+                &known(),
+                &[
+                    zone("zone:5", &["logical:1"]),
+                    zone("zone:6", &["logical:2", "logical:1"])
+                ]
+            ),
+            Err(Refusal::SnapshotSharesLogicalOutput {
+                logical_output_id: "logical:1".to_string(),
+                zones: ("zone:5".to_string(), "zone:6".to_string()),
+            })
+        );
+        assert_eq!(
+            z.recall(&known(), &[zone("zone:5", &[])]),
+            Err(Refusal::NoLogicalOutputs)
+        );
+        assert_eq!(z.persisted(), &before, "a refused recall changed nothing");
     }
 
     /// The store round-trips, keeps `next_id`, and tolerates an

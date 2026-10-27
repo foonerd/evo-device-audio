@@ -154,6 +154,34 @@ Zones move no audio, no mixer and no drop-in. A zone's EQ is
 stored here, not rendered here; no scene is stored; `eq_only`
 in composition.alsa stays the one pipe and the one cascade.
 
+### Scenes
+
+A scene is a name and a snapshot of every zone: id, name,
+membership and EQ. It holds nothing else: not the playing
+terminus, not the options EQ, not the logical outputs.
+
+- `scene.save { name }`: the zones as they are, under the name.
+  The name is trimmed, non-empty, at most 64 characters, and
+  unique among scenes without regard to case; a scene of that
+  name is replaced in place. At most 32 scenes: the 33rd is
+  refused and nothing is written. Answers the scene.
+- `scene.list {}`: the names, in the order first saved; an empty
+  set is an empty list.
+- `scene.recall { name }`: the live zones are replaced by the
+  snapshot, ids kept; `next_id` becomes one past the highest
+  present and never moves backward; an empty snapshot clears the
+  zones. An unknown name, a snapshot naming a logical output the
+  plugin does not have, one twice in a zone, or one in two
+  zones is refused before any write, and the live zones stay.
+  The logical outputs, the physical outputs and the options EQ
+  stay. The EQ claim is published again. Answers the scene.
+- `scene.remove { name }`: the scene taken away; the live zones
+  stay. Answers it.
+
+Scenes survive a restart in `<state_dir>/scenes.toml`. A missing
+file is no scenes; a file that does not parse is no scenes, and
+the live zones stay.
+
 ### The zone EQ claim
 
 The plugin publishes one subject, `evo.audio.zones` /
@@ -189,6 +217,8 @@ stocking at shape 2. The manifest declares both as
   (plugin-owned; names, ids and the next id to mint)
 - Zones: `<state_dir>/zones.toml` (plugin-owned; names, ids,
   logical output ids and the next id to mint)
+- Scenes: `<state_dir>/scenes.toml` (plugin-owned; named
+  snapshots of the zones)
 
 One writer per surface is mandatory. The options observer and
 the output verbs write the drop-in through one renderer under
@@ -224,6 +254,12 @@ one lock.
   - refuse at responder boundary; nothing moves
 - unreadable or malformed `zones.toml`:
   - warn, start with no zones
+- unknown scene, empty or over-long scene name, a 33rd scene,
+  a snapshot naming an unknown logical output or one in two
+  zones:
+  - refuse at responder boundary; the live zones stay
+- unreadable or malformed `scenes.toml`:
+  - warn, start with no scenes; the live zones stay
 
 ## Verification expectations
 
@@ -252,6 +288,9 @@ For plugin-level verification, confirm:
 14. the claim follows the terminus and the one engaged zone;
     two engaged zones on one terminus do not claim; a band write
     on a zone without the claim publishes nothing new
+15. a refused recall changes no zone; a recall changes no
+    logical output and no options EQ; the 33rd scene is refused
+    and nothing is written
 
 ## Cross-reference map
 

@@ -85,6 +85,7 @@ mod eq_claim;
 mod logical_outputs;
 mod options_render;
 mod outputs;
+mod scenes;
 mod zones;
 
 use std::future::Future;
@@ -110,6 +111,7 @@ use options_render::OptionsSettings;
 use outputs::{
     Effect, GlobalMixer, OutputPolicy, OutputSnapshot, OutputStateStore,
 };
+use scenes::{Scene, SceneStore, Scenes};
 use zones::{Zone, ZoneStore, Zones};
 
 pub mod alsa_cards;
@@ -177,6 +179,10 @@ const REQUEST_TYPES: &[&str] = &[
     "zone.list",
     "zone.set_eq_engaged",
     "zone.set_eq_band",
+    "scene.save",
+    "scene.list",
+    "scene.recall",
+    "scene.remove",
 ];
 
 /// Subject scheme + value for the resolved-outputs surface.
@@ -320,13 +326,18 @@ pub struct AlsaDeliveryPlugin {
     /// Persistence for the zones. `Some` after load named the
     /// state directory.
     zones_state: Option<ZoneStore>,
+    /// Scenes: a name and a snapshot of every zone.
+    scenes: Arc<RwLock<Scenes>>,
+    /// Persistence for the scenes. `Some` after load named the
+    /// state directory.
+    scenes_state: Option<SceneStore>,
     /// The last zone EQ claim published, so an unchanged claim is
     /// not republished.
     eq_claim_published: Arc<RwLock<Option<serde_json::Value>>>,
 }
 
 /// The operator's options as last observed, and where from.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct LastOptions {
     settings: OptionsSettings,
     subject_canonical_id: String,
@@ -829,6 +840,8 @@ impl AlsaDeliveryPlugin {
             logical_state: None,
             zones: Arc::new(RwLock::new(Zones::default())),
             zones_state: None,
+            scenes: Arc::new(RwLock::new(Scenes::default())),
+            scenes_state: None,
             eq_claim_published: Arc::new(RwLock::new(None)),
         }
     }
@@ -905,6 +918,31 @@ impl AlsaDeliveryPlugin {
         let persisted = store.load().await;
         *self.zones.write().await = Zones::from_persisted(persisted);
         self.zones_state = Some(store);
+    }
+
+    /// Point the scenes file somewhere and read it.
+    async fn install_scenes(&mut self, path: PathBuf) {
+        let store = SceneStore::at(path);
+        let persisted = store.load().await;
+        *self.scenes.write().await = Scenes::from_persisted(persisted);
+        self.scenes_state = Some(store);
+    }
+
+    /// Write the scenes. A failed write is logged, not refused.
+    async fn persist_scenes(&self) {
+        let Some(store) = self.scenes_state.as_ref() else {
+            return;
+        };
+        let scenes = self.scenes.read().await;
+        if let Err(e) = store.save(scenes.persisted()).await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                path = %store.path().display(),
+                error = %e,
+                "scenes could not be written; scenes will not survive a \
+                 restart"
+            );
+        }
     }
 
     /// Write the zones. A failed write is logged, not refused:
@@ -1844,6 +1882,8 @@ impl Plugin for AlsaDeliveryPlugin {
             .await;
             self.install_zones(ctx.state_dir.join(ZoneStore::FILE_NAME))
                 .await;
+            self.install_scenes(ctx.state_dir.join(SceneStore::FILE_NAME))
+                .await;
             // Spawn the route-change reactor. The framework's
             // audio_topology_store publishes topology rewires
             // via every plugin's RouteChangeCallback; the
@@ -2004,6 +2044,10 @@ impl Respondent for AlsaDeliveryPlugin {
                     self.handle_zone_set_eq_engaged(req).await
                 }
                 "zone.set_eq_band" => self.handle_zone_set_eq_band(req).await,
+                "scene.save" => self.handle_scene_save(req).await,
+                "scene.list" => self.handle_scene_list(req).await,
+                "scene.recall" => self.handle_scene_recall(req).await,
+                "scene.remove" => self.handle_scene_remove(req).await,
                 other => Err(PluginError::Permanent(format!(
                     "request type {other:?} declared but no handler wired; \
                      manifest/runtime drift bug"
@@ -2629,6 +2673,124 @@ impl AlsaDeliveryPlugin {
         )
     }
 
+    fn scene_refused(req: &Request, r: scenes::Refusal) -> PluginError {
+        PluginError::Permanent(format!("{}: {r}", req.request_type))
+    }
+
+    /// `scene.save` — the zones as they are, under a name. A
+    /// scene of that name is replaced. Answers the scene.
+    async fn handle_scene_save(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SceneNameRequest = parse_versioned_payload(req)?;
+        let zones = self.zones.read().await.list();
+        let scene = self
+            .scenes
+            .write()
+            .await
+            .save(&payload.name, zones)
+            .map_err(|r| Self::scene_refused(req, r))?;
+        self.persist_scenes().await;
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            name = %scene.name,
+            zones = scene.zones.len(),
+            "scene saved"
+        );
+        encode(
+            req,
+            &SceneResponse {
+                v: PAYLOAD_VERSION,
+                scene,
+            },
+        )
+    }
+
+    /// `scene.list` — the names, in the order first saved.
+    async fn handle_scene_list(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        parse_versioned_payload::<EmptyPayload>(req)?;
+        let scenes = self.scenes.read().await.names();
+        encode(
+            req,
+            &SceneListResponse {
+                v: PAYLOAD_VERSION,
+                scenes,
+            },
+        )
+    }
+
+    /// `scene.recall` — replace the live zones with the snapshot.
+    /// An unknown name and a bad snapshot are refused before any
+    /// write; the logical outputs, the physical outputs and the
+    /// options EQ are not touched. The logical read lock is held
+    /// from the membership check through the zone write, as in
+    /// `zone.add`, and the claim is published again because the
+    /// zones changed. Answers the scene.
+    async fn handle_scene_recall(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SceneNameRequest = parse_versioned_payload(req)?;
+        let scene = self
+            .scenes
+            .read()
+            .await
+            .get(&payload.name)
+            .map_err(|r| Self::scene_refused(req, r))?
+            .clone();
+        {
+            let logical = self.logical.read().await;
+            let known = Self::known_logical_ids(&logical);
+            self.zones
+                .write()
+                .await
+                .recall(&known, &scene.zones)
+                .map_err(|r| Self::zone_refused(req, r))?;
+        }
+        self.persist_zones().await;
+        self.publish_eq_claim().await;
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            name = %scene.name,
+            zones = scene.zones.len(),
+            "scene recalled"
+        );
+        encode(
+            req,
+            &SceneResponse {
+                v: PAYLOAD_VERSION,
+                scene,
+            },
+        )
+    }
+
+    /// `scene.remove` — the scene taken away. The live zones stay.
+    async fn handle_scene_remove(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SceneNameRequest = parse_versioned_payload(req)?;
+        let scene = self
+            .scenes
+            .write()
+            .await
+            .remove(&payload.name)
+            .map_err(|r| Self::scene_refused(req, r))?;
+        self.persist_scenes().await;
+        tracing::info!(plugin = PLUGIN_NAME, name = %scene.name, "scene removed");
+        encode(
+            req,
+            &SceneResponse {
+                v: PAYLOAD_VERSION,
+                scene,
+            },
+        )
+    }
+
     /// `zone.list` — every zone, in id order. Reads the registry
     /// and changes nothing.
     async fn handle_zone_list(
@@ -2903,6 +3065,36 @@ struct ZoneResponse {
 struct ZoneListResponse {
     v: u32,
     zones: Vec<Zone>,
+}
+
+/// `scene.save`, `scene.recall` and `scene.remove` request: a
+/// name.
+#[derive(Debug, Deserialize)]
+struct SceneNameRequest {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    name: String,
+}
+
+impl HasPayloadVersion for SceneNameRequest {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+/// `scene.save`, `scene.recall` and `scene.remove` answer with
+/// the scene.
+#[derive(Debug, Serialize)]
+struct SceneResponse {
+    v: u32,
+    scene: Scene,
+}
+
+/// `scene.list` answers the names.
+#[derive(Debug, Serialize)]
+struct SceneListResponse {
+    v: u32,
+    scenes: Vec<String>,
 }
 
 /// `zone.set_eq_engaged` request.
@@ -3386,6 +3578,10 @@ mod tests {
             "zone.list",
             "zone.set_eq_engaged",
             "zone.set_eq_band",
+            "scene.save",
+            "scene.list",
+            "scene.recall",
+            "scene.remove",
         ];
         for (name, toml) in [
             ("manifest.toml", MANIFEST_TOML),
@@ -5075,6 +5271,9 @@ pcm.evo {
         async fn with_zones(mut self) -> Self {
             self = self.with_logical_state().await;
             self.plugin
+                .install_scenes(self.dir.path().join(SceneStore::FILE_NAME))
+                .await;
+            self.plugin
                 .install_zones(self.dir.path().join(ZoneStore::FILE_NAME))
                 .await;
             for (name, out) in [("Kitchen", "hw:0,0"), ("Hall", "hw:1,0")] {
@@ -5927,8 +6126,8 @@ pcm.evo {
         let production = lib.split("#[cfg(test)]\nmod tests").next().unwrap();
         assert_eq!(
             production.matches("self.publish_eq_claim().await;").count(),
-            10,
-            "eight handlers, the rebind, the release"
+            11,
+            "eight handlers, the rebind, the release, the scene recall"
         );
         let observer_start =
             production.find("async fn spawn_options_observer").unwrap();
@@ -5970,5 +6169,322 @@ pcm.evo {
                 "eq_claim.rs names {forbidden:?}"
             );
         }
+    }
+
+    // ----- scenes: a name and a snapshot of every zone -----
+
+    async fn zones_now(rig: &OutputRig) -> Value {
+        rig.call("zone.list", json!({ "v": 1 })).await.unwrap()["zones"].clone()
+    }
+
+    /// Save keeps every zone as it is; recall brings it back
+    /// after the zones changed, ids and EQ included, clears on an
+    /// empty snapshot, and republishes the claim; list and remove
+    /// answer as ordered; the logical outputs, the physical
+    /// outputs and the options EQ are untouched throughout.
+    #[tokio::test]
+    async fn a_scene_saves_and_recalls_the_zones_and_nothing_else() {
+        let rig = OutputRig::new()
+            .await
+            .with_zones()
+            .await
+            .with_options(hardware_mixer_on_dac())
+            .await;
+        let outputs_before = rig.snapshot_outputs().await;
+        let options_before = rig.plugin.last_options.read().await.clone();
+        // A scene saved before any zone exists is the empty one.
+        rig.call("scene.save", json!({ "v": 1, "name": "Empty" }))
+            .await
+            .unwrap();
+        rig.call("zone.add", json!({ "v": 1, "name": "Down", "logical_output_ids": ["logical:1"] })).await.unwrap();
+        rig.call(
+            "zone.set_eq_engaged",
+            json!({ "v": 1, "id": "zone:1", "engaged": true }),
+        )
+        .await
+        .unwrap();
+        rig.call("zone.set_eq_band", json!({ "v": 1, "id": "zone:1", "index": 0, "freq_hz": 100, "gain_db": 5.0, "q": 1.0 })).await.unwrap();
+        rig.call("zone.add", json!({ "v": 1, "name": "Up", "logical_output_ids": ["logical:2"] })).await.unwrap();
+        let saved_zones = zones_now(&rig).await;
+
+        let s = rig
+            .call("scene.save", json!({ "v": 1, "name": " Evening " }))
+            .await
+            .unwrap();
+        assert_eq!(s["scene"]["name"], "Evening");
+        assert_eq!(s["scene"]["zones"], saved_zones);
+        let listed = rig.call("scene.list", json!({ "v": 1 })).await.unwrap();
+        assert_eq!(listed, json!({ "v": 1, "scenes": ["Empty", "Evening"] }));
+
+        // Change the zones: remove one, add another, change the EQ.
+        rig.call("zone.remove", json!({ "v": 1, "id": "zone:1" }))
+            .await
+            .unwrap();
+        rig.call("zone.add", json!({ "v": 1, "name": "Porch", "logical_output_ids": ["logical:1"] })).await.unwrap();
+        rig.call("zone.set_eq_band", json!({ "v": 1, "id": "zone:2", "index": 3, "freq_hz": 400, "gain_db": -2.0, "q": 2.0 })).await.unwrap();
+        assert_ne!(zones_now(&rig).await, saved_zones);
+        assert_eq!(
+            rig.last_claim().unwrap()["claimed"],
+            false,
+            "Porch holds the terminus but is not engaged"
+        );
+
+        let n = rig.claim_count();
+        let r = rig
+            .call("scene.recall", json!({ "v": 1, "name": "evening" }))
+            .await
+            .unwrap();
+        assert_eq!(r["scene"]["name"], "Evening");
+        assert_eq!(
+            zones_now(&rig).await,
+            saved_zones,
+            "the snapshot is live, ids and eq included"
+        );
+        assert!(rig.claim_count() > n, "the claim was published again");
+        assert_eq!(
+            rig.last_claim().unwrap()["zone_id"],
+            "zone:1",
+            "Down is engaged on the terminus again"
+        );
+        let added = rig.call("zone.add", json!({ "v": 1, "name": "Next", "logical_output_ids": ["logical:2"] })).await;
+        assert!(added.is_err(), "logical:2 is Up's");
+        rig.call("zone.remove", json!({ "v": 1, "id": "zone:2" }))
+            .await
+            .unwrap();
+        let added = rig.call("zone.add", json!({ "v": 1, "name": "Next", "logical_output_ids": ["logical:2"] })).await.unwrap();
+        assert_eq!(
+            added["zone"]["id"], "zone:4",
+            "next_id did not move backward"
+        );
+
+        // The empty scene clears the zones.
+        rig.call("scene.recall", json!({ "v": 1, "name": "Empty" }))
+            .await
+            .unwrap();
+        assert_eq!(zones_now(&rig).await, json!([]));
+        assert_eq!(rig.last_claim().unwrap()["claimed"], false);
+
+        // Nothing but zones moved.
+        assert_eq!(
+            rig.snapshot_outputs().await,
+            outputs_before,
+            "logical and physical outputs untouched"
+        );
+        assert_eq!(
+            *rig.plugin.last_options.read().await,
+            options_before,
+            "the options eq untouched"
+        );
+        assert!(rig.mixer.calls.lock().unwrap().is_empty());
+        assert_eq!(rig.drop_in().await, "");
+
+        // Remove answers the scene; unknown is refused; the live
+        // zones stay, so recall Evening first and watch it stay
+        // live through the remove.
+        rig.call("scene.recall", json!({ "v": 1, "name": "Evening" }))
+            .await
+            .unwrap();
+        assert_eq!(zones_now(&rig).await, saved_zones);
+        let gone = rig
+            .call("scene.remove", json!({ "v": 1, "name": "Evening" }))
+            .await
+            .unwrap();
+        assert_eq!(gone["scene"]["zones"], saved_zones);
+        assert_eq!(zones_now(&rig).await, saved_zones, "the live zones stay");
+        let err = rig
+            .call("scene.remove", json!({ "v": 1, "name": "Evening" }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown scene"), "{err}");
+        assert_eq!(zones_now(&rig).await, saved_zones);
+        assert_eq!(
+            rig.call("scene.list", json!({ "v": 1 })).await.unwrap()["scenes"],
+            json!(["Empty"])
+        );
+    }
+
+    /// A refused recall changes no zone: an unknown name, a
+    /// snapshot naming a logical output the plugin no longer has,
+    /// and a snapshot with one logical output in two zones.
+    #[tokio::test]
+    async fn a_refused_recall_changes_no_zone() {
+        let rig = OutputRig::new().await.with_zones().await;
+        rig.call(
+            "delivery.add_logical_output",
+            json!({ "v": 1, "name": "Porch", "output_id": "hw:1,0" }),
+        )
+        .await
+        .unwrap();
+        rig.call("zone.add", json!({ "v": 1, "name": "Side", "logical_output_ids": ["logical:3"] })).await.unwrap();
+        rig.call("scene.save", json!({ "v": 1, "name": "WithPorch" }))
+            .await
+            .unwrap();
+        rig.call("zone.remove", json!({ "v": 1, "id": "zone:1" }))
+            .await
+            .unwrap();
+        rig.call(
+            "delivery.remove_logical_output",
+            json!({ "v": 1, "id": "logical:3" }),
+        )
+        .await
+        .unwrap();
+        rig.call("zone.add", json!({ "v": 1, "name": "Down", "logical_output_ids": ["logical:1"] })).await.unwrap();
+        let live = zones_now(&rig).await;
+
+        let err = rig
+            .call("scene.recall", json!({ "v": 1, "name": "Nope" }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown scene"), "{err}");
+        assert_eq!(zones_now(&rig).await, live);
+
+        let err = rig
+            .call("scene.recall", json!({ "v": 1, "name": "WithPorch" }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("unknown logical output \\\"logical:3\\\""),
+            "{err}"
+        );
+        assert_eq!(
+            zones_now(&rig).await,
+            live,
+            "a refused recall changed nothing"
+        );
+
+        // A snapshot with one logical output in two zones, as a
+        // hand-edited scenes file could hold.
+        let mut bad = Scenes::default();
+        let zone = |id: &str, ids: &[&str]| Zone {
+            id: id.to_string(),
+            name: id.to_string(),
+            logical_output_ids: ids.iter().map(|s| s.to_string()).collect(),
+            eq: zones::ZoneEq::default(),
+        };
+        bad.save(
+            "Shared",
+            vec![
+                zone("zone:7", &["logical:1"]),
+                zone("zone:8", &["logical:2", "logical:1"]),
+            ],
+        )
+        .unwrap();
+        *rig.plugin.scenes.write().await = bad;
+        let err = rig
+            .call("scene.recall", json!({ "v": 1, "name": "Shared" }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("in both \\\"zone:7\\\" and \\\"zone:8\\\""),
+            "{err}"
+        );
+        assert_eq!(zones_now(&rig).await, live);
+    }
+
+    /// At most 32 scenes: the 33rd save is refused and nothing is
+    /// written; a save of an existing name replaces it. Scenes
+    /// survive a restart; a malformed file is no scenes and the
+    /// zones stay.
+    #[tokio::test]
+    async fn scenes_are_capped_replaced_and_persisted() {
+        let rig = OutputRig::new().await.with_zones().await;
+        rig.call("zone.add", json!({ "v": 1, "name": "Down", "logical_output_ids": ["logical:1"] })).await.unwrap();
+        for i in 0..32 {
+            rig.call(
+                "scene.save",
+                json!({ "v": 1, "name": format!("Scene {i}") }),
+            )
+            .await
+            .unwrap();
+        }
+        let path = rig.dir.path().join(SceneStore::FILE_NAME);
+        let file_before = tokio::fs::read(&path).await.unwrap();
+        let err = rig
+            .call("scene.save", json!({ "v": 1, "name": "Thirty-three" }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("already 32 scenes"), "{err}");
+        assert_eq!(
+            tokio::fs::read(&path).await.unwrap(),
+            file_before,
+            "nothing written"
+        );
+        assert_eq!(
+            rig.call("scene.list", json!({ "v": 1 })).await.unwrap()["scenes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            32
+        );
+
+        rig.call(
+            "zone.set_eq_engaged",
+            json!({ "v": 1, "id": "zone:1", "engaged": true }),
+        )
+        .await
+        .unwrap();
+        let replaced = rig
+            .call("scene.save", json!({ "v": 1, "name": "scene 5" }))
+            .await
+            .unwrap();
+        assert_eq!(
+            replaced["scene"]["zones"][0]["eq"]["engaged"], true,
+            "replaced with the zones as they are now"
+        );
+        assert_eq!(
+            rig.call("scene.list", json!({ "v": 1 })).await.unwrap()["scenes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            32
+        );
+
+        let mut again = loaded_plugin().await;
+        again.install_scenes(path.clone()).await;
+        let listed: Value = serde_json::from_slice(
+            &again
+                .handle_request(&request("scene.list", json!({ "v": 1 })))
+                .await
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
+        assert_eq!(listed["scenes"].as_array().unwrap().len(), 32);
+        assert_eq!(listed["scenes"][5], "scene 5");
+
+        tokio::fs::write(&path, "v = \"nope\"\n[[scenes")
+            .await
+            .unwrap();
+        let mut broken = loaded_plugin().await;
+        broken
+            .install_zones(rig.dir.path().join(ZoneStore::FILE_NAME))
+            .await;
+        broken.install_scenes(path).await;
+        let listed: Value = serde_json::from_slice(
+            &broken
+                .handle_request(&request("scene.list", json!({ "v": 1 })))
+                .await
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
+        assert_eq!(
+            listed["scenes"],
+            json!([]),
+            "a file that does not parse is no scenes"
+        );
+        let zones: Value = serde_json::from_slice(
+            &broken
+                .handle_request(&request("zone.list", json!({ "v": 1 })))
+                .await
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
+        assert_eq!(
+            zones["zones"].as_array().unwrap().len(),
+            1,
+            "and the live zones stay"
+        );
     }
 }
