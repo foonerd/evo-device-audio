@@ -151,8 +151,27 @@ between a zone's membership check and its write, and a zone
 cannot take an id between the removal's check and its removal.
 
 Zones move no audio, no mixer and no drop-in. A zone's EQ is
-stored, not rendered; no scene is stored; `eq_only` stays the one
-pipe.
+stored here, not rendered here; no scene is stored; `eq_only`
+in composition.alsa stays the one pipe and the one cascade.
+
+### The zone EQ claim
+
+The plugin publishes one subject, `evo.audio.zones` /
+`eq_claim` (type `audio_zone_eq_claim`): which zone's EQ the one
+pipe should sound. The payload is `{ v: 1, claimed: false }`, or
+`{ v: 1, claimed: true, zone_id, engaged: true, bands }` with
+exactly 10 bands. The claim is true only while one physical
+output is the chain terminus — the output `play_output` treats
+as playing — and exactly one zone with `engaged` true holds a
+logical output that points at that terminus. A silent terminus,
+a zone with `engaged` false, and two engaged zones on the same
+terminus all publish `claimed: false`. It is announced at load
+and updated whenever the playing terminus, a zone's EQ or
+membership, or a logical output's target changes; an unchanged
+claim is not republished. The composition plugin subscribes and,
+in `eq_only`, sounds the claimed bands instead of the options
+bands; a missing subject leaves it on the options EQ. The
+composition plugin does not read `zones.toml`.
 Zones survive a restart in `<state_dir>/zones.toml`. No subject
 is published. The four verbs are this plugin's `audio.zones`
 stocking at shape 1; every other verb is its `audio.delivery`
@@ -230,6 +249,9 @@ For plugin-level verification, confirm:
     refusal names the zone
 13. a band write on one zone changes no other zone and reaches
     no mixer, drop-in, dispatcher or options verb
+14. the claim follows the terminus and the one engaged zone;
+    two engaged zones on one terminus do not claim; a band write
+    on a zone without the claim publishes nothing new
 
 ## Cross-reference map
 

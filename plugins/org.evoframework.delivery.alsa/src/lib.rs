@@ -81,6 +81,7 @@
 // keep it allowed crate-wide.
 #![allow(clippy::manual_async_fn)]
 
+mod eq_claim;
 mod logical_outputs;
 mod options_render;
 mod outputs;
@@ -92,6 +93,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use eq_claim::EqClaim;
 use evo_plugin_sdk::contract::audio_routing::{
     AudioRouting, AudioRoutingError, ReadEndpoint, RouteChange,
     RouteChangeCallback,
@@ -187,6 +189,16 @@ const REQUEST_TYPES: &[&str] = &[
 const SUBJECT_SCHEME_DELIVERY: &str = "evo.audio.delivery";
 const SUBJECT_VALUE_OUTPUTS: &str = "outputs";
 const SUBJECT_TYPE_OUTPUTS: &str = "audio_delivery_outputs";
+
+/// Subject scheme + value for the zone EQ claim: which zone's EQ
+/// the one pipe should sound, if any. Announced at load and
+/// updated whenever the playing terminus, a zone's EQ or
+/// membership, or a logical output's target changes. The
+/// composition plugin subscribes; a missing subject means it
+/// keeps using the options EQ.
+const SUBJECT_SCHEME_ZONES: &str = "evo.audio.zones";
+const SUBJECT_VALUE_EQ_CLAIM: &str = "eq_claim";
+const SUBJECT_TYPE_EQ_CLAIM: &str = "audio_zone_eq_claim";
 
 /// Parse the embedded plugin manifest.
 pub fn manifest() -> Manifest {
@@ -308,6 +320,9 @@ pub struct AlsaDeliveryPlugin {
     /// Persistence for the zones. `Some` after load named the
     /// state directory.
     zones_state: Option<ZoneStore>,
+    /// The last zone EQ claim published, so an unchanged claim is
+    /// not republished.
+    eq_claim_published: Arc<RwLock<Option<serde_json::Value>>>,
 }
 
 /// The operator's options as last observed, and where from.
@@ -560,6 +575,110 @@ impl DropInRenderer {
     }
 }
 
+/// Publishes the zone EQ claim. Holds clones of every registry
+/// the claim depends on, so a handler and an observer task can
+/// both publish after their change; the last publish wins and
+/// an unchanged claim is not republished.
+#[derive(Clone)]
+struct EqClaimPublisher {
+    outputs: Arc<RwLock<OutputPolicy>>,
+    cached_outputs: Arc<RwLock<Vec<ResolvedAlsaOutput>>>,
+    last_options: Arc<RwLock<Option<LastOptions>>>,
+    logical: Arc<RwLock<LogicalOutputs>>,
+    zones: Arc<RwLock<Zones>>,
+    announcer: Option<Arc<dyn SubjectAnnouncer>>,
+    last_published: Arc<RwLock<Option<serde_json::Value>>>,
+}
+
+impl EqClaimPublisher {
+    fn addressing() -> ExternalAddressing {
+        ExternalAddressing {
+            scheme: SUBJECT_SCHEME_ZONES.to_string(),
+            value: SUBJECT_VALUE_EQ_CLAIM.to_string(),
+        }
+    }
+
+    /// The claim as things stand: the terminus the chain ends at,
+    /// the logical outputs that point at it, and the one engaged
+    /// zone that holds one of them. Locks are taken one at a time
+    /// and logical before zones.
+    async fn current(&self) -> EqClaim {
+        let follow = self
+            .last_options
+            .read()
+            .await
+            .as_ref()
+            .and_then(|l| l.settings.output_device.clone())
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| {
+                options_render::DEFAULT_OUTPUT_DEVICE.to_string()
+            });
+        let outputs = self.cached_outputs.read().await.clone();
+        let terminus = self.outputs.read().await.terminus(&outputs, &follow);
+        let logical = self.logical.read().await.list();
+        let zones = self.zones.read().await.list();
+        eq_claim::compute_claim(terminus.as_deref(), &logical, &zones)
+    }
+
+    /// Announce the subject with the current claim. Load only.
+    async fn announce(&self) {
+        let Some(announcer) = self.announcer.as_ref() else {
+            return;
+        };
+        let state = self.current().await.to_wire();
+        let announcement = SubjectAnnouncement {
+            subject_type: SUBJECT_TYPE_EQ_CLAIM.to_string(),
+            addressings: vec![Self::addressing()],
+            claims: Vec::new(),
+            state: state.clone(),
+            announced_at: std::time::SystemTime::now(),
+        };
+        match announcer.announce(announcement).await {
+            Ok(()) => {
+                *self.last_published.write().await = Some(state);
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    "evo.audio.zones:eq_claim announced"
+                );
+            }
+            Err(e) => tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "evo.audio.zones:eq_claim announce failed"
+            ),
+        }
+    }
+
+    /// Publish the current claim when it differs from the last
+    /// one published.
+    async fn publish(&self) {
+        let Some(announcer) = self.announcer.as_ref() else {
+            return;
+        };
+        let state = self.current().await.to_wire();
+        {
+            let mut last = self.last_published.write().await;
+            if last.as_ref() == Some(&state) {
+                return;
+            }
+            *last = Some(state.clone());
+        }
+        if let Err(e) = announcer.update_state(Self::addressing(), state).await
+        {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "evo.audio.zones:eq_claim update_state failed"
+            );
+        } else {
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                "evo.audio.zones:eq_claim updated"
+            );
+        }
+    }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -710,7 +829,26 @@ impl AlsaDeliveryPlugin {
             logical_state: None,
             zones: Arc::new(RwLock::new(Zones::default())),
             zones_state: None,
+            eq_claim_published: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// The claim publisher over this plugin's registries.
+    fn eq_claim_publisher(&self) -> EqClaimPublisher {
+        EqClaimPublisher {
+            outputs: Arc::clone(&self.outputs),
+            cached_outputs: Arc::clone(&self.cached_outputs),
+            last_options: Arc::clone(&self.last_options),
+            logical: Arc::clone(&self.logical),
+            zones: Arc::clone(&self.zones),
+            announcer: self.subject_announcer.clone(),
+            last_published: Arc::clone(&self.eq_claim_published),
+        }
+    }
+
+    /// Publish the zone EQ claim if it changed.
+    async fn publish_eq_claim(&self) {
+        self.eq_claim_publisher().publish().await;
     }
 
     /// The renderer every drop-in write goes through.
@@ -817,6 +955,7 @@ impl AlsaDeliveryPlugin {
         let renderer = self.drop_in_renderer();
         let outcome = renderer.render_and_write().await;
         renderer.emit_rendered(&outcome, now_ms()).await;
+        self.publish_eq_claim().await;
     }
 
     /// Replace the asound.conf path. Used by tests to point at a
@@ -1030,6 +1169,7 @@ impl AlsaDeliveryPlugin {
             return;
         };
         let renderer = self.drop_in_renderer();
+        let eq_claim = self.eq_claim_publisher();
         let happening_emitter = Arc::clone(&ctx.happening_emitter);
         let addressing = ExternalAddressing {
             scheme: "evo.audio.options".to_string(),
@@ -1145,6 +1285,11 @@ impl AlsaDeliveryPlugin {
                                 }
 
                                 renderer.emit_rendered(&outcome, observed_at_ms).await;
+                                // The operator's output_device
+                                // is the terminus under Follow:
+                                // which zone's EQ sounds may
+                                // have changed with it.
+                                eq_claim.publish().await;
 
                                 // Mixer-transition lifecycle is
                                 // owned by the orchestrator
@@ -1244,6 +1389,7 @@ impl AlsaDeliveryPlugin {
         let catalog_for_task = self.card_catalog.clone();
         let announcer_for_task = self.subject_announcer.clone();
         let cached_outputs_for_task = Arc::clone(&self.cached_outputs);
+        let eq_claim_for_task = self.eq_claim_publisher();
         let addressing = ExternalAddressing {
             scheme: "evo.hardware.audio".to_string(),
             value: "active_config".to_string(),
@@ -1362,6 +1508,9 @@ impl AlsaDeliveryPlugin {
                         Some(&active),
                     )
                     .await;
+                    // The outputs list moved: the terminus may
+                    // resolve differently now.
+                    eq_claim_for_task.publish().await;
                 }
                 Ok(None) => {
                     tracing::debug!(
@@ -1429,6 +1578,9 @@ impl AlsaDeliveryPlugin {
                                     Some(&active),
                                 )
                                 .await;
+                                // The outputs list moved: the terminus may
+                                // resolve differently now.
+                                eq_claim_for_task.publish().await;
                             }
                             Err(SubjectStateStreamError::Lagged {
                                 dropped,
@@ -1678,6 +1830,7 @@ impl Plugin for AlsaDeliveryPlugin {
             );
             self.install_routing(ctx.audio_routing.clone())?;
             self.happening_emitter = Some(Arc::clone(&ctx.happening_emitter));
+            self.subject_announcer = Some(Arc::clone(&ctx.subject_announcer));
             // Enabled flags and volumes the output verbs set
             // last time around; the chain binding is not
             // persisted and starts as Follow.
@@ -1739,6 +1892,10 @@ impl Plugin for AlsaDeliveryPlugin {
             // republish on every active_config update.
             self.install_card_catalog_and_publish_outputs(ctx).await;
             self.spawn_hardware_audio_observer(ctx).await;
+            // Announce which zone's EQ the one pipe should sound,
+            // now that the outputs, the names and the zones are
+            // all in: the composition plugin subscribes to this.
+            self.eq_claim_publisher().announce().await;
             tracing::info!(
                 plugin = PLUGIN_NAME,
                 "plugin loaded; modular ALSA delivery surface ready; \
@@ -2043,6 +2200,8 @@ impl AlsaDeliveryPlugin {
             let renderer = self.drop_in_renderer();
             let outcome = renderer.render_and_write().await;
             renderer.emit_rendered(&outcome, now_ms()).await;
+            // The terminus moved: which zone's EQ sounds may have.
+            self.publish_eq_claim().await;
             if let Some(Err(e)) = &outcome.write_outcome {
                 return Err(PluginError::Transient(format!(
                     "{}: the chain was rebound but the drop-in could not \
@@ -2151,6 +2310,7 @@ impl AlsaDeliveryPlugin {
             .add(&outputs, &payload.name, &payload.output_id)
             .map_err(|r| Self::logical_refused(req, r))?;
         self.persist_logical_outputs().await;
+        self.publish_eq_claim().await;
         tracing::info!(
             plugin = PLUGIN_NAME,
             id = %row.id,
@@ -2188,6 +2348,7 @@ impl AlsaDeliveryPlugin {
             )
             .map_err(|r| Self::logical_refused(req, r))?;
         self.persist_logical_outputs().await;
+        self.publish_eq_claim().await;
         tracing::info!(
             plugin = PLUGIN_NAME,
             id = %row.id,
@@ -2245,6 +2406,7 @@ impl AlsaDeliveryPlugin {
                 .map_err(|r| Self::logical_refused(req, r))?
         };
         self.persist_logical_outputs().await;
+        self.publish_eq_claim().await;
         tracing::info!(
             plugin = PLUGIN_NAME,
             id = %row.id,
@@ -2311,6 +2473,7 @@ impl AlsaDeliveryPlugin {
                 .map_err(|r| Self::zone_refused(req, r))?
         };
         self.persist_zones().await;
+        self.publish_eq_claim().await;
         tracing::info!(
             plugin = PLUGIN_NAME,
             id = %zone.id,
@@ -2351,6 +2514,7 @@ impl AlsaDeliveryPlugin {
                 .map_err(|r| Self::zone_refused(req, r))?
         };
         self.persist_zones().await;
+        self.publish_eq_claim().await;
         tracing::info!(
             plugin = PLUGIN_NAME,
             id = %zone.id,
@@ -2381,6 +2545,7 @@ impl AlsaDeliveryPlugin {
             .remove(&payload.id)
             .map_err(|r| Self::zone_refused(req, r))?;
         self.persist_zones().await;
+        self.publish_eq_claim().await;
         tracing::info!(
             plugin = PLUGIN_NAME,
             id = %zone.id,
@@ -2410,6 +2575,7 @@ impl AlsaDeliveryPlugin {
             .set_eq_engaged(&payload.id, payload.engaged)
             .map_err(|r| Self::zone_refused(req, r))?;
         self.persist_zones().await;
+        self.publish_eq_claim().await;
         tracing::info!(
             plugin = PLUGIN_NAME,
             id = %zone.id,
@@ -2447,6 +2613,7 @@ impl AlsaDeliveryPlugin {
             )
             .map_err(|r| Self::zone_refused(req, r))?;
         self.persist_zones().await;
+        self.publish_eq_claim().await;
         tracing::info!(
             plugin = PLUGIN_NAME,
             id = %zone.id,
@@ -3060,7 +3227,7 @@ mod tests {
         AudioRoutingError, AudioRoutingMethod, CompositionEndpoints,
         EndpointKind, ReadEndpoint, RouteChangeCallback, WriteEndpoint,
     };
-    use evo_plugin_sdk::contract::HealthStatus;
+    use evo_plugin_sdk::contract::{HealthStatus, ReportError};
     use serde_json::{json, Value};
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -4059,9 +4226,66 @@ pcm.evo {
 
     /// A loaded plugin with two outputs, a tempdir drop-in and
     /// state file, and a recording mixer.
+    /// Records every announcement and state update.
+    #[derive(Default)]
+    struct CapturingAnnouncer {
+        announced: Mutex<Vec<SubjectAnnouncement>>,
+        updates: Mutex<Vec<(ExternalAddressing, Value)>>,
+    }
+
+    impl CapturingAnnouncer {
+        fn claim_updates(&self) -> Vec<Value> {
+            self.updates
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(a, _)| a.value == SUBJECT_VALUE_EQ_CLAIM)
+                .map(|(_, v)| v.clone())
+                .collect()
+        }
+    }
+
+    impl SubjectAnnouncer for CapturingAnnouncer {
+        fn announce<'a>(
+            &'a self,
+            announcement: SubjectAnnouncement,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                self.announced.lock().unwrap().push(announcement);
+                Ok(())
+            })
+        }
+
+        fn retract<'a>(
+            &'a self,
+            _addressing: ExternalAddressing,
+            _reason: Option<String>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>,
+        > {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn update_state<'a>(
+            &'a self,
+            addressing: ExternalAddressing,
+            state: Value,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                self.updates.lock().unwrap().push((addressing, state));
+                Ok(())
+            })
+        }
+    }
+
     struct OutputRig {
         plugin: AlsaDeliveryPlugin,
         mixer: Arc<RecordingMixer>,
+        announcer: Arc<CapturingAnnouncer>,
         dir: tempfile::TempDir,
     }
 
@@ -4083,7 +4307,24 @@ pcm.evo {
                 seeded_output(0, "DAC", Some("Digital")),
                 seeded_output(1, "HDMI", Some("PCM")),
             ];
-            Self { plugin, mixer, dir }
+            let announcer = Arc::new(CapturingAnnouncer::default());
+            plugin.subject_announcer =
+                Some(Arc::clone(&announcer) as Arc<dyn SubjectAnnouncer>);
+            Self {
+                plugin,
+                mixer,
+                announcer,
+                dir,
+            }
+        }
+
+        /// The last zone EQ claim published, if any.
+        fn last_claim(&self) -> Option<Value> {
+            self.announcer.claim_updates().last().cloned()
+        }
+
+        fn claim_count(&self) -> usize {
+            self.announcer.claim_updates().len()
         }
 
         async fn with_options(self, settings: OptionsSettings) -> Self {
@@ -5439,6 +5680,294 @@ pcm.evo {
             assert!(
                 !handlers.contains(forbidden),
                 "the eq handlers name {forbidden:?}"
+            );
+        }
+    }
+
+    // ----- the zone EQ claim: which zone's EQ the one pipe sounds -----
+
+    fn claimed(zone: &str) -> Value {
+        json!(zone)
+    }
+
+    /// The claim follows the terminus and the one engaged zone
+    /// holding a logical output on it: engaging claims, a band
+    /// write republishes the bands, pausing drops the claim,
+    /// playing another output claims by that output's zone, and
+    /// re-pointing a logical output moves the claim with it.
+    #[tokio::test]
+    async fn the_claim_follows_the_terminus_and_the_one_engaged_zone() {
+        let rig = OutputRig::new()
+            .await
+            .with_zones()
+            .await
+            .with_options(hardware_mixer_on_dac())
+            .await;
+        rig.call("zone.add", json!({ "v": 1, "name": "Down", "logical_output_ids": ["logical:1"] })).await.unwrap();
+        assert_eq!(
+            rig.last_claim().map(|c| c["claimed"].clone()),
+            Some(json!(false)),
+            "a zone not engaged does not claim"
+        );
+
+        rig.call(
+            "zone.set_eq_engaged",
+            json!({ "v": 1, "id": "zone:1", "engaged": true }),
+        )
+        .await
+        .unwrap();
+        let c = rig.last_claim().unwrap();
+        assert_eq!(c["claimed"], true);
+        assert_eq!(c["zone_id"], claimed("zone:1"));
+        assert_eq!(c["engaged"], true);
+        assert_eq!(c["bands"].as_array().unwrap().len(), 10);
+        assert_eq!(c["v"], 1);
+
+        rig.call("zone.set_eq_band", json!({ "v": 1, "id": "zone:1", "index": 0, "freq_hz": 100, "gain_db": 4.0, "q": 1.0 })).await.unwrap();
+        let c = rig.last_claim().unwrap();
+        assert_eq!(
+            c["bands"][0],
+            json!({ "freq_hz": 100, "gain_db": 4.0, "q": 1.0 }),
+            "a band write on the claiming zone republishes its bands"
+        );
+
+        rig.verb("delivery.pause_output", "hw:0,0").await.unwrap();
+        assert_eq!(
+            rig.last_claim().unwrap(),
+            json!({ "v": 1, "claimed": false }),
+            "a silent terminus does not claim"
+        );
+
+        rig.verb("delivery.play_output", "hw:1,0").await.unwrap();
+        assert_eq!(
+            rig.last_claim().unwrap()["claimed"],
+            false,
+            "no engaged zone on HDMI"
+        );
+        rig.call("zone.add", json!({ "v": 1, "name": "Up", "logical_output_ids": ["logical:2"] })).await.unwrap();
+        rig.call(
+            "zone.set_eq_engaged",
+            json!({ "v": 1, "id": "zone:2", "engaged": true }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rig.last_claim().unwrap()["zone_id"], claimed("zone:2"));
+
+        rig.call("zone.remove", json!({ "v": 1, "id": "zone:2" }))
+            .await
+            .unwrap();
+        assert_eq!(
+            rig.last_claim().unwrap()["claimed"],
+            false,
+            "the zone is gone"
+        );
+
+        // Kitchen now points at HDMI: Down holds it and is engaged.
+        rig.call(
+            "delivery.update_logical_output",
+            json!({ "v": 1, "id": "logical:1", "output_id": "hw:1,0" }),
+        )
+        .await
+        .unwrap();
+        let c = rig.last_claim().unwrap();
+        assert_eq!(
+            c["zone_id"],
+            claimed("zone:1"),
+            "a logical target change moves the claim"
+        );
+        assert_eq!(c["bands"][0]["gain_db"], 4.0);
+    }
+
+    /// Two engaged zones on one terminus do not claim; the claim
+    /// returns when one is disengaged.
+    #[tokio::test]
+    async fn two_engaged_zones_on_one_terminus_do_not_claim() {
+        let rig = OutputRig::new()
+            .await
+            .with_zones()
+            .await
+            .with_options(hardware_mixer_on_dac())
+            .await;
+        rig.call(
+            "delivery.add_logical_output",
+            json!({ "v": 1, "name": "Porch", "output_id": "hw:0,0" }),
+        )
+        .await
+        .unwrap();
+        rig.call("zone.add", json!({ "v": 1, "name": "Down", "logical_output_ids": ["logical:1"] })).await.unwrap();
+        rig.call("zone.add", json!({ "v": 1, "name": "Side", "logical_output_ids": ["logical:3"] })).await.unwrap();
+        rig.call(
+            "zone.set_eq_engaged",
+            json!({ "v": 1, "id": "zone:1", "engaged": true }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rig.last_claim().unwrap()["zone_id"], claimed("zone:1"));
+        rig.call(
+            "zone.set_eq_engaged",
+            json!({ "v": 1, "id": "zone:2", "engaged": true }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rig.last_claim().unwrap(),
+            json!({ "v": 1, "claimed": false }),
+            "two engaged zones on the terminus: the options eq sounds"
+        );
+        rig.call(
+            "zone.set_eq_engaged",
+            json!({ "v": 1, "id": "zone:1", "engaged": false }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rig.last_claim().unwrap()["zone_id"], claimed("zone:2"));
+    }
+
+    /// A band write on a zone that does not hold the claim
+    /// publishes nothing new: the claim, and so the sounding
+    /// bands, stay exactly as they were.
+    #[tokio::test]
+    async fn a_band_write_on_a_zone_without_the_claim_publishes_nothing_new() {
+        let rig = OutputRig::new()
+            .await
+            .with_zones()
+            .await
+            .with_options(hardware_mixer_on_dac())
+            .await;
+        rig.call("zone.add", json!({ "v": 1, "name": "Down", "logical_output_ids": ["logical:1"] })).await.unwrap();
+        rig.call(
+            "zone.set_eq_engaged",
+            json!({ "v": 1, "id": "zone:1", "engaged": true }),
+        )
+        .await
+        .unwrap();
+        rig.call("zone.add", json!({ "v": 1, "name": "Up", "logical_output_ids": ["logical:2"] })).await.unwrap();
+        rig.call(
+            "zone.set_eq_engaged",
+            json!({ "v": 1, "id": "zone:2", "engaged": true }),
+        )
+        .await
+        .unwrap();
+        let before = rig.last_claim().unwrap();
+        assert_eq!(before["zone_id"], claimed("zone:1"));
+        let n = rig.claim_count();
+        rig.call("zone.set_eq_band", json!({ "v": 1, "id": "zone:2", "index": 0, "freq_hz": 100, "gain_db": 9.0, "q": 1.0 })).await.unwrap();
+        rig.call(
+            "zone.update",
+            json!({ "v": 1, "id": "zone:2", "name": "Upstairs" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rig.claim_count(), n, "nothing new was published");
+        assert_eq!(rig.last_claim().unwrap(), before);
+    }
+
+    /// The claim is computed from the operator's output device
+    /// when no output verb has bound the chain, so an options
+    /// change moves it; and the announcement at load carries the
+    /// subject's type, addressing and current claim.
+    #[tokio::test]
+    async fn the_follow_device_moves_the_claim_and_load_announces_it() {
+        let rig = OutputRig::new()
+            .await
+            .with_zones()
+            .await
+            .with_options(hardware_mixer_on_dac())
+            .await;
+        rig.call("zone.add", json!({ "v": 1, "name": "Down", "logical_output_ids": ["logical:1"] })).await.unwrap();
+        rig.call(
+            "zone.set_eq_engaged",
+            json!({ "v": 1, "id": "zone:1", "engaged": true }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rig.last_claim().unwrap()["zone_id"], claimed("zone:1"));
+        *rig.plugin.last_options.write().await = Some(LastOptions {
+            settings: OptionsSettings {
+                output_device: Some("hw:1,0".to_string()),
+                ..hardware_mixer_on_dac()
+            },
+            subject_canonical_id: "options-2".to_string(),
+        });
+        rig.plugin.publish_eq_claim().await;
+        assert_eq!(
+            rig.last_claim().unwrap(),
+            json!({ "v": 1, "claimed": false }),
+            "the operator's device is HDMI now"
+        );
+
+        rig.plugin.eq_claim_publisher().announce().await;
+        let a = rig
+            .announcer
+            .announced
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap();
+        assert_eq!(a.subject_type, SUBJECT_TYPE_EQ_CLAIM);
+        assert_eq!(
+            a.addressings,
+            vec![ExternalAddressing {
+                scheme: "evo.audio.zones".to_string(),
+                value: "eq_claim".to_string()
+            }]
+        );
+        assert_eq!(a.state, json!({ "v": 1, "claimed": false }));
+    }
+
+    /// Every path that can move the claim republishes it: the
+    /// eight logical-output and zone handlers, the output-verb
+    /// rebind, the binding release at unload, the options
+    /// observer after its render, and both hardware-observer
+    /// republishes. Nothing in the claim path renders or mixes.
+    #[test]
+    fn every_claim_moving_path_republishes_and_the_claim_renders_nothing() {
+        let lib = include_str!("lib.rs");
+        let production = lib.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert_eq!(
+            production.matches("self.publish_eq_claim().await;").count(),
+            10,
+            "eight handlers, the rebind, the release"
+        );
+        let observer_start =
+            production.find("async fn spawn_options_observer").unwrap();
+        let observer_end = production[observer_start..]
+            .find("async fn stop_options_observer")
+            .unwrap();
+        let observer =
+            &production[observer_start..observer_start + observer_end];
+        assert!(
+            observer.contains("eq_claim.publish().await;"),
+            "the options observer republishes after its render"
+        );
+        let hw_start = production
+            .find("async fn spawn_hardware_audio_observer")
+            .unwrap();
+        let hw_end = production[hw_start..]
+            .find("async fn stop_hardware_audio_observer")
+            .unwrap();
+        let hw = &production[hw_start..hw_start + hw_end];
+        assert_eq!(
+            hw.matches("eq_claim_for_task.publish().await;").count(),
+            2,
+            "both republishes of the outputs list"
+        );
+        // Code only: a comment may say nothing here renders.
+        let claim: String = include_str!("eq_claim.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for forbidden in [
+            "amixer", "drop_in", "render", "mixer", "softvol", "options.",
+        ] {
+            assert!(
+                !claim.contains(forbidden),
+                "eq_claim.rs names {forbidden:?}"
             );
         }
     }
