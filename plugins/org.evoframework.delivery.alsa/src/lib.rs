@@ -3101,6 +3101,64 @@ mod tests {
         }
     }
 
+    /// The four zone verbs are the `audio.zones` stocking and
+    /// nothing else is; every other verb is the `audio.delivery`
+    /// stocking; the two together are the plugin's whole verb
+    /// set. Both manifests.
+    #[test]
+    fn zone_verbs_are_the_zones_stocking_and_not_the_delivery_one() {
+        const ZONE_VERBS: &[&str] =
+            &["zone.add", "zone.update", "zone.remove", "zone.list"];
+        for (name, toml) in [
+            ("manifest.toml", MANIFEST_TOML),
+            ("manifest.oop.toml", include_str!("../manifest.oop.toml")),
+        ] {
+            let m = Manifest::from_toml(toml).expect(name);
+            assert_eq!(m.stockings.len(), 2, "{name}: two stockings");
+            let delivery = m
+                .stockings
+                .iter()
+                .find(|s| s.shelf == "audio.delivery")
+                .unwrap_or_else(|| panic!("{name}: audio.delivery stocking"));
+            let zones = m
+                .stockings
+                .iter()
+                .find(|s| s.shelf == "audio.zones")
+                .unwrap_or_else(|| panic!("{name}: audio.zones stocking"));
+            assert_eq!(delivery.shape, 2, "{name}");
+            assert_eq!(zones.shape, 1, "{name}");
+            assert_eq!(m.target.shelf, "audio.delivery", "{name}: primary");
+            let mut zone_list: Vec<&str> =
+                zones.request_types.iter().map(String::as_str).collect();
+            zone_list.sort_unstable();
+            let mut want = ZONE_VERBS.to_vec();
+            want.sort_unstable();
+            assert_eq!(
+                zone_list, want,
+                "{name}: the zones stocking is the four"
+            );
+            for verb in ZONE_VERBS {
+                assert!(
+                    !delivery.request_types.iter().any(|v| v == verb),
+                    "{name}: {verb} is on the audio.delivery stocking"
+                );
+            }
+            let mut union: Vec<&str> = delivery
+                .request_types
+                .iter()
+                .chain(zones.request_types.iter())
+                .map(String::as_str)
+                .collect();
+            union.sort_unstable();
+            let mut all = REQUEST_TYPES.to_vec();
+            all.sort_unstable();
+            assert_eq!(
+                union, all,
+                "{name}: the two stockings are the whole set"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn identity_matches_manifest() {
         let p = AlsaDeliveryPlugin::new();

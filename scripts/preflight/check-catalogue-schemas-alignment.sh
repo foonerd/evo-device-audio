@@ -13,13 +13,15 @@
 #
 #   1. Scan every `plugins/*/manifest.toml` and
 #      `plugins/*/manifest.oop.toml` in this distribution and
-#      extract the value of `[target].shelf`. Shelves are
-#      identified by their qualified `rack.shelf` form.
+#      extract every shelf it stocks: the `[target]` block of a
+#      single-shelf manifest, or every `[[stockings]]` block of
+#      a multi-shelf one. Shelves are identified by their
+#      qualified `rack.shelf` form.
 #
 #   2. For each unique shelf, look up the schema file at the
 #      canonical path inside the schemas-repo checkout:
 #        schemas/org.evoframework/<rack>/<shelf>.v<N>.toml
-#      where <N> is the manifest's `[target].shape` field.
+#      where <N> is that block's `shape` field.
 #
 #   3. If the schema file is missing, the cut is refused.
 #
@@ -55,60 +57,69 @@ fi
 
 VIOLATIONS=()
 
-# Extract shelf + shape from a manifest file. Sets globals
-# `manifest_shelf` and `manifest_shape`. Returns 0 if both are
-# parsed; non-zero if either is missing.
-extract_target() {
+# Emit every (shelf, shape) pair a manifest stocks, one per line
+# as `shelf shape`. A manifest declares either one `[target]`
+# block (single-shelf form) or one or more `[[stockings]]` blocks
+# (multi-shelf form); the two forms are mutually exclusive and
+# both are read here. A stockings-only manifest is not skipped:
+# every shelf it stocks must have its schema file, exactly as a
+# `[target]` shelf must.
+#
+# Bash regex extraction is fine here — these files are
+# well-formed TOML and the fields live at the block's top
+# level. We deliberately avoid a TOML parser dependency in the
+# preflight to keep it shell-portable.
+extract_stockings() {
     local f="$1"
-    manifest_shelf=""
-    manifest_shape=""
-    # Bash regex extraction is fine here — these files are
-    # well-formed TOML and the fields live at the [target] block
-    # top level. We deliberately avoid a TOML parser dependency
-    # in the preflight to keep it shell-portable.
-    in_target=0
+    local in_block=0 shelf="" shape=""
+    flush() {
+        if [[ "$in_block" -eq 1 ]] && [[ -n "$shelf" ]] && [[ -n "$shape" ]]; then
+            echo "$shelf $shape"
+        fi
+        shelf=""
+        shape=""
+    }
     while IFS= read -r line; do
-        if [[ "$line" =~ ^\[target\] ]]; then
-            in_target=1
+        if [[ "$line" =~ ^\[target\] ]] || [[ "$line" =~ ^\[\[stockings\]\] ]]; then
+            flush
+            in_block=1
             continue
         fi
-        if [[ "$line" =~ ^\[[^][]+\] ]] && [[ "$in_target" -eq 1 ]] && [[ ! "$line" =~ ^\[target\] ]]; then
-            in_target=0
+        if [[ "$line" =~ ^\[[^][]+\] ]] || [[ "$line" =~ ^\[\[[^][]+\]\] ]]; then
+            flush
+            in_block=0
             continue
         fi
-        [[ "$in_target" -eq 1 ]] || continue
+        [[ "$in_block" -eq 1 ]] || continue
         if [[ "$line" =~ ^[[:space:]]*shelf[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]]; then
-            manifest_shelf="${BASH_REMATCH[1]}"
+            shelf="${BASH_REMATCH[1]}"
         fi
         if [[ "$line" =~ ^[[:space:]]*shape[[:space:]]*=[[:space:]]*([0-9]+) ]]; then
-            manifest_shape="${BASH_REMATCH[1]}"
+            shape="${BASH_REMATCH[1]}"
         fi
     done < "$f"
-    [[ -n "$manifest_shelf" ]] && [[ -n "$manifest_shape" ]]
+    flush
 }
 
 # Track checked (shelf, shape) pairs so we only report once per
-# pair even if multiple manifests target the same shelf.
+# pair even if multiple manifests stock the same shelf.
 declare -A CHECKED
 
 while IFS= read -r manifest; do
-    if ! extract_target "$manifest"; then
-        # Manifest has no [target] block or missing shelf/shape;
-        # not in scope of this preflight (admission code refuses
-        # such manifests separately).
-        continue
-    fi
-    key="${manifest_shelf}:${manifest_shape}"
-    if [[ -n "${CHECKED[$key]:-}" ]]; then
-        continue
-    fi
-    CHECKED[$key]=1
-    rack="${manifest_shelf%%.*}"
-    shelf="${manifest_shelf#*.}"
-    schema_file="$SCHEMAS_DIR/schemas/org.evoframework/${rack}/${shelf}.v${manifest_shape}.toml"
-    if [[ ! -f "$schema_file" ]]; then
-        VIOLATIONS+=("MISSING_SCHEMA: manifest '$manifest' targets shelf '$manifest_shelf' shape $manifest_shape — no schema at '$schema_file'")
-    fi
+    while read -r manifest_shelf manifest_shape; do
+        [[ -n "$manifest_shelf" ]] || continue
+        key="${manifest_shelf}:${manifest_shape}"
+        if [[ -n "${CHECKED[$key]:-}" ]]; then
+            continue
+        fi
+        CHECKED[$key]=1
+        rack="${manifest_shelf%%.*}"
+        shelf="${manifest_shelf#*.}"
+        schema_file="$SCHEMAS_DIR/schemas/org.evoframework/${rack}/${shelf}.v${manifest_shape}.toml"
+        if [[ ! -f "$schema_file" ]]; then
+            VIOLATIONS+=("MISSING_SCHEMA: manifest '$manifest' stocks shelf '$manifest_shelf' shape $manifest_shape — no schema at '$schema_file'")
+        fi
+    done < <(extract_stockings "$manifest")
 done < <(git ls-files 'plugins/*/manifest.toml' 'plugins/*/manifest.oop.toml' 2>/dev/null || true)
 
 if [[ ${#VIOLATIONS[@]} -eq 0 ]]; then

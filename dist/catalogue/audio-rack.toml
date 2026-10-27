@@ -82,6 +82,20 @@ drive output-device selection.
 """
 
 [[racks.shelves]]
+name = "zones"
+shape = 1
+description = """
+A zone is a name over one or more logical outputs, the names \
+the delivery shelf gives to physical outputs. Stocked by the \
+delivery plugin (org.evoframework.delivery.alsa) alongside \
+audio.delivery: zone.add / zone.update / zone.remove / \
+zone.list. A zone is not an ALSA device and not an EQ; it \
+moves no audio, no mixer and no drop-in. A logical output \
+sits in one zone at most, and cannot be removed while a zone \
+holds it.
+"""
+
+[[racks.shelves]]
 name = "options"
 shape = 2
 description = """

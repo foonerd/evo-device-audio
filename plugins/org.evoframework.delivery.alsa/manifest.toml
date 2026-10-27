@@ -4,9 +4,46 @@ name = "org.evoframework.delivery.alsa"
 version = "0.1.0"
 contract = 1
 
-[target]
+# Two stockings from one process. The delivery stocking is the
+# modular ALSA pipeline's operator surface: hardware inspection,
+# the five output verbs, and the names the operator gives to
+# physical outputs. The zones stocking is a name over one or more
+# of those logical outputs; it reads the logical-output store and
+# writes only the zone store, under the same lock order. One
+# plugin owns both because a zone is nothing but logical outputs,
+# and the refusal that keeps a zoned logical output from being
+# removed needs both registries under one roof.
+[[stockings]]
 shelf = "audio.delivery"
 shape = 2
+role  = "respondent"
+request_types = [
+    "delivery.probe_hardware",
+    "delivery.list_cards",
+    "delivery.list_mixers",
+    "delivery.active_endpoint",
+    "delivery.list_outputs",
+    "delivery.enable_output",
+    "delivery.disable_output",
+    "delivery.set_output_volume",
+    "delivery.play_output",
+    "delivery.pause_output",
+    "delivery.add_logical_output",
+    "delivery.update_logical_output",
+    "delivery.remove_logical_output",
+    "delivery.list_logical_outputs",
+]
+
+[[stockings]]
+shelf = "audio.zones"
+shape = 1
+role  = "respondent"
+request_types = [
+    "zone.add",
+    "zone.update",
+    "zone.remove",
+    "zone.list",
+]
 
 [kind]
 instance = "singleton"

@@ -141,10 +141,10 @@ cannot take an id between the removal's check and its removal.
 Zones move no audio, no mixer and no drop-in. No EQ is attached
 to a zone and no scene is stored; `eq_only` stays the one EQ.
 Zones survive a restart in `<state_dir>/zones.toml`. No subject
-is published. The four verbs dispatch under this plugin's
-`audio.delivery` stocking until the `audio.zones` shelf is
-declared in the rack catalogue and the schemas repository; the
-request types are the shelf's own (`zone.*`) already.
+is published. The four verbs are this plugin's `audio.zones`
+stocking at shape 1; every other verb is its `audio.delivery`
+stocking at shape 2. The manifest declares both as
+`[[stockings]]`, and the two lists do not overlap.
 
 ## On-disk contract
 
