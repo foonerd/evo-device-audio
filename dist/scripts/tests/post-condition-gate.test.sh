@@ -47,12 +47,13 @@ FAIL=0
 # shellcheck disable=SC2034
 healthy_env() {
     ACTIVE_STATE="active"
-    # Twenty-two: every entry on dist/scripts/lib/oop-plugins.sh,
+    # Twenty-three: every entry on dist/scripts/lib/oop-plugins.sh,
     # the twentieth org.evoframework.alarm, the twenty-first
-    # org.evoframework.system.info and the twenty-second
-    # org.evoframework.system.backup.
-    PLUGINS_ADMITTED=22
-    PLUGINS_EXPECTED=22
+    # org.evoframework.system.info, the twenty-second
+    # org.evoframework.system.backup and the twenty-third
+    # org.evoframework.identity.locale.
+    PLUGINS_ADMITTED=23
+    PLUGINS_EXPECTED=23
     ADMISSION_FAILURES=0
     NOT_DECLARED=0
     JOURNAL_FAIL_COUNT=0
@@ -142,17 +143,19 @@ else
 fi
 
 # The healthy count above is the ship list, and the alarm, the
-# system info plugin and the backup plugin are on it.
+# system info plugin, the backup plugin and the locale plugin are
+# on it.
 # shellcheck source=../lib/oop-plugins.sh
 source "$SCRIPT_DIR/../lib/oop-plugins.sh"
-if [[ "${#OOP_PLUGINS[@]}" -eq 22 ]] \
+if [[ "${#OOP_PLUGINS[@]}" -eq 23 ]] \
     && printf '%s\n' "${OOP_PLUGINS[@]}" | grep -q '^org\.evoframework\.alarm:' \
     && printf '%s\n' "${OOP_PLUGINS[@]}" | grep -q '^org\.evoframework\.system\.info:' \
-    && printf '%s\n' "${OOP_PLUGINS[@]}" | grep -q '^org\.evoframework\.system\.backup:'; then
-    echo "PASS  the ship list is 22 plugins, org.evoframework.alarm, org.evoframework.system.info and org.evoframework.system.backup among them"
+    && printf '%s\n' "${OOP_PLUGINS[@]}" | grep -q '^org\.evoframework\.system\.backup:' \
+    && printf '%s\n' "${OOP_PLUGINS[@]}" | grep -q '^org\.evoframework\.identity\.locale:'; then
+    echo "PASS  the ship list is 23 plugins, org.evoframework.alarm, org.evoframework.system.info, org.evoframework.system.backup and org.evoframework.identity.locale among them"
     PASS=$((PASS + 1))
 else
-    echo "FAIL  the ship list is ${#OOP_PLUGINS[@]} plugins, or org.evoframework.alarm, org.evoframework.system.info or org.evoframework.system.backup is not on it"
+    echo "FAIL  the ship list is ${#OOP_PLUGINS[@]} plugins, or org.evoframework.alarm, org.evoframework.system.info, org.evoframework.system.backup or org.evoframework.identity.locale is not on it"
     FAIL=$((FAIL + 1))
 fi
 

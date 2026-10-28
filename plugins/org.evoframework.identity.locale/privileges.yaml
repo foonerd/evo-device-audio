@@ -1,0 +1,26 @@
+schema_version: "1.0"
+plugin: org.evoframework.identity.locale
+owner: evo-device-audio
+isolation: oop
+has_os_dependencies: false
+
+# One setter on the `system.locale` shelf. The operator's language
+# is stored in this plugin's own state directory; nothing else on
+# the host is read or written.
+
+capability_intent:
+  - id: state_directory_read_write
+    need: read and write `language.toml` in the plugin's own state directory (/var/lib/evo/plugins/org.evoframework.identity.locale/), holding the operator's language. Written only when a set applies a language the glass has a catalogue for, through a temporary file and a rename.
+    access_path: filesystem/state
+    failure_mode: a missing or unreadable file is no stored language, so the language in force is `en`; a failed write refuses the set and the language in force stays.
+
+required_binaries: []
+required_kernel_modules: []
+required_system_services: []
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+  expected:
+    - steward state directory exists
+host_provisioning: {}

@@ -3792,6 +3792,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "org-evoframework-identity-locale"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "evo-plugin-sdk",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "org-evoframework-metadata-local"
 version = "0.1.2"
 dependencies = [

@@ -1,0 +1,43 @@
+[plugin]
+name = "org.evoframework.identity.locale"
+# Keep in sync with this crate's Cargo.toml [package].version (PluginIdentity + packaging).
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "system.locale"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.13"
+os_family = "linux"
+outbound_network = false
+# The stored language lives in the plugin's own state directory.
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 8
+max_cpu_percent = 1
+
+[lifecycle]
+# Reactive-only: one setter over one stored value.
+mode = "reactive-only"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+# No verb_capabilities: changing the language asks for no password.
+request_types = ["language.set"]
+response_budget_ms = 2000
