@@ -489,6 +489,19 @@ the build. Both are reads gated at scope `system`, and a fact \
 the device does not provide answers null.
 """
 
+[[racks.shelves]]
+name = "backup"
+shape = 1
+description = """
+One backup of the operator's configuration. Stocked by \
+org.evoframework.system.backup: export_backup reads config \
+(logical outputs and zones), playlists and settings from the \
+plugins that own them, and import_backup puts them back \
+through the same owners, removing nothing and reporting what \
+an owner refuses. Both are step-up gated at `system_admin`. \
+Music files and share passwords are never in a backup.
+"""
+
 # Subject types the audio playback warden announces on
 # every song change. The track subject is keyed by
 # `mpd-path` URI scheme; the album subject is keyed by

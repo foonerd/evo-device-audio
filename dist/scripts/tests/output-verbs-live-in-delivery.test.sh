@@ -21,6 +21,13 @@
 # names appears in a Rust source, a manifest or a privileges
 # file outside `plugins/org.evoframework.delivery.alsa`.
 #
+# One caller is named: `plugins/org.evoframework.system.backup`
+# reads and puts back logical outputs and zones by calling the
+# owner's verbs through the shelf dispatcher, so it may name
+# them. It may not carry them: the test goes red if either of its
+# manifests stocks one as a request type, or if its `src/lib.rs`
+# handles one as its own request type.
+#
 # Documentation and this test directory are not scanned: a
 # changelog may name a verb; a crate may not.
 
@@ -30,6 +37,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 OWNER="plugins/org.evoframework.delivery.alsa"
+# The only plugin that may name the verbs besides their owner, and
+# only to call them.
+CALLER="plugins/org.evoframework.system.backup"
 VERBS=(
     "delivery.enable_output"
     "delivery.disable_output"
@@ -55,27 +65,57 @@ VERBS=(
 PASS=0
 FAIL=0
 
-# Where a verb may be named: the owning plugin. Everything else
-# under crates/ and plugins/ (Rust sources, manifests,
-# privileges) must not name it.
+# Where a verb may be named: the owning plugin and the one named
+# caller. Everything else under crates/ and plugins/ (Rust
+# sources, manifests, privileges) must not name it.
 scan_for() {
     local verb="$1"
     # grep -r exits 1 on no match; that is the pass path.
     ( cd "$REPO_DIR" && grep -rl --include='*.rs' --include='*.toml' \
         --include='*.yaml' --include='*.yml' -F "$verb" crates plugins \
         2>/dev/null || true ) \
-        | { grep -v "^$OWNER/" || true; }
+        | { grep -v -e "^$OWNER/" -e "^$CALLER/" || true; }
 }
 
 for verb in "${VERBS[@]}"; do
     hits="$(scan_for "$verb")"
     if [[ -z "$hits" ]]; then
-        echo "PASS  $verb is named only under $OWNER"
+        echo "PASS  $verb is named only under $OWNER and its caller"
         PASS=$((PASS + 1))
     else
-        echo "FAIL  $verb is named outside $OWNER:"
+        echo "FAIL  $verb is named outside $OWNER and its caller:"
         printf '      %s\n' $hits
         FAIL=$((FAIL + 1))
+    fi
+done
+
+# The caller names the verbs to call them, never to carry them:
+# neither of its manifests stocks one as a request type, and its
+# lib.rs has no match arm that handles one.
+stocked_by_caller() {
+    local verb="$1" manifest
+    for manifest in "$REPO_DIR/$CALLER/manifest.toml" "$REPO_DIR/$CALLER/manifest.oop.toml"; do
+        if awk '/request_types[[:space:]]*=[[:space:]]*\[/ { f = 1 } f { print } f && /\]/ { f = 0 }' \
+            "$manifest" | grep -q -F "\"$verb\""; then
+            return 0
+        fi
+    done
+    return 1
+}
+handled_by_caller() {
+    local verb_re="${1//./\\.}"
+    grep -Eq "\"$verb_re\"[[:space:]]*=>" "$REPO_DIR/$CALLER/src/lib.rs"
+}
+for verb in "${VERBS[@]}"; do
+    if stocked_by_caller "$verb"; then
+        echo "FAIL  $verb is stocked by $CALLER"
+        FAIL=$((FAIL + 1))
+    elif handled_by_caller "$verb"; then
+        echo "FAIL  $verb is handled as a request type by $CALLER"
+        FAIL=$((FAIL + 1))
+    else
+        echo "PASS  $verb is called, not carried, by $CALLER"
+        PASS=$((PASS + 1))
     fi
 done
 

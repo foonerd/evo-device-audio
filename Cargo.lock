@@ -3986,6 +3986,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "org-evoframework-system-backup"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "evo-plugin-sdk",
+ "semver",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "org-evoframework-system-info"
 version = "0.1.13"
 dependencies = [
