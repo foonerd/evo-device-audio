@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Tests for the alarm plugin, against a stub appointment ledger.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
+use evo_plugin_sdk::contract::AppointmentState;
 use serde_json::{json, Value};
 
 use super::*;
@@ -15,17 +17,34 @@ enum LedgerCall {
     Create(AppointmentSpec, AppointmentAction),
 }
 
+/// The ledger's entry for `alarm`: what was scheduled, and its
+/// state.
+#[derive(Debug, Clone, PartialEq)]
+struct Entry {
+    spec: AppointmentSpec,
+    action: AppointmentAction,
+    state: AppointmentState,
+}
+
 /// Stands in for the framework appointment ledger: records every
-/// call and, when told to, refuses the create.
+/// call and keeps the entry for `alarm` as the ledger does. A
+/// create re-issues the id in place as `Pending`, a refused create
+/// leaves the entry as it was, and a cancel marks the entry
+/// `Cancelled` and keeps it. Told to, it refuses creates.
 #[derive(Default)]
 struct StubLedger {
     calls: Mutex<Vec<LedgerCall>>,
-    refuse_create: bool,
+    entry: Mutex<Option<Entry>>,
+    refuse_create: AtomicBool,
 }
 
 impl StubLedger {
     fn calls(&self) -> Vec<LedgerCall> {
         self.calls.lock().unwrap().clone()
+    }
+
+    fn entry(&self) -> Option<Entry> {
+        self.entry.lock().unwrap().clone()
     }
 
     fn created(&self) -> Vec<(AppointmentSpec, AppointmentAction)> {
@@ -54,10 +73,15 @@ impl AppointmentScheduler for StubLedger {
             self.calls
                 .lock()
                 .unwrap()
-                .push(LedgerCall::Create(spec, action));
-            if self.refuse_create {
+                .push(LedgerCall::Create(spec.clone(), action.clone()));
+            if self.refuse_create.load(Ordering::SeqCst) {
                 return Err(ReportError::Invalid("quota".to_string()));
             }
+            *self.entry.lock().unwrap() = Some(Entry {
+                spec,
+                action,
+                state: AppointmentState::Pending,
+            });
             Ok(id)
         })
     }
@@ -73,6 +97,9 @@ impl AppointmentScheduler for StubLedger {
                 .lock()
                 .unwrap()
                 .push(LedgerCall::Cancel(id.as_str().to_string()));
+            if let Some(entry) = self.entry.lock().unwrap().as_mut() {
+                entry.state = AppointmentState::Cancelled;
+            }
             Ok(())
         })
     }
@@ -139,13 +166,13 @@ async fn describe_names_the_manifest_verbs() {
 
 // ----- alarm.set -----
 
-/// A set cancels the appointment `alarm` and schedules it again:
-/// weekly on the named days in the order given, local time,
+/// A set schedules the appointment `alarm` and does not cancel
+/// first: weekly on the named days in the order given, local time,
 /// waking the device, no pre-arm; the fire loads the playlist into
 /// the queue from its first entry. The answer echoes the days as
 /// given and the name trimmed.
 #[tokio::test]
-async fn a_set_cancels_then_schedules_the_one_appointment() {
+async fn a_set_schedules_the_one_appointment() {
     let ledger = Arc::new(StubLedger::default());
     let p = plugin_on(&ledger);
     let resp = p
@@ -164,11 +191,18 @@ async fn a_set_cancels_then_schedules_the_one_appointment() {
         })
     );
     let calls = ledger.calls();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0], LedgerCall::Cancel(APPOINTMENT_ID.to_string()));
-    let LedgerCall::Create(spec, action) = &calls[1] else {
-        panic!("second call is the create: {calls:?}");
+    assert_eq!(calls.len(), 1, "one create, no cancel: {calls:?}");
+    let LedgerCall::Create(spec, action) = &calls[0] else {
+        panic!("the one call is the create: {calls:?}");
     };
+    assert_eq!(
+        ledger.entry(),
+        Some(Entry {
+            spec: spec.clone(),
+            action: action.clone(),
+            state: AppointmentState::Pending,
+        })
+    );
     assert_eq!(spec.appointment_id, "alarm");
     assert_eq!(spec.time.as_deref(), Some("07:30"));
     assert_eq!(spec.zone, AppointmentTimeZone::Local);
@@ -207,8 +241,8 @@ fn the_miss_policy_is_the_ledger_default() {
     assert_eq!(spec.miss_policy, unnamed.miss_policy);
 }
 
-/// A second set replaces the first: cancel, schedule, cancel,
-/// schedule, under the same id.
+/// A second set replaces the first: two creates under the same id,
+/// no cancel, and the second is the one alarm.
 #[tokio::test]
 async fn a_new_set_replaces_the_alarm() {
     let ledger = Arc::new(StubLedger::default());
@@ -219,14 +253,13 @@ async fn a_new_set_replaces_the_alarm() {
     p.handle_request(&set(json!(["sat", "sun"]), "09:15", "Late"))
         .await
         .unwrap();
-    let calls = ledger.calls();
-    assert_eq!(calls.len(), 4);
-    assert_eq!(calls[0], LedgerCall::Cancel("alarm".to_string()));
-    assert_eq!(calls[2], LedgerCall::Cancel("alarm".to_string()));
     let created = ledger.created();
+    assert_eq!(ledger.calls().len(), 2, "two creates, no cancel");
     assert_eq!(created[1].0.appointment_id, "alarm");
-    assert_eq!(created[1].0.time.as_deref(), Some("09:15"));
-    assert_eq!(created[1].1.payload["playlist_name"], "Late");
+    let entry = ledger.entry().expect("an alarm stands");
+    assert_eq!(entry.state, AppointmentState::Pending);
+    assert_eq!(entry.spec.time.as_deref(), Some("09:15"));
+    assert_eq!(entry.action.payload["playlist_name"], "Late");
 }
 
 /// Every refusal comes before the ledger is touched, so the alarm
@@ -277,41 +310,72 @@ async fn a_refused_set_schedules_nothing() {
     }
 }
 
-/// A ledger that refuses the create after the cancel leaves no
-/// alarm, and the set answers that refusal.
+/// Pin: a failed create leaves the previous appointment pending.
+/// The set answers the ledger's refusal, nothing is cancelled, and
+/// the appointment that was set is neither cancelled nor absent.
 #[tokio::test]
-async fn a_create_the_ledger_refuses_answers_the_refusal() {
-    let ledger = Arc::new(StubLedger {
-        refuse_create: true,
-        ..StubLedger::default()
-    });
+async fn a_failed_create_leaves_the_alarm_that_was_set() {
+    let ledger = Arc::new(StubLedger::default());
     let p = plugin_on(&ledger);
+    p.handle_request(&set(json!(["mon"]), "06:00", "Early"))
+        .await
+        .unwrap();
+    let before = ledger.entry().expect("the first alarm stands");
+    assert_eq!(before.state, AppointmentState::Pending);
+
+    ledger.refuse_create.store(true, Ordering::SeqCst);
     let err = p
-        .handle_request(&set(json!(["mon"]), "07:00", "Morning"))
+        .handle_request(&set(json!(["sat"]), "09:15", "Late"))
         .await
         .unwrap_err();
     assert!(matches!(err, PluginError::Permanent(_)), "{err:?}");
-    assert_eq!(ledger.calls().len(), 2, "cancel, then the refused create");
+    match ledger.entry() {
+        None => panic!("the alarm that was set is absent"),
+        Some(after) => {
+            assert_eq!(
+                after.state,
+                AppointmentState::Pending,
+                "the alarm that was set is {:?}",
+                after.state
+            );
+            assert_eq!(after, before, "the alarm that was set");
+        }
+    }
+    assert!(
+        !ledger
+            .calls()
+            .iter()
+            .any(|c| matches!(c, LedgerCall::Cancel(_))),
+        "a set never cancels"
+    );
 }
 
 // ----- alarm.clear -----
 
-/// A clear cancels the appointment `alarm` and answers ok, also
-/// when no alarm is set.
+/// A clear cancels the appointment `alarm` and answers ok, and a
+/// second clear, with no alarm set, answers ok too.
 #[tokio::test]
 async fn a_clear_cancels_and_answers_ok_even_when_none_is_set() {
     let ledger = Arc::new(StubLedger::default());
     let p = plugin_on(&ledger);
+    p.handle_request(&set(json!(["mon"]), "06:00", "Early"))
+        .await
+        .unwrap();
     for _ in 0..2 {
         let resp = p
             .handle_request(&req(VERB_CLEAR, json!({ "v": 1 })))
             .await
             .unwrap();
         assert_eq!(body(&resp), json!({ "v": 1, "status": "ok" }));
+        assert_eq!(
+            ledger.entry().map(|e| e.state),
+            Some(AppointmentState::Cancelled),
+            "no alarm remains"
+        );
     }
     assert_eq!(
-        ledger.calls(),
-        vec![
+        ledger.calls()[1..],
+        [
             LedgerCall::Cancel("alarm".to_string()),
             LedgerCall::Cancel("alarm".to_string()),
         ]

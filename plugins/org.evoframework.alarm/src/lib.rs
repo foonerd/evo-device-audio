@@ -5,15 +5,18 @@
 //! One alarm on the `audio.alarm` shelf: the weekdays the
 //! operator names, a local `HH:MM`, and a playlist name.
 //!
-//! - `alarm.set { v, weekdays, time, playlist_name }` cancels the
-//!   appointment `alarm` and schedules it again from the new
-//!   values. It answers `{ v, alarm: { weekdays, time,
-//!   playlist_name } }`: the weekdays in the order given, the
-//!   time, and the name trimmed. An empty weekday list, a day
-//!   named twice, an unknown day token, a time that is not
-//!   `HH:MM`, and a name that is empty once trimmed are refused
-//!   before any schedule, so the alarm in place stays. The set
-//!   does not check that the playlist exists.
+//! - `alarm.set { v, weekdays, time, playlist_name }` schedules
+//!   the appointment `alarm` from the new values without
+//!   cancelling first: the ledger re-issues an id in place, so a
+//!   create that succeeds is the one alarm and a create the
+//!   ledger refuses leaves the previous appointment pending. It
+//!   answers `{ v, alarm: { weekdays, time, playlist_name } }`:
+//!   the weekdays in the order given, the time, and the name
+//!   trimmed. An empty weekday list, a day named twice, an
+//!   unknown day token, a time that is not `HH:MM`, and a name
+//!   that is empty once trimmed are refused before any schedule,
+//!   so the alarm in place stays. The set does not check that the
+//!   playlist exists.
 //! - `alarm.clear { v }` cancels the appointment `alarm` and
 //!   answers `{ v, status: "ok" }`, also when no alarm is set.
 //!
@@ -218,8 +221,8 @@ pub struct AlarmPlugin {
     loaded: bool,
     /// Ledger handle from `LoadContext`. `None` refuses both verbs.
     appointments: Option<Arc<dyn AppointmentScheduler>>,
-    /// Serialises set and clear, so a cancel and its schedule are
-    /// never split by another gesture.
+    /// Serialises set and clear, so the last gesture to reach the
+    /// ledger is the one that stands.
     gesture: tokio::sync::Mutex<()>,
 }
 
@@ -253,10 +256,9 @@ impl AlarmPlugin {
         let ledger = self.ledger()?;
         let (spec, action) = alarm.appointment();
         let _gesture = self.gesture.lock().await;
-        ledger
-            .cancel_appointment(AppointmentId::new(APPOINTMENT_ID))
-            .await
-            .map_err(|e| ledger_refused(VERB_SET, e))?;
+        // No cancel first: the ledger re-issues `alarm` in place,
+        // so a refused create leaves the previous appointment
+        // pending.
         ledger
             .create_appointment(spec, action)
             .await
