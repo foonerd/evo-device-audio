@@ -476,6 +476,19 @@ list_active / send / cancel are anonymous — send-time \
 attribution comes from the payload's `source_plugin` field.
 """
 
+[[racks.shelves]]
+name = "info"
+shape = 1
+description = """
+What the device is and what it runs. Stocked by \
+org.evoframework.system.info: get_system_info reads the \
+host's name, operating system, kernel, architecture, model, \
+processor, memory and uptime; get_system_version reads the \
+installed release from the installer's record and answers \
+the build. Both are reads gated at scope `system`, and a fact \
+the device does not provide answers null.
+"""
+
 # Subject types the audio playback warden announces on
 # every song change. The track subject is keyed by
 # `mpd-path` URI scheme; the album subject is keyed by

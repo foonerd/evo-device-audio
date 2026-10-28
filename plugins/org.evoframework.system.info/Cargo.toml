@@ -1,0 +1,39 @@
+[package]
+name = "org-evoframework-system-info"
+# The workspace version: `get_system_version` answers it as `build`.
+# Keep manifest.toml [plugin].version equal to it.
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Stocks the system.info shelf: get_system_info reads the host (name, OS, kernel, architecture, model, CPU, memory, uptime) and get_system_version reads the installed release record. Read-only; a missing source answers null."
+
+[lib]
+path = "src/lib.rs"
+
+# Out-of-process wire binary cross-built by `dist/scripts/deploy-distribution.sh`
+# and staged under `/opt/evo/plugins/org.evoframework.system.info/`; the
+# framework's Phase-2 discovery walks the search root at boot and admits the
+# bundle.
+[[bin]]
+name = "system-info-wire"
+path = "src/bin/system-info-wire.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+evo-plugin-sdk = { workspace = true }
+# `uname(2)` without unsafe code, for the machine name.
+nix = { version = "0.30", default-features = false, features = ["feature"] }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -3986,6 +3986,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "org-evoframework-system-info"
+version = "0.1.13"
+dependencies = [
+ "anyhow",
+ "evo-plugin-sdk",
+ "nix 0.30.1",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "org-evoframework-system-kiosk"
 version = "0.1.1"
 dependencies = [

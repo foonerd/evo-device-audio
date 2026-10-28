@@ -37,6 +37,7 @@ OOP_PLUGINS=(
     "org.evoframework.source.dlna:org-evoframework-source-dlna:source-dlna-wire:"
     "org.evoframework.storage.usb:org-evoframework-storage-usb:storage-usb-wire:"
     "org.evoframework.alarm:org-evoframework-alarm:alarm-wire:"
+    "org.evoframework.system.info:org-evoframework-system-info:system-info-wire:"
 )
 
 # Expected admitted-plugin count after a clean install/reinstall.
