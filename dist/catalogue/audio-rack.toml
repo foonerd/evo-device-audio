@@ -85,14 +85,13 @@ drive output-device selection.
 name = "zones"
 shape = 1
 description = """
-A zone is a name over one or more logical outputs, the names \
-the delivery shelf gives to physical outputs. Stocked by the \
-delivery plugin (org.evoframework.delivery.alsa) alongside \
-audio.delivery: zone.add / zone.update / zone.remove / \
-zone.list. A zone is not an ALSA device and not an EQ; it \
-moves no audio, no mixer and no drop-in. A logical output \
-sits in one zone at most, and cannot be removed while a zone \
-holds it.
+A zone is a name over one or more logical outputs. It stores \
+its own EQ. evo.audio.zones / eq_claim tells the one eq_only \
+cascade which zone's bands to use. A scene is a name and a \
+snapshot of every zone: scene.save, scene.list, scene.recall, \
+scene.remove. A zone is not an ALSA device. It moves no mixer \
+and no drop-in. A logical output sits in one zone at most, and \
+cannot be removed while a zone holds it.
 """
 
 [[racks.shelves]]
