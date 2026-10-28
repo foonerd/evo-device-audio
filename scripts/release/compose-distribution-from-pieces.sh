@@ -222,6 +222,9 @@ log "install surface overlaid (bootstrap, chown lib, rtc-wake)"
     echo "schema_version = 1"
     echo "bundle_kind = \"evo-device-audio\""
     echo "version = \"${CARGO_VERSION}\""
+    # The release the installer keeps on the box: the cut, never
+    # the Cargo version above.
+    echo "release = \"${CUT_VER}\""
     echo "architecture = \"${TARGET}\""
     echo "composed_from_pieces = true"
     echo "built_at_utc = \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""

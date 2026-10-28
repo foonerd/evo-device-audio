@@ -1061,6 +1061,48 @@ place_opt_evo() {
     rm -f "${tmp_cat}"
 }
 
+# A top-level `key = "value"` string from a bundle manifest, read
+# before its first table. Prints nothing when the key is absent,
+# empty, or not a plain string.
+manifest_string() {
+    local manifest="$1" key="$2"
+    awk -v k="${key}" '
+        /^\[/ { exit }
+        $0 ~ "^" k " = \"[^\"\\\\]*\"$" {
+            v = $0
+            sub("^" k " = \"", "", v)
+            sub("\"$", "", v)
+            print v
+            exit
+        }
+    ' "${manifest}"
+}
+
+# The installed release, which the system.info plugin reads: the
+# staged manifest's `release`, `architecture` and `built_at_utc`,
+# and nothing else. `version` is the Cargo version, not the
+# release, and is not copied. A key the manifest lacks is left out
+# of the record, never invented. Called once the staged binaries
+# are in place and bootstrap has run, so the wipe is behind it and
+# the file stays root-owned at 0644.
+INSTALLED_RECORD="${INSTALLED_RECORD:-/var/lib/evo/installed.toml}"
+write_installed_record() {
+    local manifest="${1:-${STAGE_DIR}/bundle-manifest.toml}"
+    local out="${2:-${INSTALLED_RECORD}}"
+    local tmp key value
+    mkdir -p "$(dirname "${out}")"
+    tmp="$(mktemp "${out}.XXXXXX")"
+    for key in release architecture built_at_utc; do
+        value="$(manifest_string "${manifest}" "${key}")"
+        if [[ -n "${value}" ]]; then
+            printf '%s = "%s"\n' "${key}" "${value}" >> "${tmp}"
+        fi
+    done
+    chmod 0644 "${tmp}"
+    mv -f "${tmp}" "${out}"
+    echo "  recorded the installed release in ${out}: $(manifest_string "${manifest}" release || true)"
+}
+
 install_main_systemd_unit() {
     # Main evo.service unit lives at /etc/systemd/system/evo.service.
     # bootstrap.sh handles only the .d/ drop-ins (exec-start.conf etc.);
@@ -1959,7 +2001,7 @@ case "${MODE}" in
         echo "[3/7] system packages (baseline + per-plugin prerequisites, parity-verified) ..." ; ensure_system_packages ; echo "  ok"
         echo "[4/7] stop prior steward ..." ; stop_prior_steward    ; echo "  ok"
         echo "[5/7] /opt/evo (binaries + plugins + catalogue) ..." ; place_opt_evo  ; echo "  ok"
-        echo "[6/7] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
+        echo "[6/7] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; write_installed_record ; echo "  ok"
         echo "[7/7] start + verify ..."   ; start_operator_surface ; verify_post_condition
         ;;
     reinstall)
@@ -1969,7 +2011,7 @@ case "${MODE}" in
         echo "[4/7] FULL WIPE (binaries + config + state + music) ..."
         wipe_full ; echo "  ok"
         echo "[5/7] /opt/evo ..."        ; place_opt_evo           ; echo "  ok"
-        echo "[6/7] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
+        echo "[6/7] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; write_installed_record ; echo "  ok"
         echo "[7/7] start + verify ..."  ; start_operator_surface ; verify_post_condition
         MUSIC_HASH_CHANGED="true"
         ;;
@@ -1981,7 +2023,7 @@ case "${MODE}" in
         echo "[5/8] CONFIG WIPE (binaries + config + state, music preserved) ..."
         wipe_config ; echo "  ok"
         echo "[6/8] /opt/evo ..."        ; place_opt_evo           ; echo "  ok"
-        echo "[7/8] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
+        echo "[7/8] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; write_installed_record ; echo "  ok"
         echo "[8/8] start + verify + music library byte-equal ..."  ; start_operator_surface ; verify_post_condition ; verify_music_hashes_preserved
         ;;
     wipe-user-data)

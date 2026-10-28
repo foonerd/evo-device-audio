@@ -11,6 +11,7 @@
 # Bundle layout (rooted at the tarball's root):
 #
 #   bundle-manifest.toml          Manifest: arch, version,
+#                                 release (from CUT_VERSION),
 #                                 plugin list, sha256 of every
 #                                 content file, build_at_utc.
 #   bin/evo-device-audio          Steward binary (per arch).
@@ -126,6 +127,25 @@ if [[ -z "${DIST_VERSION}" ]]; then
     exit 2
 fi
 
+# The release the bundle records, which the installer keeps on
+# the box: the one line in CUT_VERSION, without a leading v. Read
+# as compose-distribution-from-pieces.sh reads it. It is never the
+# Cargo version above, which only names the tarball.
+read_cut_release() {
+    local root="$1" cut
+    cut="$(tr -d ' \t\r\n' < "${root}/CUT_VERSION" 2>/dev/null || true)"
+    if [[ -z "${cut}" ]]; then
+        echo "FAIL: CUT_VERSION is missing or empty; the bundle records its release from it" >&2
+        return 1
+    fi
+    if [[ "${cut}" == v* ]]; then
+        echo "FAIL: CUT_VERSION must not carry a leading v (read: ${cut})" >&2
+        return 1
+    fi
+    printf '%s\n' "${cut}"
+}
+CUT_RELEASE="$(read_cut_release "${REPO_ROOT}")" || exit 1
+
 # Shared OOP plugin list — MUST stay identical to
 # deploy-distribution.sh. Sourced from one file so a reinstall
 # bundle cannot silently ship a subset of the deploy path.
@@ -145,6 +165,7 @@ fi
 echo "=== build-bundle.sh ==="
 echo "Target:  ${TARGET_TRIPLE}"
 echo "Version: ${DIST_VERSION}"
+echo "Release: ${CUT_RELEASE}"
 echo "Out:     ${EVO_BUNDLE_OUT_DIR}"
 echo ""
 
@@ -494,6 +515,7 @@ echo "[4/5] compose bundle-manifest.toml ..."
     echo "schema_version = 1"
     echo "bundle_kind = \"evo-device-audio\""
     echo "version = \"${DIST_VERSION}\""
+    echo "release = \"${CUT_RELEASE}\""
     echo "architecture = \"${TARGET_TRIPLE}\""
     echo "built_at_utc = \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
     echo ""
