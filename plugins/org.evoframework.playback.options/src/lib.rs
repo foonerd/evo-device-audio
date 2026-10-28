@@ -62,6 +62,11 @@
 //!   not. Absent state is a valid "first-boot" condition, not
 //!   a fault.
 //!
+//! - Holds one sleep timer (`options.set_sleep_timer`): after a
+//!   wait it fades the global volume on `audio.playback` to
+//!   silence, pauses, and puts the volume back. In memory only;
+//!   see `src/sleep_timer.rs`.
+//!
 //! ## What this plugin does NOT do
 //!
 //! - **Open ALSA, parse aplay -L, drive MPD.** That's
@@ -97,13 +102,14 @@ use evo_device_audio_shared::transition_envelope::{
 use evo_plugin_sdk::contract::{
     BuildInfo, ExternalAddressing, HappeningEmitter, HealthReport, LoadContext,
     Plugin, PluginDescription, PluginError, PluginIdentity, Request,
-    Respondent, Response, RuntimeCapabilities, SubjectAnnouncement,
-    SubjectAnnouncer, SubjectQuerier, SubjectStateStream,
+    Respondent, Response, RuntimeCapabilities, ShelfRequestDispatcher,
+    SubjectAnnouncement, SubjectAnnouncer, SubjectQuerier, SubjectStateStream,
     SubjectStateStreamError, SubjectStateSubscriber,
 };
 use evo_plugin_sdk::Manifest;
 use serde::{Deserialize, Serialize};
 
+mod sleep_timer;
 pub mod transition;
 
 /// Timeout the orchestrator waits for the playback warden's
@@ -306,6 +312,7 @@ const REQUEST_TYPES: &[&str] = &[
     "options.delete_eq_preset",
     "options.restore_last_known_good",
     "options.reset_to_defaults",
+    "options.set_sleep_timer",
 ];
 
 /// Upper bound for the crossfade-seconds operator setting.
@@ -813,6 +820,12 @@ pub struct PlaybackOptionsPlugin {
     /// init attempt.
     envelope_observed_channel:
         tokio::sync::Mutex<Option<Arc<EnvelopeObservedChannel>>>,
+    /// Shelf-request dispatcher from `LoadContext`. The sleep
+    /// timer reaches `audio.playback` through it for the volume
+    /// and the pause. `None` refuses arming the timer.
+    shelf_dispatcher: Option<Arc<dyn ShelfRequestDispatcher>>,
+    /// The one sleep timer. In memory only; unload cancels it.
+    sleep_timer: sleep_timer::SleepTimer,
     requests_handled: std::sync::atomic::AtomicU64,
 }
 
@@ -850,6 +863,8 @@ impl PlaybackOptionsPlugin {
             subject_publish_timeout_override: None,
             transition_overall_timeout_override: None,
             envelope_observed_channel: tokio::sync::Mutex::new(None),
+            shelf_dispatcher: None,
+            sleep_timer: sleep_timer::SleepTimer::default(),
             requests_handled: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -1612,6 +1627,8 @@ impl Plugin for PlaybackOptionsPlugin {
             self.subject_state_subscriber =
                 ctx.subject_state_subscriber.as_ref().map(Arc::clone);
             self.subject_querier = ctx.subject_querier.as_ref().map(Arc::clone);
+            self.shelf_dispatcher =
+                ctx.shelf_request_dispatcher.as_ref().map(Arc::clone);
             // Announce the settings subject so consumers
             // (playback.mpd, future UI plugins) can resolve
             // its canonical id + subscribe to state changes
@@ -1650,6 +1667,9 @@ impl Plugin for PlaybackOptionsPlugin {
                 requests_handled = self.requests_handled(),
                 "plugin unload"
             );
+            // A restart cancels the sleep timer. One that is
+            // fading puts the volume back first.
+            self.sleep_timer.cancel().await;
             self.happening_emitter = None;
             self.loaded = false;
             Ok(())
@@ -1752,6 +1772,9 @@ impl Respondent for PlaybackOptionsPlugin {
                 }
                 "options.reset_to_defaults" => {
                     self.handle_reset_to_defaults(req).await
+                }
+                "options.set_sleep_timer" => {
+                    self.handle_set_sleep_timer(req).await
                 }
                 other => Err(PluginError::Permanent(format!(
                     "request type {other:?} declared but no handler wired"
@@ -2451,6 +2474,49 @@ impl PlaybackOptionsPlugin {
             serde_json::Value::Number(payload.value.into()),
         )
         .await;
+        encode(
+            req,
+            &SimpleOk {
+                v: PAYLOAD_VERSION,
+                status: "ok",
+            },
+        )
+    }
+
+    /// Arm, replace, or cancel the sleep timer. `seconds` is the
+    /// wait before the fade and `fade_ms` how long the global
+    /// volume takes to reach silence; `seconds` 0 cancels. When
+    /// the fade ends playback pauses and the volume returns to
+    /// its level before the fade. Not a setting: nothing is
+    /// persisted, no happening is emitted, the settings subject
+    /// does not change, and crossfade stays as it is.
+    async fn handle_set_sleep_timer(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SetSleepTimerPayload = parse_versioned(req)?;
+        if payload.seconds == 0 {
+            self.sleep_timer.cancel().await;
+        } else {
+            let dispatcher =
+                self.shelf_dispatcher.as_ref().map(Arc::clone).ok_or_else(
+                    || {
+                        PluginError::Permanent(
+                            "the sleep timer reaches audio.playback through \
+                             the shelf dispatcher, and none was provided \
+                             at load"
+                                .to_string(),
+                        )
+                    },
+                )?;
+            self.sleep_timer
+                .arm(
+                    dispatcher,
+                    Duration::from_secs(u64::from(payload.seconds)),
+                    Duration::from_millis(u64::from(payload.fade_ms)),
+                )
+                .await;
+        }
         encode(
             req,
             &SimpleOk {
@@ -3292,6 +3358,22 @@ struct SetVolumeNormalizationPayload {
 }
 
 impl HasPayloadVersion for SetVolumeNormalizationPayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SetSleepTimerPayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    /// Seconds until the fade starts; 0 cancels.
+    seconds: u32,
+    /// Milliseconds the global volume takes to reach silence.
+    fade_ms: u32,
+}
+
+impl HasPayloadVersion for SetSleepTimerPayload {
     fn payload_version(&self) -> u32 {
         self.v
     }
@@ -4541,6 +4623,319 @@ mod tests {
             }
             other => panic!("expected Permanent, got {other:?}"),
         }
+    }
+
+    // ----- sleep timer -----
+
+    /// Stands in for `audio.playback`: keeps one global volume and
+    /// records every verb the sleep timer sends, in order.
+    #[derive(Default)]
+    struct StubPlayback {
+        volume: Mutex<u8>,
+        calls: Mutex<Vec<(String, String, Value)>>,
+    }
+
+    impl StubPlayback {
+        fn at(volume: u8) -> Arc<Self> {
+            let stub = Self::default();
+            *stub.volume.lock().unwrap() = volume;
+            Arc::new(stub)
+        }
+
+        fn volume(&self) -> u8 {
+            *self.volume.lock().unwrap()
+        }
+
+        fn calls(&self) -> Vec<(String, String, Value)> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn verbs(&self) -> Vec<String> {
+            self.calls().into_iter().map(|(_, verb, _)| verb).collect()
+        }
+    }
+
+    impl ShelfRequestDispatcher for StubPlayback {
+        fn dispatch<'a>(
+            &'a self,
+            shelf: &'a str,
+            request_type: &'a str,
+            payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<u8>,
+                            evo_plugin_sdk::contract::ShelfDispatchError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            use evo_plugin_sdk::contract::ShelfDispatchError;
+            Box::pin(async move {
+                let body: Value =
+                    serde_json::from_slice(&payload).unwrap_or(Value::Null);
+                self.calls.lock().unwrap().push((
+                    shelf.to_string(),
+                    request_type.to_string(),
+                    body.clone(),
+                ));
+                let answer = match request_type {
+                    "get_now_playing" => {
+                        json!({ "v": 1, "volume": self.volume() })
+                    }
+                    "set_volume" => {
+                        let level = body["volume"]
+                            .as_u64()
+                            .and_then(|v| u8::try_from(v).ok())
+                            .ok_or_else(|| ShelfDispatchError::Permanent {
+                                detail: "set_volume needs a u8 volume".into(),
+                            })?;
+                        *self.volume.lock().unwrap() = level;
+                        json!({ "v": 1, "status": "ok" })
+                    }
+                    "pause" => json!({ "v": 1, "status": "ok" }),
+                    other => {
+                        return Err(ShelfDispatchError::VerbNotStockedOnShelf {
+                            shelf: shelf.to_string(),
+                            request_type: other.to_string(),
+                        })
+                    }
+                };
+                Ok(answer.to_string().into_bytes())
+            })
+        }
+    }
+
+    async fn plugin_with_playback(
+        stub: &Arc<StubPlayback>,
+    ) -> (PlaybackOptionsPlugin, tempfile::TempDir) {
+        let (mut p, dir) = loaded_plugin().await;
+        p.shelf_dispatcher =
+            Some(Arc::clone(stub) as Arc<dyn ShelfRequestDispatcher>);
+        (p, dir)
+    }
+
+    fn sleep_timer(seconds: u32, fade_ms: u32) -> Request {
+        req(
+            "options.set_sleep_timer",
+            json!({ "v": 1, "seconds": seconds, "fade_ms": fade_ms }),
+        )
+    }
+
+    async fn advance(by: Duration) {
+        tokio::time::sleep(by).await;
+    }
+
+    /// Pin: the sleep timer is not crossfade. A whole run — wait,
+    /// fade, pause, restore — leaves the crossfade setting, the
+    /// options file, the settings subject and the happenings as
+    /// they were, and sends `audio.playback` nothing but the
+    /// volume read, the volume steps and the pause.
+    #[tokio::test(start_paused = true)]
+    async fn the_sleep_timer_leaves_the_crossfade_setting() {
+        let stub = StubPlayback::at(60);
+        let (mut p, dir) = plugin_with_playback(&stub).await;
+        let emitter = Arc::new(CapturingEmitter::default());
+        let announcer = Arc::new(CapturingAnnouncer::default());
+        p.happening_emitter = Some(emitter.clone());
+        p.subject_announcer = Some(announcer.clone());
+        p.handle_request(&req(
+            "options.set_crossfade_seconds",
+            json!({ "v": 1, "value": 5 }),
+        ))
+        .await
+        .unwrap();
+        // The setter publishes the settings subject from a spawned
+        // task; let it land before the counts are taken, so they
+        // measure the timer alone. The crossfade set itself shows
+        // as one happening and one subject update.
+        advance(Duration::from_secs(1)).await;
+        let state_path = dir.path().join(STATE_FILENAME);
+        let file_before = std::fs::read(&state_path).unwrap();
+        let events_before = emitter.count();
+        let updates_before = announcer.updates().len();
+        assert_eq!((events_before, updates_before), (1, 1));
+
+        p.handle_request(&sleep_timer(30, 2000)).await.unwrap();
+        advance(Duration::from_secs(40)).await;
+
+        assert!(
+            stub.verbs().iter().any(|v| v == "pause"),
+            "the timer ran to the pause"
+        );
+        assert_eq!(p.settings().crossfade_seconds, 5);
+        assert_eq!(
+            std::fs::read(&state_path).unwrap(),
+            file_before,
+            "nothing is written to the options file"
+        );
+        assert_eq!(emitter.count(), events_before, "no happening");
+        assert_eq!(
+            announcer.updates().len(),
+            updates_before,
+            "the settings subject does not move"
+        );
+        for (shelf, verb, _) in stub.calls() {
+            assert_eq!(shelf, "audio.playback");
+            assert!(
+                ["get_now_playing", "set_volume", "pause"]
+                    .contains(&verb.as_str()),
+                "the timer sent {verb:?}"
+            );
+        }
+    }
+
+    /// Pin: the volume is not left silent. The fade steps the
+    /// global volume down to 0, playback pauses, and only then the
+    /// volume returns to its level before the fade.
+    #[tokio::test(start_paused = true)]
+    async fn the_volume_is_back_after_the_sleep_timer_pauses() {
+        let stub = StubPlayback::at(40);
+        let (p, _dir) = plugin_with_playback(&stub).await;
+        let resp = p.handle_request(&sleep_timer(10, 3000)).await.unwrap();
+        let v: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v, json!({ "v": 1, "status": "ok" }));
+        advance(Duration::from_secs(9)).await;
+        assert!(stub.calls().is_empty(), "nothing before the wait is over");
+        advance(Duration::from_secs(5)).await;
+
+        let calls = stub.calls();
+        let verbs = stub.verbs();
+        assert_eq!(verbs[0], "get_now_playing");
+        assert_eq!(verbs.iter().filter(|v| *v == "pause").count(), 1);
+        let pause = verbs.iter().position(|v| v == "pause").unwrap();
+        let fade: Vec<u64> = calls[1..pause]
+            .iter()
+            .map(|(_, verb, body)| {
+                assert_eq!(verb, "set_volume");
+                body["volume"].as_u64().unwrap()
+            })
+            .collect();
+        assert!(
+            fade.windows(2).all(|w| w[1] < w[0]),
+            "the fade only goes down: {fade:?}"
+        );
+        assert_eq!(fade.last(), Some(&0), "silence before the pause");
+        assert_eq!(verbs[pause + 1..], ["set_volume"], "one restore");
+        assert_eq!(calls[pause + 1].2["volume"], 40);
+        assert_eq!(stub.volume(), 40, "not silent after the pause");
+        assert!(!p.sleep_timer.is_armed().await);
+    }
+
+    /// Pin: a restart cancels the sleep timer. Unload disarms it,
+    /// no options file is written, and a plugin loaded again from
+    /// the same state starts with no timer; the wait passes and
+    /// nothing reaches `audio.playback`.
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_leaves_no_sleep_timer_armed() {
+        let stub = StubPlayback::at(50);
+        let (mut p, dir) = plugin_with_playback(&stub).await;
+        p.handle_request(&sleep_timer(30, 1000)).await.unwrap();
+        assert!(p.sleep_timer.is_armed().await);
+        p.unload().await.unwrap();
+        assert!(!p.sleep_timer.is_armed().await);
+
+        let state_path = dir.path().join(STATE_FILENAME);
+        assert!(!state_path.exists(), "the timer wrote no options file");
+        let mut again =
+            PlaybackOptionsPlugin::new().with_state_path(state_path.clone());
+        let settings = again.load_settings_from_disk().await.unwrap();
+        *again.settings.write().unwrap() = settings;
+        again.shelf_dispatcher =
+            Some(Arc::clone(&stub) as Arc<dyn ShelfRequestDispatcher>);
+        again.loaded = true;
+        assert!(!again.sleep_timer.is_armed().await);
+
+        advance(Duration::from_secs(60)).await;
+        assert!(
+            stub.calls().is_empty(),
+            "no fade and no pause after a restart"
+        );
+    }
+
+    /// A restart during the fade puts the volume back and does not
+    /// pause.
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_during_the_fade_puts_the_volume_back() {
+        let stub = StubPlayback::at(50);
+        let (mut p, _dir) = plugin_with_playback(&stub).await;
+        p.handle_request(&sleep_timer(5, 4000)).await.unwrap();
+        advance(Duration::from_secs(7)).await;
+        assert!(stub.volume() < 50, "fading");
+        p.unload().await.unwrap();
+        assert_eq!(stub.volume(), 50);
+        advance(Duration::from_secs(10)).await;
+        assert!(!stub.verbs().iter().any(|v| v == "pause"));
+        assert_eq!(stub.volume(), 50);
+    }
+
+    /// `seconds` 0 cancels: a timer still waiting never reaches
+    /// `audio.playback`. Cancelling with nothing armed is not an
+    /// error.
+    #[tokio::test(start_paused = true)]
+    async fn seconds_zero_cancels_the_sleep_timer() {
+        let stub = StubPlayback::at(50);
+        let (p, _dir) = plugin_with_playback(&stub).await;
+        p.handle_request(&sleep_timer(30, 1000)).await.unwrap();
+        advance(Duration::from_secs(10)).await;
+        p.handle_request(&sleep_timer(0, 0)).await.unwrap();
+        assert!(!p.sleep_timer.is_armed().await);
+        advance(Duration::from_secs(60)).await;
+        assert!(stub.calls().is_empty());
+        p.handle_request(&sleep_timer(0, 0)).await.unwrap();
+    }
+
+    /// A cancel during the fade stops it and puts the volume back
+    /// to its level before the fade; playback is not paused.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_during_the_fade_restores_the_level() {
+        let stub = StubPlayback::at(70);
+        let (p, _dir) = plugin_with_playback(&stub).await;
+        p.handle_request(&sleep_timer(5, 4000)).await.unwrap();
+        advance(Duration::from_secs(7)).await;
+        assert!(stub.volume() < 70, "fading");
+        p.handle_request(&sleep_timer(0, 0)).await.unwrap();
+        assert_eq!(stub.volume(), 70);
+        let sent = stub.calls().len();
+        advance(Duration::from_secs(10)).await;
+        assert_eq!(stub.calls().len(), sent, "the fade stopped");
+        assert!(!stub.verbs().iter().any(|v| v == "pause"));
+    }
+
+    /// A second set replaces the armed timer: the first wait
+    /// passes with nothing sent, and the one pause comes at the
+    /// second timer's time.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_set_replaces_the_armed_sleep_timer() {
+        let stub = StubPlayback::at(30);
+        let (p, _dir) = plugin_with_playback(&stub).await;
+        p.handle_request(&sleep_timer(10, 1000)).await.unwrap();
+        advance(Duration::from_secs(5)).await;
+        p.handle_request(&sleep_timer(30, 1000)).await.unwrap();
+        advance(Duration::from_secs(20)).await;
+        assert!(stub.calls().is_empty(), "the first timer was replaced");
+        advance(Duration::from_secs(12)).await;
+        assert_eq!(stub.verbs().iter().filter(|v| *v == "pause").count(), 1);
+        assert_eq!(stub.volume(), 30);
+    }
+
+    /// Without the shelf dispatcher the timer cannot reach
+    /// `audio.playback`: arming is refused and nothing is armed;
+    /// cancelling still answers.
+    #[tokio::test]
+    async fn arming_the_sleep_timer_without_a_dispatcher_is_refused() {
+        let (p, _dir) = loaded_plugin().await;
+        match p.handle_request(&sleep_timer(10, 1000)).await.unwrap_err() {
+            PluginError::Permanent(msg) => {
+                assert!(msg.contains("audio.playback"), "got: {msg}")
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+        assert!(!p.sleep_timer.is_armed().await);
+        p.handle_request(&sleep_timer(0, 0)).await.unwrap();
     }
 
     #[tokio::test]

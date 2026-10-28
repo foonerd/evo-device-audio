@@ -81,5 +81,6 @@ request_types = [
     "options.delete_eq_preset",
     "options.restore_last_known_good",
     "options.reset_to_defaults",
+    "options.set_sleep_timer",
 ]
 response_budget_ms = 2000
