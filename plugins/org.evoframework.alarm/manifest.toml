@@ -1,0 +1,48 @@
+[plugin]
+name = "org.evoframework.alarm"
+# Keep in sync with this crate's Cargo.toml [package].version (PluginIdentity + packaging).
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "audio.alarm"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+# The appointment ledger with must-wake appointments is the
+# 0.1.13 framework surface this plugin schedules through.
+evo_min_version = "0.1.13"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 8
+max_cpu_percent = 1
+
+[lifecycle]
+# Reactive-only: the alarm is one appointment on the framework
+# ledger. The ledger keeps it across restarts, fires it, and
+# arms the device wake; this plugin only sets and clears it.
+mode = "reactive-only"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities]
+appointments = true
+
+[capabilities.respondent]
+request_types = ["alarm.set", "alarm.clear"]
+response_budget_ms = 2000

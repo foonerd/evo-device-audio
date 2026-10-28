@@ -1,0 +1,29 @@
+schema_version: "1.0"
+plugin: org.evoframework.alarm
+owner: evo-device-audio
+isolation: oop
+has_os_dependencies: false
+
+# One alarm on the `audio.alarm` shelf. The plugin holds no state
+# of its own and touches no host resource: the alarm is one
+# appointment on the framework appointment ledger, which keeps it
+# across restarts, fires it, and arms the device wake through the
+# distribution's own hook. On fire the ledger dispatches
+# `queue.load_playlist_to_queue` on `audio.queue`.
+
+capability_intent:
+  - id: appointment_ledger
+    need: create and cancel the one appointment `alarm` on the framework appointment ledger (`capabilities.appointments = true`). The appointment is weekly on the weekdays the operator names, at a local HH:MM, with must_wake_device true; its action is `queue.load_playlist_to_queue` on `audio.queue` with `{ v: 1, playlist_name, start_position: 0 }`.
+    access_path: framework/appointments
+    failure_mode: plugin admits; alarm.set and alarm.clear refuse with PluginError::Permanent naming the missing ledger handle; no alarm is scheduled.
+
+required_binaries: []
+required_kernel_modules: []
+required_system_services: []
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+  expected:
+    - steward state directory exists
+host_provisioning: {}

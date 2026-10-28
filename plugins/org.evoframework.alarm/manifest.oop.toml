@@ -1,0 +1,43 @@
+[plugin]
+name = "org.evoframework.alarm"
+# Keep in sync with this crate's Cargo.toml [package].version (PluginIdentity + packaging).
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "audio.alarm"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+evo_min_version = "0.1.13"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 8
+max_cpu_percent = 1
+
+[lifecycle]
+mode = "reactive-only"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities]
+appointments = true
+
+[capabilities.respondent]
+request_types = ["alarm.set", "alarm.clear"]
+response_budget_ms = 2000

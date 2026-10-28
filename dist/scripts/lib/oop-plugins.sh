@@ -36,6 +36,7 @@ OOP_PLUGINS=(
     "org.evoframework.system.kiosk:org-evoframework-system-kiosk:system-kiosk-wire:"
     "org.evoframework.source.dlna:org-evoframework-source-dlna:source-dlna-wire:"
     "org.evoframework.storage.usb:org-evoframework-storage-usb:storage-usb-wire:"
+    "org.evoframework.alarm:org-evoframework-alarm:alarm-wire:"
 )
 
 # Expected admitted-plugin count after a clean install/reinstall.

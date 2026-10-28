@@ -29,6 +29,7 @@ members = [
     "plugins/org.evoframework.system.notifications",
     "plugins/org.evoframework.system.kiosk",
     "plugins/org.evoframework.storage.usb",
+    "plugins/org.evoframework.alarm",
 ]
 
 # Each plugin crate lives under plugins/<full.dotted.name>/ matching

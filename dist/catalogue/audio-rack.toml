@@ -95,6 +95,19 @@ cannot be removed while a zone holds it.
 """
 
 [[racks.shelves]]
+name = "alarm"
+shape = 1
+description = """
+One alarm that wakes the device and plays a playlist. Stocked \
+by org.evoframework.alarm: alarm.set names the weekdays, a \
+local HH:MM and a playlist, and replaces the alarm; \
+alarm.clear takes it away. The alarm is one appointment on \
+the framework appointment ledger whose fire loads that \
+playlist into the queue and plays it. It is not the sleep \
+timer.
+"""
+
+[[racks.shelves]]
 name = "options"
 shape = 2
 description = """

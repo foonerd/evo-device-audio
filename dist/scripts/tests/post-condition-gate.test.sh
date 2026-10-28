@@ -47,8 +47,10 @@ FAIL=0
 # shellcheck disable=SC2034
 healthy_env() {
     ACTIVE_STATE="active"
-    PLUGINS_ADMITTED=19
-    PLUGINS_EXPECTED=19
+    # Twenty: every entry on dist/scripts/lib/oop-plugins.sh, the
+    # twentieth being org.evoframework.alarm.
+    PLUGINS_ADMITTED=20
+    PLUGINS_EXPECTED=20
     ADMISSION_FAILURES=0
     NOT_DECLARED=0
     JOURNAL_FAIL_COUNT=0
@@ -134,6 +136,18 @@ if grep -q 'start_operator_surface' "$INSTALLER" \
     PASS=$((PASS + 1))
 else
     echo "FAIL  installer does not restart evo-ui and evo-kiosk"
+    FAIL=$((FAIL + 1))
+fi
+
+# The healthy count above is the ship list, and the alarm is on it.
+# shellcheck source=../lib/oop-plugins.sh
+source "$SCRIPT_DIR/../lib/oop-plugins.sh"
+if [[ "${#OOP_PLUGINS[@]}" -eq 20 ]] \
+    && printf '%s\n' "${OOP_PLUGINS[@]}" | grep -q '^org\.evoframework\.alarm:'; then
+    echo "PASS  the ship list is 20 plugins, org.evoframework.alarm among them"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL  the ship list is ${#OOP_PLUGINS[@]} plugins, or org.evoframework.alarm is not on it"
     FAIL=$((FAIL + 1))
 fi
 
