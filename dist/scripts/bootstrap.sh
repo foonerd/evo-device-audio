@@ -128,6 +128,8 @@ STORAGE_USB_SUDOERS_FILE="/etc/sudoers.d/evo-storage-usb"
 STORAGE_USB_WRAPPER_DST="/usr/local/bin/evo-usb-mount"
 RTC_WAKE_SUDOERS_FILE="/etc/sudoers.d/evo-rtc-wake"
 RTC_WAKE_WRAPPER_DST="/usr/local/bin/evo-rtc-wake"
+SET_TIMEZONE_SUDOERS_FILE="/etc/sudoers.d/evo-set-timezone"
+SET_TIMEZONE_WRAPPER_DST="/usr/local/bin/evo-set-timezone"
 STORAGE_USB_STATE_DIR="/var/lib/evo/plugins/org.evoframework.storage.usb"
 DACS_CATALOGUE_DIR="/usr/share/evo-device-audio"
 DACS_CATALOGUE_PATH="${DACS_CATALOGUE_DIR}/dacs.json"
@@ -881,6 +883,35 @@ install -m 0440 -o root -g root "$TMP" "$RTC_WAKE_SUDOERS_FILE"
 rm -f "$TMP"
 trap - EXIT
 echo "[bootstrap] installed $RTC_WAKE_WRAPPER_DST and $RTC_WAKE_SUDOERS_FILE"
+
+# ----------------------------------------------------------
+# Step 1h.t: /usr/local/bin/evo-set-timezone +
+#            /etc/sudoers.d/evo-set-timezone (narrow NOPASSWD)
+# ----------------------------------------------------------
+# The steward service user cannot set the host's zone itself.
+# This root-owned wrapper is the only privileged target of
+# timezone.set: it takes one zone, checks it against the host's
+# zone database, and runs timedatectl set-timezone.
+SET_TIMEZONE_WRAPPER_SRC="$DIST_DIR/bin/evo-set-timezone"
+SET_TIMEZONE_SUDOERS_TEMPLATE="$DIST_DIR/sudoers.d/evo-set-timezone.in"
+if [[ ! -f "$SET_TIMEZONE_WRAPPER_SRC" || ! -f "$SET_TIMEZONE_SUDOERS_TEMPLATE" ]]; then
+    echo "timezone wrapper or sudoers template missing under $DIST_DIR" >&2
+    exit 2
+fi
+install -m 0755 -o root -g root "$SET_TIMEZONE_WRAPPER_SRC" "$SET_TIMEZONE_WRAPPER_DST"
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+sed -e "s|@EVO_SERVICE_USER@|$SERVICE_USER|g" \
+    "$SET_TIMEZONE_SUDOERS_TEMPLATE" > "$TMP"
+if ! visudo -c -f "$TMP" >/dev/null; then
+    echo "timezone sudoers fragment failed visudo -c; refusing to install" >&2
+    trap - EXIT
+    exit 2
+fi
+install -m 0440 -o root -g root "$TMP" "$SET_TIMEZONE_SUDOERS_FILE"
+rm -f "$TMP"
+trap - EXIT
+echo "[bootstrap] installed $SET_TIMEZONE_WRAPPER_DST and $SET_TIMEZONE_SUDOERS_FILE"
 
 # ----------------------------------------------------------
 # Step 1d: /usr/share/evo-device-audio/dacs.json

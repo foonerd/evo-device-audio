@@ -207,6 +207,10 @@ log "kiosk program ${TARGET} present ($(wc -c < "${KIOSK_PROGRAM}") bytes)"
     "composed tree has no dist/bin/evo-rtc-wake; bootstrap Step 1h exits 2"
 [[ -f "${STAGE}/dist/sudoers.d/evo-rtc-wake.in" ]] || die \
     "composed tree has no dist/sudoers.d/evo-rtc-wake.in; bootstrap Step 1h exits 2"
+[[ -x "${STAGE}/dist/bin/evo-set-timezone" ]] || die \
+    "composed tree has no dist/bin/evo-set-timezone; bootstrap Step 1h.t exits 2"
+[[ -f "${STAGE}/dist/sudoers.d/evo-set-timezone.in" ]] || die \
+    "composed tree has no dist/sudoers.d/evo-set-timezone.in; bootstrap Step 1h.t exits 2"
 if grep -qE 'chown[[:space:]]+-R[[:space:]]+"\$SERVICE_USER:\$SERVICE_USER"[[:space:]]+/var/lib/evo' \
         "${STAGE}/dist/scripts/bootstrap.sh"; then
     die "composed bootstrap still recursively chowns /var/lib/evo"
@@ -216,7 +220,7 @@ grep -q 'chown_tree_same_fs /var/lib/evo' "${STAGE}/dist/scripts/bootstrap.sh" \
 grep -q 'chown_tenant_state_trees' "${STAGE}/dist/scripts/bootstrap.sh" \
     || die "composed bootstrap does not tenant-own kiosk state trees after layer installers"
 log "evo.service present ($(wc -c < "${STAGE}/dist/systemd/evo.service") bytes)"
-log "install surface overlaid (bootstrap, chown lib, rtc-wake)"
+log "install surface overlaid (bootstrap, chown lib, rtc-wake, set-timezone)"
 
 {
     echo "schema_version = 1"

@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Stocks the system.locale shelf: language.set sets the operator's language to one the glass has a catalogue for, stores it, and answers the language in force."
+description = "Stocks the system.locale shelf: language.set sets the operator's language to one the glass has a catalogue for; timezone.set sets the device's zone and has the pending alarm follow it. Each answers what is in force."
 
 [lib]
 path = "src/lib.rs"
@@ -25,13 +25,13 @@ evo-plugin-sdk = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["fs", "sync"] }
+tokio = { workspace = true, features = ["fs", "process", "sync", "time"] }
 toml = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true

@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Set the host's timezone to one IANA zone the host's zone
+# database holds. The only privileged target of timezone.set:
+# one argument, checked here before timedatectl sees it.
+set -euo pipefail
+readonly TIMEDATECTL="/usr/bin/timedatectl"
+readonly ZONEINFO="/usr/share/zoneinfo"
+readonly ZONE_RE='^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$'
+if [[ $# -ne 1 || ! "$1" =~ $ZONE_RE || "$1" == Factory ]]; then
+    echo "evo-set-timezone: expected one IANA zone name" >&2
+    exit 1
+fi
+# The list is read whole before it is searched, so an early
+# match cannot fail the pipe.
+zones="$("$TIMEDATECTL" list-timezones)"
+if ! grep -Fxq -- "$1" <<<"$zones"; then
+    echo "evo-set-timezone: $1 is not in the host's zone list" >&2
+    exit 1
+fi
+if [[ "$(head -c 4 -- "$ZONEINFO/$1" 2>/dev/null)" != TZif ]]; then
+    echo "evo-set-timezone: $ZONEINFO/$1 is not a zone file" >&2
+    exit 1
+fi
+exec "$TIMEDATECTL" set-timezone -- "$1"

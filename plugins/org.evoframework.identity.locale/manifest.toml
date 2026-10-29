@@ -31,13 +31,20 @@ max_memory_mb = 8
 max_cpu_percent = 1
 
 [lifecycle]
-# Reactive-only: one setter over one stored value.
+# Reactive-only: two setters, each answering what is in force.
 mode = "reactive-only"
 autostart = true
 restart_on_crash = true
 restart_budget = 5
 
 [capabilities.respondent]
-# No verb_capabilities: changing the language asks for no password.
-request_types = ["language.set"]
-response_budget_ms = 2000
+request_types = ["language.set", "timezone.set"]
+# timezone.set applies the zone, waits more than a second, then
+# waits on alarm.reschedule before it answers.
+response_budget_ms = 6000
+
+[capabilities.respondent.verb_capabilities]
+# language.set is absent: changing the language asks for no
+# password. A zone change is a per-device system setting, a write
+# at system_admin, not step-up.
+"timezone.set" = { kind = "write", scope = "system_admin" }

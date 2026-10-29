@@ -23,7 +23,8 @@ else
     fail "compose does not call overlay-dist-install-surface.sh"
 fi
 
-# A frozen-piece-shaped tree: old bootstrap, no chown lib, no RTC.
+# A frozen-piece-shaped tree: old bootstrap, no chown lib, no RTC,
+# no timezone grant.
 DEST="$(mktemp -d)"
 cleanup() { rm -rf "$DEST"; }
 trap cleanup EXIT
@@ -37,6 +38,15 @@ printf 'old-captive\n' > "$DEST/bin/evo-captive-probe"
 printf 'old-kiosk\n' > "$DEST/sudoers.d/evo-system-kiosk.in"
 mkdir -p "$DEST/systemd/evo.service.d"
 printf 'exec\n' > "$DEST/systemd/evo.service.d/exec-start.conf"
+
+# The piece alone lacks the timezone grant, so the overlay is what
+# places it.
+if [[ ! -e "$DEST/bin/evo-set-timezone" \
+    && ! -e "$DEST/sudoers.d/evo-set-timezone.in" ]]; then
+    pass "a piece-only tree lacks evo-set-timezone and its .in"
+else
+    fail "the piece fixture already carries the timezone grant"
+fi
 
 bash "$OVERLAY" --repo-root "$REPO_ROOT" --dest-dist "$DEST"
 
@@ -70,6 +80,18 @@ if [[ -f "$DEST/sudoers.d/evo-rtc-wake.in" ]]; then
     pass "overlay places evo-rtc-wake.in"
 else
     fail "overlay missing evo-rtc-wake.in"
+fi
+
+if [[ -x "$DEST/bin/evo-set-timezone" ]]; then
+    pass "overlay places evo-set-timezone"
+else
+    fail "overlay missing evo-set-timezone"
+fi
+
+if [[ -f "$DEST/sudoers.d/evo-set-timezone.in" ]]; then
+    pass "overlay places evo-set-timezone.in"
+else
+    fail "overlay missing evo-set-timezone.in"
 fi
 
 if [[ -f "$DEST/systemd/evo.service" ]]; then

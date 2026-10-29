@@ -1,10 +1,20 @@
 // Copyright (c) 2026 Just a Nerd
 // SPDX-License-Identifier: Apache-2.0
-//! Tests for the identity.locale plugin, against a state directory
-//! in a temporary directory.
+//! Tests for the identity.locale plugin: the language against a
+//! state directory in a temporary directory, the zone against a
+//! stub host and a stub shelf dispatcher on tokio's test clock.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
+
+use evo_plugin_sdk::contract::ShelfDispatchError;
+use evo_plugin_sdk::manifest::VerbCapability;
 use serde_json::{json, Value};
 
+use super::timezone::{
+    HostFuture, ALARM_SHELF, FACTORY, SETTLE, VERB_ALARM_RESCHEDULE,
+};
 use super::*;
 
 /// A plugin booted the way load boots it, over a state file in
@@ -45,29 +55,89 @@ fn stored(dir: &Path) -> Option<String> {
 
 // ----- manifest / surface -----
 
-/// Both manifests stock `system.locale` with `language.set` only,
-/// and no capability gate: changing the language asks for no
-/// password.
-#[test]
-fn both_manifests_stock_system_locale_with_an_ungated_language_set() {
+fn both_manifests() -> [Manifest; 2] {
     let oop = Manifest::from_toml(include_str!("../manifest.oop.toml"))
         .expect("manifest.oop.toml parses");
-    for m in [manifest(), oop] {
+    [manifest(), oop]
+}
+
+/// Both manifests stock `system.locale` with the two setters, a
+/// 6000 ms budget for the zone change's wait and reschedule, and
+/// one gate: `timezone.set` is a write at `system_admin`.
+#[test]
+fn both_manifests_stock_system_locale_with_two_setters() {
+    for m in both_manifests() {
         assert_eq!(m.plugin.name, PLUGIN_NAME);
         assert_eq!(m.target.shelf, "system.locale");
         assert_eq!(m.target.shape, 1);
         let resp = m.capabilities.respondent.expect("respondent");
-        assert_eq!(resp.request_types, vec![VERB_LANGUAGE_SET]);
+        assert_eq!(
+            resp.request_types,
+            vec![VERB_LANGUAGE_SET, VERB_TIMEZONE_SET]
+        );
+        assert_eq!(resp.response_budget_ms, 6000);
+        assert_eq!(
+            resp.verb_capabilities.into_iter().collect::<Vec<_>>(),
+            vec![(
+                VERB_TIMEZONE_SET.to_string(),
+                VerbCapability::Write {
+                    scope: "system_admin".to_string()
+                }
+            )]
+        );
+    }
+}
+
+/// Pin: language.set stays ungated. Changing the language asks
+/// for no password, in either manifest.
+#[test]
+fn language_set_stays_ungated() {
+    for m in both_manifests() {
+        let resp = m.capabilities.respondent.expect("respondent");
+        assert!(resp.request_types.iter().any(|v| v == VERB_LANGUAGE_SET));
         assert!(
-            resp.verb_capabilities.is_empty(),
-            "no gate on language.set: {:?}",
+            !resp.verb_capabilities.contains_key(VERB_LANGUAGE_SET),
+            "language.set is gated: {:?}",
+            resp.verb_capabilities
+        );
+    }
+}
+
+/// Pin: `alarm.reschedule` declares no verb capability, in either
+/// alarm manifest. The shelf dispatcher calls it as this plugin,
+/// whose principal holds no capability; a gate there would refuse
+/// every zone change's reschedule.
+#[test]
+fn alarm_reschedule_declares_no_verb_capabilities() {
+    for (file, text) in [
+        (
+            "alarm manifest.toml",
+            include_str!("../../org.evoframework.alarm/manifest.toml"),
+        ),
+        (
+            "alarm manifest.oop.toml",
+            include_str!("../../org.evoframework.alarm/manifest.oop.toml"),
+        ),
+    ] {
+        let m = Manifest::from_toml(text).expect(file);
+        assert_eq!(m.target.shelf, ALARM_SHELF, "{file}");
+        let resp = m.capabilities.respondent.expect(file);
+        assert!(
+            resp.request_types
+                .iter()
+                .any(|v| v == VERB_ALARM_RESCHEDULE),
+            "{file} does not stock {VERB_ALARM_RESCHEDULE}"
+        );
+        assert!(
+            !resp.verb_capabilities.contains_key(VERB_ALARM_RESCHEDULE),
+            "{file} gates {VERB_ALARM_RESCHEDULE}: {:?}",
             resp.verb_capabilities
         );
     }
 }
 
 #[tokio::test]
-async fn describe_names_the_manifest_verb() {
+async fn describe_names_the_manifest_verbs() {
     let d = LocalePlugin::new().describe().await;
     let declared = manifest().capabilities.respondent.unwrap().request_types;
     assert_eq!(d.runtime_capabilities.request_types, declared);
@@ -188,16 +258,424 @@ async fn a_malformed_payload_is_refused() {
     assert_eq!(stored(dir.path()), None);
 }
 
-/// The plugin carries no zone verb and needs no host grant.
-#[test]
-fn the_plugin_sets_the_language_only() {
-    for (file, text) in [
-        ("src/lib.rs", include_str!("lib.rs")),
-        ("manifest.toml", include_str!("../manifest.toml")),
-        ("manifest.oop.toml", include_str!("../manifest.oop.toml")),
-    ] {
-        for token in ["timezone", "zoneinfo", "localtime", "sudo"] {
-            assert!(!text.contains(token), "{file} names {token:?}");
+// ----- timezone.set -----
+
+/// What the host and the dispatcher were asked, in order, on the
+/// test clock.
+#[derive(Debug, Clone, PartialEq)]
+enum Seen {
+    Apply(String),
+    Reschedule,
+}
+
+#[derive(Default)]
+struct Timeline(Mutex<Vec<(Seen, tokio::time::Instant)>>);
+
+impl Timeline {
+    fn push(&self, seen: Seen) {
+        self.0
+            .lock()
+            .unwrap()
+            .push((seen, tokio::time::Instant::now()));
+    }
+
+    fn seen(&self) -> Vec<Seen> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(s, _)| s.clone())
+            .collect()
+    }
+
+    /// The time from each apply to the reschedule after it.
+    fn gaps(&self) -> Vec<Duration> {
+        let events = self.0.lock().unwrap();
+        events
+            .windows(2)
+            .filter_map(|w| match (&w[0].0, &w[1].0) {
+                (Seen::Apply(_), Seen::Reschedule) => Some(w[1].1 - w[0].1),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// Stands in for the host: a zone in force, the zones its database
+/// holds, and an apply that can fail, fail after moving the zone,
+/// or report success and move nothing.
+struct StubHost {
+    timeline: Arc<Timeline>,
+    in_force: Mutex<String>,
+    held: Vec<&'static str>,
+    apply_fails: AtomicBool,
+    failed_apply_moves: AtomicBool,
+    apply_moves_nothing: AtomicBool,
+    zone_unreadable: AtomicBool,
+    list_unreadable: AtomicBool,
+}
+
+impl StubHost {
+    fn new(timeline: &Arc<Timeline>, in_force: &str) -> Self {
+        Self {
+            timeline: Arc::clone(timeline),
+            in_force: Mutex::new(in_force.to_string()),
+            held: vec!["Etc/UTC", "Europe/London", "America/New_York", FACTORY],
+            apply_fails: AtomicBool::new(false),
+            failed_apply_moves: AtomicBool::new(false),
+            apply_moves_nothing: AtomicBool::new(false),
+            zone_unreadable: AtomicBool::new(false),
+            list_unreadable: AtomicBool::new(false),
         }
     }
+
+    fn in_force(&self) -> String {
+        self.in_force.lock().unwrap().clone()
+    }
+}
+
+impl ZoneHost for StubHost {
+    fn zone_in_force(&self) -> HostFuture<'_, String> {
+        Box::pin(async {
+            if self.zone_unreadable.load(Ordering::SeqCst) {
+                return Err("timedatectl show failed".to_string());
+            }
+            Ok(self.in_force())
+        })
+    }
+
+    fn holds<'a>(&'a self, zone: &'a str) -> HostFuture<'a, bool> {
+        Box::pin(async move {
+            if self.list_unreadable.load(Ordering::SeqCst) {
+                return Err("timedatectl list-timezones failed".to_string());
+            }
+            Ok(self.held.contains(&zone))
+        })
+    }
+
+    fn apply<'a>(&'a self, zone: &'a str) -> HostFuture<'a, ()> {
+        Box::pin(async move {
+            self.timeline.push(Seen::Apply(zone.to_string()));
+            let fails = self.apply_fails.load(Ordering::SeqCst);
+            let moves = if fails {
+                self.failed_apply_moves.load(Ordering::SeqCst)
+            } else {
+                !self.apply_moves_nothing.load(Ordering::SeqCst)
+            };
+            if moves {
+                *self.in_force.lock().unwrap() = zone.to_string();
+            }
+            if fails {
+                return Err("sudo: evo-set-timezone exited 1".to_string());
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Stands in for the shelf dispatcher: records each call, and
+/// refuses when told to.
+struct StubDispatcher {
+    timeline: Arc<Timeline>,
+    calls: Mutex<Vec<(String, String, Value)>>,
+    refuse: AtomicBool,
+}
+
+impl StubDispatcher {
+    fn new(timeline: &Arc<Timeline>) -> Self {
+        Self {
+            timeline: Arc::clone(timeline),
+            calls: Mutex::new(Vec::new()),
+            refuse: AtomicBool::new(false),
+        }
+    }
+
+    fn calls(&self) -> Vec<(String, String, Value)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl ShelfRequestDispatcher for StubDispatcher {
+    fn dispatch<'a>(
+        &'a self,
+        shelf: &'a str,
+        request_type: &'a str,
+        payload: Vec<u8>,
+        _instance_id: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<Output = Result<Vec<u8>, ShelfDispatchError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.timeline.push(Seen::Reschedule);
+            self.calls.lock().unwrap().push((
+                shelf.to_string(),
+                request_type.to_string(),
+                serde_json::from_slice(&payload).unwrap(),
+            ));
+            if self.refuse.load(Ordering::SeqCst) {
+                return Err(ShelfDispatchError::Transient {
+                    detail: "the alarm plugin is restarting".to_string(),
+                });
+            }
+            Ok(br#"{"v":1,"status":"ok"}"#.to_vec())
+        })
+    }
+}
+
+struct Rig {
+    timeline: Arc<Timeline>,
+    host: Arc<StubHost>,
+    dispatcher: Arc<StubDispatcher>,
+    plugin: LocalePlugin,
+}
+
+/// A loaded plugin over a stub host with `in_force` as its zone and
+/// a stub dispatcher.
+fn rig(in_force: &str) -> Rig {
+    let timeline = Arc::new(Timeline::default());
+    let host = Arc::new(StubHost::new(&timeline, in_force));
+    let dispatcher = Arc::new(StubDispatcher::new(&timeline));
+    let mut plugin = LocalePlugin::new();
+    plugin.zone_host = Arc::clone(&host) as Arc<dyn ZoneHost>;
+    plugin.dispatcher =
+        Some(Arc::clone(&dispatcher) as Arc<dyn ShelfRequestDispatcher>);
+    plugin.loaded = true;
+    Rig {
+        timeline,
+        host,
+        dispatcher,
+        plugin,
+    }
+}
+
+fn zone_req(payload: Value) -> Request {
+    Request {
+        request_type: VERB_TIMEZONE_SET.to_string(),
+        ..req(payload)
+    }
+}
+
+async fn set_zone(p: &LocalePlugin, zone: &str) -> Result<Value, PluginError> {
+    p.handle_request(&zone_req(json!({ "v": 1, "timezone": zone })))
+        .await
+        .map(|resp| serde_json::from_slice(&resp.payload).unwrap())
+}
+
+fn transient(r: Result<Value, PluginError>) -> String {
+    match r {
+        Err(PluginError::Transient(msg)) => msg,
+        other => panic!("expected a Transient error, got {other:?}"),
+    }
+}
+
+/// Pin: timezone.set applies, waits more than one second, then
+/// calls `alarm.reschedule { v: 1 }` on `audio.alarm` through the
+/// shelf dispatcher, and answers the zone the host reports in
+/// force.
+#[tokio::test(start_paused = true)]
+async fn timezone_set_applies_waits_then_reschedules() {
+    let r = rig("Etc/UTC");
+    assert!(SETTLE > Duration::from_secs(1));
+    assert_eq!(
+        set_zone(&r.plugin, "Europe/London").await.unwrap(),
+        json!({ "v": 1, "timezone": "Europe/London" })
+    );
+    assert_eq!(
+        r.timeline.seen(),
+        [Seen::Apply("Europe/London".into()), Seen::Reschedule]
+    );
+    let gaps = r.timeline.gaps();
+    assert_eq!(gaps.len(), 1);
+    assert!(gaps[0] > Duration::from_secs(1), "waited {:?}", gaps[0]);
+    assert_eq!(
+        r.dispatcher.calls(),
+        [(
+            ALARM_SHELF.to_string(),
+            VERB_ALARM_RESCHEDULE.to_string(),
+            json!({ "v": 1 })
+        )]
+    );
+}
+
+/// Pin: a failed apply is not a clean answer and names the zone in
+/// force. With the zone unmoved there is nothing for the alarm to
+/// follow. A failed apply that moved the zone anyway still has the
+/// alarm follow, after the wait, and the error names the new zone.
+#[tokio::test(start_paused = true)]
+async fn a_failed_apply_is_not_clean_and_names_the_zone_in_force() {
+    let r = rig("Etc/UTC");
+    r.host.apply_fails.store(true, Ordering::SeqCst);
+    let msg = transient(set_zone(&r.plugin, "Europe/London").await);
+    assert!(msg.contains("apply failed"), "{msg}");
+    assert!(msg.contains("zone in force is Etc/UTC"), "{msg}");
+    assert_eq!(r.timeline.seen(), [Seen::Apply("Europe/London".into())]);
+
+    r.host.failed_apply_moves.store(true, Ordering::SeqCst);
+    let msg = transient(set_zone(&r.plugin, "Europe/London").await);
+    assert!(msg.contains("zone in force is Europe/London"), "{msg}");
+    assert_eq!(
+        r.timeline.seen()[1..],
+        [Seen::Apply("Europe/London".into()), Seen::Reschedule]
+    );
+    assert!(r.timeline.gaps()[0] > Duration::from_secs(1));
+}
+
+/// Pin: a refused reschedule is not a clean answer and names the
+/// zone in force, which stays applied: one apply, no roll-back.
+/// Sending the same zone again runs the reschedule again.
+#[tokio::test(start_paused = true)]
+async fn a_refused_reschedule_is_not_clean_and_names_the_zone_in_force() {
+    let r = rig("Etc/UTC");
+    r.dispatcher.refuse.store(true, Ordering::SeqCst);
+    let msg = transient(set_zone(&r.plugin, "Europe/London").await);
+    assert!(msg.contains("zone in force is Europe/London"), "{msg}");
+    assert!(msg.contains(VERB_ALARM_RESCHEDULE), "{msg}");
+    assert_eq!(r.host.in_force(), "Europe/London", "the zone stays applied");
+    assert_eq!(
+        r.timeline.seen(),
+        [Seen::Apply("Europe/London".into()), Seen::Reschedule]
+    );
+
+    r.dispatcher.refuse.store(false, Ordering::SeqCst);
+    assert_eq!(
+        set_zone(&r.plugin, "Europe/London").await.unwrap(),
+        json!({ "v": 1, "timezone": "Europe/London" })
+    );
+    assert_eq!(
+        r.timeline.seen()[2..],
+        [Seen::Apply("Europe/London".into()), Seen::Reschedule]
+    );
+    assert!(r
+        .timeline
+        .gaps()
+        .iter()
+        .all(|g| *g > Duration::from_secs(1)));
+}
+
+/// Pin: an unknown zone, and `Factory`, answer the zone still in
+/// force and run no apply. The stub's database holds `Factory`, so
+/// only the plugin's own refusal keeps it out.
+#[tokio::test(start_paused = true)]
+async fn an_unknown_zone_and_factory_answer_the_zone_in_force_and_apply_nothing(
+) {
+    let r = rig("Etc/UTC");
+    for zone in [
+        FACTORY,
+        "Not/Held",
+        "",
+        "../Europe/London",
+        "Europe/../London",
+        "/Europe/London",
+        "Europe/London/",
+        "Europe/London -H host",
+        "Europe/London\n",
+        "Europe//London",
+    ] {
+        assert_eq!(
+            set_zone(&r.plugin, zone).await.unwrap(),
+            json!({ "v": 1, "timezone": "Etc/UTC" }),
+            "{zone:?}"
+        );
+    }
+    assert_eq!(r.timeline.seen(), [], "nothing was applied or rescheduled");
+    assert_eq!(r.host.in_force(), "Etc/UTC");
+}
+
+/// A name reaches the host only in the shape of an IANA zone, so it
+/// cannot walk out of the zone database when its file is read.
+#[test]
+fn zone_names_have_the_iana_shape() {
+    for name in [
+        "UTC",
+        "Etc/UTC",
+        "Etc/GMT+5",
+        "Etc/GMT-14",
+        "America/Argentina/Buenos_Aires",
+        "America/Port-au-Prince",
+    ] {
+        assert!(timezone::is_zone_name(name), "{name:?} is refused");
+    }
+    for name in [
+        "",
+        "/",
+        "..",
+        "../etc/passwd",
+        "Europe/../London",
+        "/Europe/London",
+        "Europe/London/",
+        "Europe//London",
+        "Europe/London -H host",
+        "Europe/London\n",
+        "Europe/Lon.don",
+        "Europe\\London",
+    ] {
+        assert!(!timezone::is_zone_name(name), "{name:?} is accepted");
+    }
+}
+
+/// Without a shelf dispatcher the alarm cannot follow, so nothing
+/// is applied; the refusal names the zone in force.
+#[tokio::test(start_paused = true)]
+async fn without_a_dispatcher_nothing_is_applied() {
+    let mut r = rig("Etc/UTC");
+    r.plugin.dispatcher = None;
+    match set_zone(&r.plugin, "Europe/London").await {
+        Err(PluginError::Permanent(msg)) => {
+            assert!(msg.contains("zone in force is Etc/UTC"), "{msg}")
+        }
+        other => panic!("expected Permanent, got {other:?}"),
+    }
+    assert_eq!(r.timeline.seen(), []);
+}
+
+/// A zone in force or a zone database that cannot be read applies
+/// nothing.
+#[tokio::test(start_paused = true)]
+async fn an_unreadable_host_applies_nothing() {
+    let r = rig("Etc/UTC");
+    r.host.list_unreadable.store(true, Ordering::SeqCst);
+    let msg = transient(set_zone(&r.plugin, "Europe/London").await);
+    assert!(msg.contains("zone in force is Etc/UTC"), "{msg}");
+    r.host.list_unreadable.store(false, Ordering::SeqCst);
+    r.host.zone_unreadable.store(true, Ordering::SeqCst);
+    let msg = transient(set_zone(&r.plugin, "Europe/London").await);
+    assert!(msg.contains("could not be read"), "{msg}");
+    assert_eq!(r.timeline.seen(), []);
+}
+
+/// An apply that reports success but leaves another zone in force
+/// is not clean: the answer is never a zone that was asked for and
+/// not applied.
+#[tokio::test(start_paused = true)]
+async fn an_apply_that_moves_nothing_is_not_clean() {
+    let r = rig("Etc/UTC");
+    r.host.apply_moves_nothing.store(true, Ordering::SeqCst);
+    let msg = transient(set_zone(&r.plugin, "Europe/London").await);
+    assert!(msg.contains("zone in force is Etc/UTC"), "{msg}");
+    assert!(msg.contains("not Europe/London"), "{msg}");
+}
+
+/// A payload of the wrong version or shape is a malformed request,
+/// and touches nothing.
+#[tokio::test(start_paused = true)]
+async fn a_malformed_zone_payload_is_refused() {
+    let r = rig("Etc/UTC");
+    for payload in [
+        json!({ "v": 2, "timezone": "Europe/London" }),
+        json!({ "v": 1 }),
+        json!({ "v": 1, "timezone": 7 }),
+    ] {
+        assert!(
+            matches!(
+                r.plugin.handle_request(&zone_req(payload.clone())).await,
+                Err(PluginError::Permanent(_))
+            ),
+            "{payload}"
+        );
+    }
+    assert_eq!(r.timeline.seen(), []);
 }

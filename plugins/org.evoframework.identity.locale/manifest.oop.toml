@@ -36,5 +36,8 @@ restart_on_crash = true
 restart_budget = 5
 
 [capabilities.respondent]
-request_types = ["language.set"]
-response_budget_ms = 2000
+request_types = ["language.set", "timezone.set"]
+response_budget_ms = 6000
+
+[capabilities.respondent.verb_capabilities]
+"timezone.set" = { kind = "write", scope = "system_admin" }

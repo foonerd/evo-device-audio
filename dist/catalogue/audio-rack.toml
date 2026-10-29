@@ -506,13 +506,20 @@ Music files and share passwords are never in a backup.
 name = "locale"
 shape = 1
 description = """
-The operator's language. Stocked by \
-org.evoframework.identity.locale: language.set sets it from \
-settings at any time after first boot and answers the \
-language in force. Only a language the glass has a catalogue \
-for applies, `en` today; any other tag is not applied and the \
-answer is the language still in force. Before any set the \
-language is `en`. No password is asked.
+The operator's language and the device's timezone. Stocked by \
+org.evoframework.identity.locale: language.set sets the \
+language from settings at any time after first boot and \
+answers the language in force. Only a language the glass has \
+a catalogue for applies, `en` today; any other tag is not \
+applied and the answer is the language still in force. Before \
+any set the language is `en`. No password is asked. \
+timezone.set sets the device's zone and answers the zone in \
+force, an IANA name; a zone the host does not hold, and \
+`Factory`, are not applied. After an apply it waits more than \
+a second, then has the pending alarm rescheduled on the new \
+zone before it answers. A failed apply or a refused \
+reschedule is an error naming the zone in force. It is a \
+write at `system_admin`, not step-up.
 """
 
 # Subject types the audio playback warden announces on

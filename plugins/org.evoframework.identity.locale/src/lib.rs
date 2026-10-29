@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! # org-evoframework-identity-locale
 //!
-//! Stocks the `system.locale` shelf with one setter,
-//! `language.set { v: 1, language }`, for the operator's language.
+//! Stocks the `system.locale` shelf with two setters:
+//! `language.set { v: 1, language }` for the operator's language,
+//! and `timezone.set { v: 1, timezone }` for the device's zone.
+//!
+//! ## `language.set`
 //!
 //! - It answers `{ v: 1, language }`, the language now in force, as
 //!   a BCP 47 tag.
@@ -17,9 +20,22 @@
 //! - The stored language lives in `language.toml` in the plugin's
 //!   own state directory and survives a restart. A stored tag the
 //!   glass has no catalogue for counts as no stored language.
+//! - It carries no capability gate: changing the language asks for
+//!   no password.
 //!
-//! The verb carries no capability gate: changing the language asks
-//! for no password.
+//! ## `timezone.set`
+//!
+//! - It answers `{ v: 1, timezone }`, the zone now in force as the
+//!   host names it, an IANA name.
+//! - A zone the host's zone database does not hold, and `Factory`,
+//!   are not applied. The answer is the zone still in force, not an
+//!   error.
+//! - After an apply it waits more than a second, then calls
+//!   `alarm.reschedule` on `audio.alarm` through the shelf
+//!   dispatcher, and only then answers.
+//! - A failed apply and a refused reschedule are errors that name
+//!   the zone in force. See [`timezone`].
+//! - It is gated `write:system_admin`, not step-up.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -27,14 +43,19 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use evo_plugin_sdk::contract::{
     BuildInfo, HealthReport, LoadContext, Plugin, PluginDescription,
     PluginError, PluginIdentity, Request, Respondent, Response,
-    RuntimeCapabilities,
+    RuntimeCapabilities, ShelfRequestDispatcher,
 };
 use evo_plugin_sdk::Manifest;
 use serde::Deserialize;
+
+pub mod timezone;
+
+use timezone::{Timedatectl, ZoneHost, VERB_TIMEZONE_SET};
 
 /// Embedded manifest source.
 pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
@@ -80,6 +101,13 @@ pub struct LocalePlugin {
     /// The language in force. Held across a set so two sets do not
     /// interleave their writes.
     language: tokio::sync::Mutex<String>,
+    /// Reads and applies the host's zone.
+    zone_host: Arc<dyn ZoneHost>,
+    /// Shelf dispatcher from `LoadContext`, for `alarm.reschedule`.
+    /// `None` refuses a zone change before anything is applied.
+    dispatcher: Option<Arc<dyn ShelfRequestDispatcher>>,
+    /// Serialises zone changes, so the alarm follows the last one.
+    zone_gesture: tokio::sync::Mutex<()>,
 }
 
 impl LocalePlugin {
@@ -91,6 +119,9 @@ impl LocalePlugin {
             catalogues: CATALOGUES.iter().map(|c| (*c).to_string()).collect(),
             state_path: None,
             language: tokio::sync::Mutex::new(DEFAULT_LANGUAGE.to_string()),
+            zone_host: Arc::new(Timedatectl),
+            dispatcher: None,
+            zone_gesture: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -181,6 +212,38 @@ impl LocalePlugin {
         })?;
         Ok(Response::for_request(req, bytes))
     }
+
+    async fn handle_timezone_set(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: ZonePayload = serde_json::from_slice(&req.payload).map_err(|e| {
+            PluginError::Permanent(format!(
+                "{VERB_TIMEZONE_SET} payload is not valid JSON for the expected shape: {e}"
+            ))
+        })?;
+        if payload.v != PAYLOAD_VERSION {
+            return Err(PluginError::Permanent(format!(
+                "{VERB_TIMEZONE_SET} payload version {} unsupported; expected {PAYLOAD_VERSION}",
+                payload.v
+            )));
+        }
+        let _gesture = self.zone_gesture.lock().await;
+        let zone = timezone::set_zone(
+            self.zone_host.as_ref(),
+            self.dispatcher.as_deref(),
+            &payload.timezone,
+        )
+        .await?;
+        let body =
+            serde_json::json!({ "v": PAYLOAD_VERSION, "timezone": zone });
+        let bytes = serde_json::to_vec(&body).map_err(|e| {
+            PluginError::Permanent(format!(
+                "{VERB_TIMEZONE_SET} response encode failed: {e}"
+            ))
+        })?;
+        Ok(Response::for_request(req, bytes))
+    }
 }
 
 impl Default for LocalePlugin {
@@ -212,6 +275,13 @@ struct SetPayload {
     language: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ZonePayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    timezone: String,
+}
+
 fn default_payload_version() -> u32 {
     PAYLOAD_VERSION
 }
@@ -226,7 +296,10 @@ impl Plugin for LocalePlugin {
                     contract: 1,
                 },
                 runtime_capabilities: RuntimeCapabilities {
-                    request_types: vec![VERB_LANGUAGE_SET.to_string()],
+                    request_types: vec![
+                        VERB_LANGUAGE_SET.to_string(),
+                        VERB_TIMEZONE_SET.to_string(),
+                    ],
                     accepts_custody: false,
                     flags: Default::default(),
                     course_correct_verbs: Vec::new(),
@@ -248,6 +321,14 @@ impl Plugin for LocalePlugin {
         async move {
             if self.state_path.is_none() {
                 self.state_path = Some(ctx.state_dir.join(STATE_FILENAME));
+            }
+            self.dispatcher =
+                ctx.shelf_request_dispatcher.as_ref().map(Arc::clone);
+            if self.dispatcher.is_none() {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    "no shelf dispatcher; timezone.set will refuse"
+                );
             }
             self.restore().await;
             self.loaded = true;
@@ -298,6 +379,7 @@ impl Respondent for LocalePlugin {
             }
             match req.request_type.as_str() {
                 VERB_LANGUAGE_SET => self.handle_set(req).await,
+                VERB_TIMEZONE_SET => self.handle_timezone_set(req).await,
                 other => Err(PluginError::Permanent(format!(
                     "identity.locale: unknown verb {other:?}"
                 ))),
