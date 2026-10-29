@@ -688,6 +688,105 @@ async fn without_the_dispatcher_both_verbs_refuse() {
     }
 }
 
+// ----- the 16 MiB bound -----
+
+/// The backup's size as the bound measures it: the object written
+/// as compact UTF-8 JSON.
+fn compact_len(backup: &Value) -> usize {
+    serde_json::to_vec(backup).unwrap().len()
+}
+
+/// Owners whose export is exactly `size` bytes as compact JSON:
+/// the set-up owners plus one playlist padded with ASCII.
+async fn owners_exporting(size: usize) -> Owners {
+    let mut owners = Owners::set_up();
+    owners.playlists.push(("Pad".to_string(), String::new()));
+    let (backup, _) = export_from(owners.clone()).await;
+    let pad = size - compact_len(&backup);
+    owners.playlists.last_mut().unwrap().1 = "a".repeat(pad);
+    owners
+}
+
+/// Pin: export over the bound is Permanent and answers no backup.
+/// At exactly 16 MiB of compact JSON the backup is answered whole;
+/// one byte more and the export is refused as Permanent, with no
+/// backup and nothing cut short. The measure is the backup object,
+/// not the response around it.
+#[tokio::test]
+async fn export_over_the_bound_is_permanent_and_answers_no_backup() {
+    assert_eq!(MAX_BACKUP_BYTES, 16 * 1_048_576);
+
+    let at = owners_exporting(MAX_BACKUP_BYTES).await;
+    let (backup, _) = export_from(at.clone()).await;
+    assert_eq!(compact_len(&backup), MAX_BACKUP_BYTES);
+    assert_eq!(
+        backup["playlists"].as_array().unwrap().last().unwrap()["m3u"],
+        json!(at.playlists.last().unwrap().1),
+        "the backup at the bound was cut short"
+    );
+
+    let over = owners_exporting(MAX_BACKUP_BYTES + 1).await;
+    let stub = Stub::new(over);
+    match plugin_on(&stub)
+        .handle_request(&req(VERB_EXPORT, json!({ "v": 1 })))
+        .await
+    {
+        Err(PluginError::Permanent(msg)) => {
+            assert!(msg.contains("over the bound"), "{msg}");
+            assert!(msg.contains(&(MAX_BACKUP_BYTES + 1).to_string()), "{msg}");
+        }
+        other => panic!("expected Permanent and no backup, got {other:?}"),
+    }
+}
+
+/// Pin: import over the bound is Permanent and calls no owner. One
+/// byte over 16 MiB of compact JSON is refused before the version is
+/// checked: a backup over the bound with a wrong `v`, or one that
+/// would not parse, is too large, not an unsupported version. At
+/// exactly 16 MiB the backup goes back.
+#[tokio::test]
+async fn import_over_the_bound_is_permanent_and_calls_no_owner() {
+    let (base, _) = export_from(Owners::set_up()).await;
+    let padded = |size: usize, edit: &dyn Fn(&mut Value)| {
+        let mut b = base.clone();
+        edit(&mut b);
+        b["playlists"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "name": "Pad", "m3u": "" }));
+        let pad = size - compact_len(&b);
+        b["playlists"].as_array_mut().unwrap().last_mut().unwrap()["m3u"] =
+            json!("a".repeat(pad));
+        assert_eq!(compact_len(&b), size);
+        b
+    };
+
+    let over = [
+        padded(MAX_BACKUP_BYTES + 1, &|_| {}),
+        padded(MAX_BACKUP_BYTES + 1, &|b| b["v"] = json!(2)),
+        padded(MAX_BACKUP_BYTES + 1, &|b| {
+            b["config"]["zones"] = json!("not a list")
+        }),
+    ];
+    for backup in over {
+        let stub = Stub::new(Owners::empty());
+        match import_into(&stub, backup).await {
+            Err(PluginError::Permanent(msg)) => {
+                assert!(msg.contains("over the bound"), "{msg}");
+                assert!(!msg.contains("unsupported"), "{msg}");
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+        assert!(stub.calls().is_empty(), "an owner was called");
+    }
+
+    let stub = Stub::new(Owners::empty());
+    import_into(&stub, padded(MAX_BACKUP_BYTES, &|_| {}))
+        .await
+        .expect("a backup at the bound goes back");
+    assert!(!stub.calls().is_empty());
+}
+
 // ----- pin: no music file, no share secret, no share add -----
 
 /// Pin: a backup holds no music file and no share secret, and

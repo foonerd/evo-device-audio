@@ -27,6 +27,11 @@
 //!   already holds, hardware the device lacks — is reported and
 //!   skipped; nothing is put in its place, and the other items
 //!   still go back.
+//! - A backup is at most [`MAX_BACKUP_BYTES`], 16 MiB, measured as
+//!   the backup object written as compact UTF-8 JSON. Export refuses
+//!   a backup over the bound as Permanent and answers none; it never
+//!   truncates. Import refuses one as Permanent before its version is
+//!   checked and before any owner is called.
 //!
 //! Every call goes to the owning plugin through the framework's
 //! shelf dispatcher. The plugin reads no file and no other
@@ -64,6 +69,11 @@ pub const VERB_IMPORT: &str = "import_backup";
 
 /// Wire payload version, and the backup's own version.
 const PAYLOAD_VERSION: u32 = 1;
+
+/// The largest backup: 16 MiB of the backup object
+/// `{ v, config, playlists, settings }` written as compact UTF-8
+/// JSON, not the request or response around it.
+pub const MAX_BACKUP_BYTES: usize = 16 * 1_048_576;
 
 const DELIVERY: &str = "audio.delivery";
 const ZONES: &str = "audio.zones";
@@ -217,6 +227,7 @@ impl BackupPlugin {
         let backup = export(d).await.map_err(|e| {
             PluginError::Transient(format!("{VERB_EXPORT} refused: {e}"))
         })?;
+        within_bound(VERB_EXPORT, &backup, "no backup is answered")?;
         tracing::info!(plugin = PLUGIN_NAME, "backup exported");
         encode(req, &json!({ "v": PAYLOAD_VERSION, "backup": backup }))
     }
@@ -226,6 +237,9 @@ impl BackupPlugin {
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: ImportPayload = parse(req)?;
+        // Before the version check: a backup over the bound is too
+        // large, whatever its version says.
+        within_bound(VERB_IMPORT, &payload.backup, "nothing was written")?;
         let d = self.dispatcher()?;
         let backup_v = payload.backup.get("v").and_then(Value::as_u64);
         if backup_v != Some(u64::from(PAYLOAD_VERSION)) {
@@ -255,6 +269,41 @@ impl Default for BackupPlugin {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The size of a backup written as compact UTF-8 JSON.
+fn compact_size(backup: &Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    // Writing a JSON value into a sink that never fails cannot fail.
+    serde_json::to_writer(&mut count, backup)
+        .expect("a JSON value always serialises");
+    count.0
+}
+
+/// Refuse a backup over [`MAX_BACKUP_BYTES`], as Permanent.
+fn within_bound(
+    verb: &str,
+    backup: &Value,
+    consequence: &str,
+) -> Result<(), PluginError> {
+    let size = compact_size(backup);
+    if size > MAX_BACKUP_BYTES {
+        return Err(PluginError::Permanent(format!(
+            "{verb}: the backup is {size} bytes as compact JSON, over the \
+             bound of {MAX_BACKUP_BYTES} bytes; {consequence}"
+        )));
+    }
+    Ok(())
 }
 
 /// Call one owner verb and parse its answer.
