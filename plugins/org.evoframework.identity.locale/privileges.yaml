@@ -16,9 +16,9 @@ capability_intent:
     access_path: filesystem/state
     failure_mode: a missing or unreadable file is no stored language, so the language in force is `en`; a failed write refuses the set and the language in force stays.
   - id: timezone_read
-    need: read the zone in force with `timedatectl show --property=Timezone --value`, the host's zone list with `timedatectl list-timezones`, and the zone file under /usr/share/zoneinfo for its TZif header. Unprivileged; nothing is written.
+    need: read the zone in force with `timedatectl show --property=Timezone --value` for timezone.set and timezone.get, the host's zone list with `timedatectl list-timezones`, and zone files under /usr/share/zoneinfo for their TZif header for timezone.set and timezone.list. Unprivileged; nothing is written.
     access_path: filesystem/system
-    failure_mode: timezone.set answers PluginError::Transient naming what could not be read; nothing is applied.
+    failure_mode: each verb answers PluginError::Transient naming what could not be read; timezone.set applies nothing, timezone.get names no zone, and timezone.list answers no list.
   - id: set_timezone_invocation
     need: invoke `sudo -n /usr/local/bin/evo-set-timezone <zone>` to make one IANA zone the host's zone. The framework dispatcher's per-verb gate verifies write:system_admin before the request reaches the plugin. The wrapper takes exactly one argument, refuses `Factory`, a name that is not the shape of an IANA zone, a zone the host does not list, and a file without a TZif header, then runs `timedatectl set-timezone`. Surfaced as the `EVO_SET_TIMEZONE` sudoers Cmnd_Alias in `dist/sudoers.d/evo-set-timezone`.
     access_path: sudoers/command

@@ -36,6 +36,17 @@
 //! - A failed apply and a refused reschedule are errors that name
 //!   the zone in force. See [`timezone`].
 //! - It is gated `write:system_admin`, not step-up.
+//!
+//! ## `timezone.get` and `timezone.list`
+//!
+//! - `timezone.get { v: 1 }` answers `{ v: 1, timezone }`, the zone
+//!   `timedatectl show --property=Timezone` names.
+//! - `timezone.list { v: 1 }` answers `{ v: 1, timezones }`, the IANA
+//!   names a `timezone.set` would apply: in the host's zone list, with
+//!   a TZif file, and not `Factory`.
+//! - A read that fails is an error: never a zone that is not in force,
+//!   never an empty or partial list.
+//! - Neither writes anything, and neither carries a write grant.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -55,7 +66,10 @@ use serde::Deserialize;
 
 pub mod timezone;
 
-use timezone::{Timedatectl, ZoneHost, VERB_TIMEZONE_SET};
+use timezone::{
+    Timedatectl, ZoneHost, VERB_TIMEZONE_GET, VERB_TIMEZONE_LIST,
+    VERB_TIMEZONE_SET,
+};
 
 /// Embedded manifest source.
 pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
@@ -244,6 +258,60 @@ impl LocalePlugin {
         })?;
         Ok(Response::for_request(req, bytes))
     }
+
+    async fn handle_timezone_get(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        read_payload(req, VERB_TIMEZONE_GET)?;
+        let zone = timezone::get_zone(self.zone_host.as_ref()).await?;
+        reply(
+            req,
+            VERB_TIMEZONE_GET,
+            serde_json::json!({ "v": PAYLOAD_VERSION, "timezone": zone }),
+        )
+    }
+
+    async fn handle_timezone_list(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        read_payload(req, VERB_TIMEZONE_LIST)?;
+        let zones = timezone::list_zones(self.zone_host.as_ref()).await?;
+        reply(
+            req,
+            VERB_TIMEZONE_LIST,
+            serde_json::json!({ "v": PAYLOAD_VERSION, "timezones": zones }),
+        )
+    }
+}
+
+/// Check a read's `{ v: 1 }` payload.
+fn read_payload(req: &Request, verb: &str) -> Result<(), PluginError> {
+    let payload: ReadPayload =
+        serde_json::from_slice(&req.payload).map_err(|e| {
+            PluginError::Permanent(format!(
+                "{verb} payload is not valid JSON for the expected shape: {e}"
+            ))
+        })?;
+    if payload.v != PAYLOAD_VERSION {
+        return Err(PluginError::Permanent(format!(
+            "{verb} payload version {} unsupported; expected {PAYLOAD_VERSION}",
+            payload.v
+        )));
+    }
+    Ok(())
+}
+
+fn reply(
+    req: &Request,
+    verb: &str,
+    body: serde_json::Value,
+) -> Result<Response, PluginError> {
+    let bytes = serde_json::to_vec(&body).map_err(|e| {
+        PluginError::Permanent(format!("{verb} response encode failed: {e}"))
+    })?;
+    Ok(Response::for_request(req, bytes))
 }
 
 impl Default for LocalePlugin {
@@ -282,6 +350,12 @@ struct ZonePayload {
     timezone: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ReadPayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+}
+
 fn default_payload_version() -> u32 {
     PAYLOAD_VERSION
 }
@@ -299,6 +373,8 @@ impl Plugin for LocalePlugin {
                     request_types: vec![
                         VERB_LANGUAGE_SET.to_string(),
                         VERB_TIMEZONE_SET.to_string(),
+                        VERB_TIMEZONE_GET.to_string(),
+                        VERB_TIMEZONE_LIST.to_string(),
                     ],
                     accepts_custody: false,
                     flags: Default::default(),
@@ -380,6 +456,8 @@ impl Respondent for LocalePlugin {
             match req.request_type.as_str() {
                 VERB_LANGUAGE_SET => self.handle_set(req).await,
                 VERB_TIMEZONE_SET => self.handle_timezone_set(req).await,
+                VERB_TIMEZONE_GET => self.handle_timezone_get(req).await,
+                VERB_TIMEZONE_LIST => self.handle_timezone_list(req).await,
                 other => Err(PluginError::Permanent(format!(
                     "identity.locale: unknown verb {other:?}"
                 ))),

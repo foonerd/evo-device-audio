@@ -519,7 +519,11 @@ force, an IANA name; a zone the host does not hold, and \
 a second, then has the pending alarm rescheduled on the new \
 zone before it answers. A failed apply or a refused \
 reschedule is an error naming the zone in force. It is a \
-write at `system_admin`, not step-up.
+write at `system_admin`, not step-up. timezone.get answers the \
+zone in force, and timezone.list the IANA names a set would \
+apply, without `Factory`; a read that fails is an error, never \
+a zone not in force or an empty or partial list. Neither \
+carries a write grant.
 """
 
 # Subject types the audio playback warden announces on

@@ -61,11 +61,12 @@ fn both_manifests() -> [Manifest; 2] {
     [manifest(), oop]
 }
 
-/// Both manifests stock `system.locale` with the two setters, a
-/// 6000 ms budget for the zone change's wait and reschedule, and
-/// one gate: `timezone.set` is a write at `system_admin`.
+/// Both manifests stock `system.locale` with the two setters and
+/// the two zone reads, a 6000 ms budget for the zone change's wait
+/// and reschedule, and one gate: `timezone.set` is a write at
+/// `system_admin`.
 #[test]
-fn both_manifests_stock_system_locale_with_two_setters() {
+fn both_manifests_stock_system_locale_with_four_verbs() {
     for m in both_manifests() {
         assert_eq!(m.plugin.name, PLUGIN_NAME);
         assert_eq!(m.target.shelf, "system.locale");
@@ -73,7 +74,12 @@ fn both_manifests_stock_system_locale_with_two_setters() {
         let resp = m.capabilities.respondent.expect("respondent");
         assert_eq!(
             resp.request_types,
-            vec![VERB_LANGUAGE_SET, VERB_TIMEZONE_SET]
+            vec![
+                VERB_LANGUAGE_SET,
+                VERB_TIMEZONE_SET,
+                VERB_TIMEZONE_GET,
+                VERB_TIMEZONE_LIST
+            ]
         );
         assert_eq!(resp.response_budget_ms, 6000);
         assert_eq!(
@@ -100,6 +106,45 @@ fn language_set_stays_ungated() {
             "language.set is gated: {:?}",
             resp.verb_capabilities
         );
+    }
+}
+
+/// Pin: timezone.set stays a write at `system_admin`, not step-up,
+/// in either manifest.
+#[test]
+fn timezone_set_stays_write_system_admin() {
+    for m in both_manifests() {
+        let resp = m.capabilities.respondent.expect("respondent");
+        assert_eq!(
+            resp.verb_capabilities.get(VERB_TIMEZONE_SET),
+            Some(&VerbCapability::Write {
+                scope: "system_admin".to_string()
+            }),
+            "timezone.set gate: {:?}",
+            resp.verb_capabilities
+        );
+    }
+}
+
+/// Pin: neither zone read carries a write grant, in either manifest.
+#[test]
+fn the_zone_reads_have_no_write_grant() {
+    for m in both_manifests() {
+        let resp = m.capabilities.respondent.expect("respondent");
+        for verb in [VERB_TIMEZONE_GET, VERB_TIMEZONE_LIST] {
+            assert!(resp.request_types.iter().any(|v| v == verb), "{verb}");
+            assert!(
+                !matches!(
+                    resp.verb_capabilities.get(verb),
+                    Some(
+                        VerbCapability::Write { .. }
+                            | VerbCapability::StepUp { .. }
+                    )
+                ),
+                "{verb} carries a write grant: {:?}",
+                resp.verb_capabilities
+            );
+        }
     }
 }
 
@@ -302,12 +347,12 @@ impl Timeline {
 }
 
 /// Stands in for the host: a zone in force, the zones its database
-/// holds, and an apply that can fail, fail after moving the zone,
-/// or report success and move nothing.
+/// holds in the host's order, and an apply that can fail, fail after
+/// moving the zone, or report success and move nothing.
 struct StubHost {
     timeline: Arc<Timeline>,
     in_force: Mutex<String>,
-    held: Vec<&'static str>,
+    held: Mutex<Vec<&'static str>>,
     apply_fails: AtomicBool,
     failed_apply_moves: AtomicBool,
     apply_moves_nothing: AtomicBool,
@@ -320,7 +365,12 @@ impl StubHost {
         Self {
             timeline: Arc::clone(timeline),
             in_force: Mutex::new(in_force.to_string()),
-            held: vec!["Etc/UTC", "Europe/London", "America/New_York", FACTORY],
+            held: Mutex::new(vec![
+                "Etc/UTC",
+                "Europe/London",
+                "America/New_York",
+                FACTORY,
+            ]),
             apply_fails: AtomicBool::new(false),
             failed_apply_moves: AtomicBool::new(false),
             apply_moves_nothing: AtomicBool::new(false),
@@ -331,6 +381,10 @@ impl StubHost {
 
     fn in_force(&self) -> String {
         self.in_force.lock().unwrap().clone()
+    }
+
+    fn hold(&self, zones: &[&'static str]) {
+        *self.held.lock().unwrap() = zones.to_vec();
     }
 }
 
@@ -349,7 +403,22 @@ impl ZoneHost for StubHost {
             if self.list_unreadable.load(Ordering::SeqCst) {
                 return Err("timedatectl list-timezones failed".to_string());
             }
-            Ok(self.held.contains(&zone))
+            Ok(self.held.lock().unwrap().contains(&zone))
+        })
+    }
+
+    fn zones(&self) -> HostFuture<'_, Vec<String>> {
+        Box::pin(async {
+            if self.list_unreadable.load(Ordering::SeqCst) {
+                return Err("timedatectl list-timezones failed".to_string());
+            }
+            Ok(self
+                .held
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|z| (*z).to_string())
+                .collect())
         })
     }
 
@@ -678,4 +747,162 @@ async fn a_malformed_zone_payload_is_refused() {
         );
     }
     assert_eq!(r.timeline.seen(), []);
+}
+
+// ----- timezone.get and timezone.list -----
+
+async fn read(p: &LocalePlugin, verb: &str) -> Result<Value, PluginError> {
+    let request = Request {
+        request_type: verb.to_string(),
+        ..req(json!({ "v": 1 }))
+    };
+    p.handle_request(&request)
+        .await
+        .map(|resp| serde_json::from_slice(&resp.payload).unwrap())
+}
+
+/// Pin: timezone.get names the zone in force, as the host names it
+/// on this read: after a set, and after the host moved it on its
+/// own. A read that fails is an error, never a zone.
+#[tokio::test(start_paused = true)]
+async fn timezone_get_names_only_the_zone_in_force() {
+    let r = rig("Europe/London");
+    assert_eq!(
+        read(&r.plugin, VERB_TIMEZONE_GET).await.unwrap(),
+        json!({ "v": 1, "timezone": "Europe/London" })
+    );
+    set_zone(&r.plugin, "America/New_York").await.unwrap();
+    assert_eq!(
+        read(&r.plugin, VERB_TIMEZONE_GET).await.unwrap()["timezone"],
+        "America/New_York"
+    );
+    *r.host.in_force.lock().unwrap() = "Etc/UTC".to_string();
+    assert_eq!(
+        read(&r.plugin, VERB_TIMEZONE_GET).await.unwrap()["timezone"],
+        "Etc/UTC"
+    );
+
+    r.host.zone_unreadable.store(true, Ordering::SeqCst);
+    let msg = transient(read(&r.plugin, VERB_TIMEZONE_GET).await);
+    assert!(msg.contains("could not be read"), "{msg}");
+    assert_eq!(
+        r.timeline.seen(),
+        [Seen::Apply("America/New_York".into()), Seen::Reschedule],
+        "a read applied or rescheduled something"
+    );
+}
+
+/// Pin: timezone.list answers the zones a set would apply, in the
+/// host's order: not `Factory`, not a name of another shape, and
+/// every name it lists is one a set applies.
+#[tokio::test(start_paused = true)]
+async fn timezone_list_answers_only_zones_a_set_would_apply() {
+    let r = rig("Etc/UTC");
+    r.host.hold(&[
+        "Etc/UTC",
+        FACTORY,
+        "Europe/London",
+        "posix/Not.A.Zone",
+        "America/New_York",
+        "Bad Name",
+    ]);
+    let answer = read(&r.plugin, VERB_TIMEZONE_LIST).await.unwrap();
+    assert_eq!(
+        answer,
+        json!({
+            "v": 1,
+            "timezones": ["Etc/UTC", "Europe/London", "America/New_York"],
+        })
+    );
+    assert_eq!(r.timeline.seen(), [], "listing applied something");
+    for zone in answer["timezones"].as_array().unwrap() {
+        let zone = zone.as_str().unwrap();
+        assert_eq!(
+            set_zone(&r.plugin, zone).await.unwrap()["timezone"],
+            zone,
+            "{zone} is listed, and a set does not apply it"
+        );
+    }
+}
+
+/// Pin: a list that cannot be read is an error, never `[]`. Nor is a
+/// zone database that holds no zone a set would apply answered as
+/// `[]`.
+#[tokio::test(start_paused = true)]
+async fn a_list_that_cannot_be_read_is_not_clean() {
+    let r = rig("Etc/UTC");
+    r.host.list_unreadable.store(true, Ordering::SeqCst);
+    let msg = transient(read(&r.plugin, VERB_TIMEZONE_LIST).await);
+    assert!(msg.contains("could not be read"), "{msg}");
+    r.host.list_unreadable.store(false, Ordering::SeqCst);
+    for held in [
+        &[][..],
+        &[FACTORY][..],
+        &["Bad Name", "posix/Not.A.Zone"][..],
+    ] {
+        r.host.hold(held);
+        transient(read(&r.plugin, VERB_TIMEZONE_LIST).await);
+    }
+}
+
+/// Pin: the host's list is never answered in part. A zone file that
+/// cannot be read fails the whole list; a file that is not there
+/// drops only its name; a name of another shape is dropped before
+/// its file is looked at.
+#[tokio::test]
+async fn the_host_list_is_never_answered_in_part() {
+    let listed = "Etc/UTC\nEurope/London\n../etc/passwd\nAmerica/New_York\n";
+    let looked = Mutex::new(Vec::new());
+    let file = |unreadable: &'static str, absent: &'static str| {
+        let looked = &looked;
+        move |zone: String| {
+            looked.lock().unwrap().push(zone.clone());
+            let answer = if zone == unreadable {
+                Err(format!("could not read {zone}"))
+            } else {
+                Ok(zone != absent)
+            };
+            async move { answer }
+        }
+    };
+
+    assert!(
+        timezone::zones_with_files(listed, file("Europe/London", ""))
+            .await
+            .is_err(),
+        "a list with an unreadable zone file was answered"
+    );
+    assert_eq!(
+        timezone::zones_with_files(listed, file("", "Europe/London"))
+            .await
+            .unwrap(),
+        ["Etc/UTC", "America/New_York"]
+    );
+    assert!(
+        !looked.lock().unwrap().iter().any(|z| z.contains("..")),
+        "a name of another shape had its file looked at: {:?}",
+        looked.lock().unwrap()
+    );
+}
+
+/// A read's payload of the wrong version or shape is a malformed
+/// request.
+#[tokio::test(start_paused = true)]
+async fn a_malformed_read_payload_is_refused() {
+    let r = rig("Etc/UTC");
+    for verb in [VERB_TIMEZONE_GET, VERB_TIMEZONE_LIST] {
+        for payload in [json!({ "v": 2 }), json!(null), json!("v")] {
+            let request = Request {
+                request_type: verb.to_string(),
+                ..req(payload.clone())
+            };
+            assert!(
+                matches!(
+                    r.plugin.handle_request(&request).await,
+                    Err(PluginError::Permanent(_))
+                ),
+                "{verb} {payload}"
+            );
+        }
+    }
 }

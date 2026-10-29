@@ -1,9 +1,18 @@
 // Copyright (c) 2026 Just a Nerd
 // SPDX-License-Identifier: Apache-2.0
-//! `timezone.set`: apply a zone on the host, let the steward's
-//! local time move to it, then have the alarm follow.
+//! The device's zone: `timezone.set` applies one, `timezone.get`
+//! reads the zone in force, and `timezone.list` reads the zones a set
+//! would apply.
 //!
-//! The order is fixed:
+//! `timezone.get` answers what `timedatectl show
+//! --property=Timezone` names, and `timezone.list` the names in the
+//! host's zone list that have a TZif file, without `Factory`: the
+//! names [`would_apply`] admits. A read that fails is an error, never
+//! a zone that is not in force and never an empty or partial list.
+//!
+//! `timezone.set` applies a zone on the host, lets the steward's
+//! local time move to it, then has the alarm follow. The order is
+//! fixed:
 //!
 //! 1. Read the zone in force, `timedatectl show
 //!    --property=Timezone`.
@@ -29,6 +38,12 @@ use evo_plugin_sdk::contract::{PluginError, ShelfRequestDispatcher};
 
 /// Set the device's timezone.
 pub const VERB_TIMEZONE_SET: &str = "timezone.set";
+
+/// Read the zone in force.
+pub const VERB_TIMEZONE_GET: &str = "timezone.get";
+
+/// Read the zones a set would apply.
+pub const VERB_TIMEZONE_LIST: &str = "timezone.list";
 
 /// The shelf whose pending alarm follows a zone change.
 pub const ALARM_SHELF: &str = "audio.alarm";
@@ -58,6 +73,9 @@ pub trait ZoneHost: Send + Sync {
     fn zone_in_force(&self) -> HostFuture<'_, String>;
     /// Whether the host's zone database holds `zone`.
     fn holds<'a>(&'a self, zone: &'a str) -> HostFuture<'a, bool>;
+    /// The zones the host's zone database holds, in the host's
+    /// order. A part that cannot be read fails the whole list.
+    fn zones(&self) -> HostFuture<'_, Vec<String>>;
     /// Make `zone` the zone in force.
     fn apply<'a>(&'a self, zone: &'a str) -> HostFuture<'a, ()>;
 }
@@ -88,12 +106,14 @@ impl ZoneHost for Timedatectl {
             }
             // The name passed is_zone_name, so it stays under the
             // zone database.
-            let path = format!("{ZONEINFO}/{zone}");
-            match tokio::fs::read(&path).await {
-                Ok(bytes) => Ok(bytes.starts_with(b"TZif")),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-                Err(e) => Err(format!("could not read {path}: {e}")),
-            }
+            has_zone_file(zone.to_string()).await
+        })
+    }
+
+    fn zones(&self) -> HostFuture<'_, Vec<String>> {
+        Box::pin(async {
+            let listed = run(TIMEDATECTL, &["list-timezones"]).await?;
+            zones_with_files(&listed, has_zone_file).await
         })
     }
 
@@ -102,6 +122,38 @@ impl ZoneHost for Timedatectl {
             async move { run(SUDO, &["-n", WRAPPER, zone]).await.map(drop) },
         )
     }
+}
+
+/// Whether the zone database has a TZif file for `zone`. A file that
+/// is not there is no file; one that cannot be read is an error.
+async fn has_zone_file(zone: String) -> Result<bool, String> {
+    let path = format!("{ZONEINFO}/{zone}");
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => Ok(bytes.starts_with(b"TZif")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("could not read {path}: {e}")),
+    }
+}
+
+/// The names in `listed`, one per line, that have the shape of an IANA
+/// zone and a zone file, in the order listed. A name of any other
+/// shape is dropped before its file is looked at. A file that cannot
+/// be read fails the whole list, so the answer is never a prefix.
+pub async fn zones_with_files<F, Fut>(
+    listed: &str,
+    has_file: F,
+) -> Result<Vec<String>, String>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<bool, String>>,
+{
+    let mut zones = Vec::new();
+    for name in listed.lines().filter(|l| is_zone_name(l)) {
+        if has_file(name.to_string()).await? {
+            zones.push(name.to_string());
+        }
+    }
+    Ok(zones)
 }
 
 /// Run a host command; its stdout, or why it failed.
@@ -135,6 +187,49 @@ pub fn is_zone_name(name: &str) -> bool {
         })
 }
 
+/// Whether a set would apply `name` once the host holds it: the
+/// shape of an IANA zone, and not `Factory`. `timezone.set` refuses
+/// every other name, and `timezone.list` lists none.
+pub fn would_apply(name: &str) -> bool {
+    is_zone_name(name) && name != FACTORY
+}
+
+/// The zone in force, as the host names it. A failed read is the
+/// error.
+pub async fn get_zone(host: &dyn ZoneHost) -> Result<String, PluginError> {
+    host.zone_in_force().await.map_err(|e| {
+        PluginError::Transient(format!(
+            "{VERB_TIMEZONE_GET}: the zone in force could not be read: {e}"
+        ))
+    })
+}
+
+/// The zones a set would apply, in the host's order. A list that
+/// cannot be read, or that holds no such zone, is the error: never
+/// an empty or partial list.
+pub async fn list_zones(
+    host: &dyn ZoneHost,
+) -> Result<Vec<String>, PluginError> {
+    let zones: Vec<String> = host
+        .zones()
+        .await
+        .map_err(|e| {
+            PluginError::Transient(format!(
+                "{VERB_TIMEZONE_LIST}: the host's zone list could not be read: {e}"
+            ))
+        })?
+        .into_iter()
+        .filter(|z| would_apply(z))
+        .collect();
+    if zones.is_empty() {
+        return Err(PluginError::Transient(format!(
+            "{VERB_TIMEZONE_LIST}: the host's zone database holds no zone a \
+             set would apply"
+        )));
+    }
+    Ok(zones)
+}
+
 /// Set the zone and have the alarm follow. The zone to answer, or
 /// the error.
 pub async fn set_zone(
@@ -147,7 +242,7 @@ pub async fn set_zone(
             "{VERB_TIMEZONE_SET}: the zone in force could not be read: {e}"
         ))
     })?;
-    let held = if is_zone_name(asked) && asked != FACTORY {
+    let held = if would_apply(asked) {
         host.holds(asked).await.map_err(|e| {
             PluginError::Transient(format!(
                 "{VERB_TIMEZONE_SET}: the host's zone database could not be \

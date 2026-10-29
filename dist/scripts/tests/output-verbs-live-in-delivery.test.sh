@@ -68,11 +68,20 @@ FAIL=0
 # Where a verb may be named: the owning plugin and the one named
 # caller. Everything else under crates/ and plugins/ (Rust
 # sources, manifests, privileges) must not name it.
+#
+# A verb is named when it appears as a whole name: the character
+# before it is not one that can continue a verb name (a letter, a
+# digit, `_` or `.`), and neither is the character after it (a
+# letter, a digit or `_`). So `timezone.list` and `zone.list_all`
+# do not name `zone.list`; `"zone.list"`, `zone.list` on its own
+# and `zone.list,` do.
 scan_for() {
     local verb="$1"
+    local verb_re="${verb//./\\.}"
     # grep -r exits 1 on no match; that is the pass path.
-    ( cd "$REPO_DIR" && grep -rl --include='*.rs' --include='*.toml' \
-        --include='*.yaml' --include='*.yml' -F "$verb" crates plugins \
+    ( cd "$REPO_DIR" && grep -rlE --include='*.rs' --include='*.toml' \
+        --include='*.yaml' --include='*.yml' \
+        "(^|[^A-Za-z0-9_.])${verb_re}([^A-Za-z0-9_]|\$)" crates plugins \
         2>/dev/null || true ) \
         | { grep -v -e "^$OWNER/" -e "^$CALLER/" || true; }
 }

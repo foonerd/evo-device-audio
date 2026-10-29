@@ -36,7 +36,12 @@ restart_on_crash = true
 restart_budget = 5
 
 [capabilities.respondent]
-request_types = ["language.set", "timezone.set"]
+request_types = [
+    "language.set",
+    "timezone.set",
+    "timezone.get",
+    "timezone.list",
+]
 response_budget_ms = 6000
 
 [capabilities.respondent.verb_capabilities]
