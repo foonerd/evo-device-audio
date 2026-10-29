@@ -112,6 +112,34 @@ fn plugin_on(ledger: &Arc<StubLedger>) -> AlarmPlugin {
     p
 }
 
+/// A plugin on the ledger that stores its alarm in `dir`, as one
+/// loaded with `dir` as its state directory.
+fn plugin_storing(
+    ledger: &Arc<StubLedger>,
+    dir: &tempfile::TempDir,
+) -> AlarmPlugin {
+    plugin_on(ledger).with_state_path(stored_path(dir))
+}
+
+fn stored_path(dir: &tempfile::TempDir) -> PathBuf {
+    dir.path().join(STATE_FILENAME)
+}
+
+fn read_stored(dir: &tempfile::TempDir) -> Alarm {
+    toml::from_str(&std::fs::read_to_string(stored_path(dir)).unwrap()).unwrap()
+}
+
+fn reschedule() -> Request {
+    req(VERB_RESCHEDULE, json!({ "v": 1 }))
+}
+
+fn has_cancel(ledger: &StubLedger) -> bool {
+    ledger
+        .calls()
+        .iter()
+        .any(|c| matches!(c, LedgerCall::Cancel(_)))
+}
+
 fn req(verb: &str, payload: Value) -> Request {
     Request {
         request_type: verb.to_string(),
@@ -143,7 +171,7 @@ fn body(resp: &Response) -> Value {
 // ----- manifest / surface -----
 
 #[test]
-fn both_manifests_stock_audio_alarm_with_two_verbs_and_the_ledger() {
+fn both_manifests_stock_audio_alarm_with_three_verbs_and_the_ledger() {
     let oop = Manifest::from_toml(include_str!("../manifest.oop.toml"))
         .expect("manifest.oop.toml parses");
     for m in [manifest(), oop] {
@@ -152,7 +180,10 @@ fn both_manifests_stock_audio_alarm_with_two_verbs_and_the_ledger() {
         assert_eq!(m.target.shape, 1);
         assert!(m.capabilities.appointments, "the ledger capability");
         let resp = m.capabilities.respondent.expect("respondent");
-        assert_eq!(resp.request_types, vec![VERB_SET, VERB_CLEAR]);
+        assert_eq!(
+            resp.request_types,
+            vec![VERB_SET, VERB_CLEAR, VERB_RESCHEDULE]
+        );
     }
 }
 
@@ -398,6 +429,285 @@ async fn without_the_ledger_both_verbs_refuse() {
             }
             other => panic!("expected Permanent, got {other:?}"),
         }
+    }
+}
+
+// ----- the stored alarm -----
+
+/// A set the ledger takes stores the alarm as answered: the days in
+/// the order given, the time, and the name trimmed. Nothing is left
+/// beside the file.
+#[tokio::test]
+async fn a_set_stores_the_alarm() {
+    let ledger = Arc::new(StubLedger::default());
+    let dir = tempfile::tempdir().unwrap();
+    let p = plugin_storing(&ledger, &dir);
+    p.handle_request(&set(json!(["fri", "mon"]), "07:30", "  Morning "))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_stored(&dir),
+        Alarm {
+            weekdays: vec!["fri".into(), "mon".into()],
+            time: "07:30".into(),
+            playlist_name: "Morning".into(),
+        }
+    );
+    let names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, [STATE_FILENAME]);
+}
+
+/// A set refused before the ledger, and a set whose create the
+/// ledger refuses, leave the stored alarm as it was; with nothing
+/// stored they store nothing.
+#[tokio::test]
+async fn a_refused_set_leaves_the_stored_alarm() {
+    let ledger = Arc::new(StubLedger::default());
+    let dir = tempfile::tempdir().unwrap();
+    let p = plugin_storing(&ledger, &dir);
+
+    p.handle_request(&set(json!(["mon"]), "25:00", "Early"))
+        .await
+        .unwrap_err();
+    ledger.refuse_create.store(true, Ordering::SeqCst);
+    p.handle_request(&set(json!(["mon"]), "06:00", "Early"))
+        .await
+        .unwrap_err();
+    assert!(!stored_path(&dir).exists(), "nothing stored");
+
+    ledger.refuse_create.store(false, Ordering::SeqCst);
+    p.handle_request(&set(json!(["mon"]), "06:00", "Early"))
+        .await
+        .unwrap();
+    let before = std::fs::read(stored_path(&dir)).unwrap();
+    p.handle_request(&set(json!(["sat"]), "6:00", "Late"))
+        .await
+        .unwrap_err();
+    ledger.refuse_create.store(true, Ordering::SeqCst);
+    p.handle_request(&set(json!(["sat"]), "09:15", "Late"))
+        .await
+        .unwrap_err();
+    assert_eq!(std::fs::read(stored_path(&dir)).unwrap(), before);
+}
+
+/// A clear removes the stored alarm, and a clear with none stored
+/// answers ok.
+#[tokio::test]
+async fn a_clear_removes_the_stored_alarm() {
+    let ledger = Arc::new(StubLedger::default());
+    let dir = tempfile::tempdir().unwrap();
+    let p = plugin_storing(&ledger, &dir);
+    p.handle_request(&set(json!(["mon"]), "06:00", "Early"))
+        .await
+        .unwrap();
+    assert!(stored_path(&dir).exists());
+    for _ in 0..2 {
+        let resp = p
+            .handle_request(&req(VERB_CLEAR, json!({ "v": 1 })))
+            .await
+            .unwrap();
+        assert_eq!(body(&resp), json!({ "v": 1, "status": "ok" }));
+        assert!(!stored_path(&dir).exists(), "the stored alarm is gone");
+    }
+}
+
+// ----- alarm.reschedule -----
+
+/// With nothing stored, a reschedule asks nothing of the ledger and
+/// answers ok; so does one after a clear.
+#[tokio::test]
+async fn a_reschedule_with_nothing_stored_answers_ok() {
+    let ledger = Arc::new(StubLedger::default());
+    let dir = tempfile::tempdir().unwrap();
+    let p = plugin_storing(&ledger, &dir);
+    let resp = p.handle_request(&reschedule()).await.unwrap();
+    assert_eq!(body(&resp), json!({ "v": 1, "status": "ok" }));
+    assert!(ledger.calls().is_empty(), "{:?}", ledger.calls());
+
+    p.handle_request(&set(json!(["mon"]), "06:00", "Early"))
+        .await
+        .unwrap();
+    p.handle_request(&req(VERB_CLEAR, json!({ "v": 1 })))
+        .await
+        .unwrap();
+    let calls = ledger.calls().len();
+    let resp = p.handle_request(&reschedule()).await.unwrap();
+    assert_eq!(body(&resp), json!({ "v": 1, "status": "ok" }));
+    assert_eq!(ledger.calls().len(), calls, "nothing after the clear");
+}
+
+/// A reschedule issues the stored alarm as the set did: one create
+/// for `alarm` with the same spec and action, and the answer is the
+/// stored alarm. A new process reads what an earlier one stored.
+#[tokio::test]
+async fn a_reschedule_reissues_the_stored_alarm() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = Arc::new(StubLedger::default());
+    plugin_storing(&first, &dir)
+        .handle_request(&set(json!(["fri", "mon"]), "07:30", "  Morning "))
+        .await
+        .unwrap();
+    let set_created = first.created();
+
+    let ledger = Arc::new(StubLedger::default());
+    let p = plugin_storing(&ledger, &dir);
+    let resp = p.handle_request(&reschedule()).await.unwrap();
+    assert_eq!(
+        body(&resp),
+        json!({
+            "v": 1,
+            "alarm": {
+                "weekdays": ["fri", "mon"],
+                "time": "07:30",
+                "playlist_name": "Morning",
+            },
+        })
+    );
+    assert_eq!(ledger.created(), set_created);
+    assert_eq!(ledger.calls().len(), 1, "{:?}", ledger.calls());
+    assert_eq!(
+        ledger.entry().map(|e| e.state),
+        Some(AppointmentState::Pending)
+    );
+}
+
+/// Pin: a reschedule never cancels. Over a pending alarm it is one
+/// create and nothing else, and the alarm stays pending.
+#[tokio::test]
+async fn a_reschedule_never_cancels() {
+    let ledger = Arc::new(StubLedger::default());
+    let dir = tempfile::tempdir().unwrap();
+    let p = plugin_storing(&ledger, &dir);
+    p.handle_request(&set(json!(["mon"]), "06:00", "Early"))
+        .await
+        .unwrap();
+    p.handle_request(&reschedule()).await.unwrap();
+    let calls = ledger.calls();
+    assert!(!has_cancel(&ledger), "a reschedule cancelled: {calls:?}");
+    assert_eq!(calls.len(), 2, "the set, then one create: {calls:?}");
+    assert!(matches!(&calls[1], LedgerCall::Create(spec, _)
+        if spec.appointment_id == APPOINTMENT_ID));
+    assert_eq!(
+        ledger.entry().map(|e| e.state),
+        Some(AppointmentState::Pending)
+    );
+}
+
+/// Pin: a failed re-issue leaves the stored alarm. A create the
+/// ledger refuses is the reschedule's error, the file is byte for
+/// byte as it was, and nothing is cancelled.
+#[tokio::test]
+async fn a_failed_reissue_keeps_the_stored_alarm() {
+    let ledger = Arc::new(StubLedger::default());
+    let dir = tempfile::tempdir().unwrap();
+    let p = plugin_storing(&ledger, &dir);
+    p.handle_request(&set(json!(["mon"]), "06:00", "Early"))
+        .await
+        .unwrap();
+    let before = std::fs::read(stored_path(&dir)).unwrap();
+
+    ledger.refuse_create.store(true, Ordering::SeqCst);
+    let err = p.handle_request(&reschedule()).await.unwrap_err();
+    assert!(
+        matches!(&err, PluginError::Permanent(m) if m.contains(VERB_RESCHEDULE)),
+        "{err:?}"
+    );
+    match std::fs::read(stored_path(&dir)) {
+        Ok(after) => assert_eq!(after, before, "the stored alarm changed"),
+        Err(e) => panic!("the stored alarm is gone: {e}"),
+    }
+    assert!(!has_cancel(&ledger), "{:?}", ledger.calls());
+}
+
+/// A stored file that does not parse, or does not hold an alarm a
+/// set would take, is refused; the ledger is not asked and the file
+/// stays as it is.
+#[tokio::test]
+async fn a_stored_file_that_is_not_an_alarm_is_refused_and_stays() {
+    for text in [
+        "not toml at all [",
+        "weekdays = [\"mon\"]\ntime = \"07:00\"\n",
+        "weekdays = [\"mon\", \"mon\"]\ntime = \"07:00\"\nplaylist_name = \"A\"\n",
+        "weekdays = [\"mon\"]\ntime = \"7:00\"\nplaylist_name = \"A\"\n",
+        "weekdays = [\"mon\"]\ntime = \"07:00\"\nplaylist_name = \"  \"\n",
+    ] {
+        let ledger = Arc::new(StubLedger::default());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(stored_path(&dir), text).unwrap();
+        let p = plugin_storing(&ledger, &dir);
+        match p.handle_request(&reschedule()).await {
+            Err(PluginError::Permanent(_)) => {}
+            other => panic!("{text:?} must be refused, got {other:?}"),
+        }
+        assert!(ledger.calls().is_empty(), "{text:?}: {:?}", ledger.calls());
+        assert_eq!(std::fs::read_to_string(stored_path(&dir)).unwrap(), text);
+    }
+}
+
+/// Without the ledger handle, a reschedule with an alarm stored
+/// refuses and leaves the file; with nothing stored it answers ok.
+#[tokio::test]
+async fn without_the_ledger_a_stored_alarm_is_not_rescheduled() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut p = AlarmPlugin::new().with_state_path(stored_path(&dir));
+    p.loaded = true;
+    let resp = p.handle_request(&reschedule()).await.unwrap();
+    assert_eq!(body(&resp), json!({ "v": 1, "status": "ok" }));
+
+    let text =
+        "weekdays = [\"mon\"]\ntime = \"07:00\"\nplaylist_name = \"A\"\n";
+    std::fs::write(stored_path(&dir), text).unwrap();
+    match p.handle_request(&reschedule()).await {
+        Err(PluginError::Permanent(msg)) => {
+            assert!(msg.contains("appointment ledger"), "got: {msg}")
+        }
+        other => panic!("expected Permanent, got {other:?}"),
+    }
+    assert_eq!(std::fs::read_to_string(stored_path(&dir)).unwrap(), text);
+}
+
+// ----- pin: load makes no ledger call -----
+
+/// Pin: load does not create, cancel or re-issue. The device wakes
+/// at the alarm time and the plugin loads after it, so a create at
+/// load would move that fire to the next named day; the ledger's
+/// catch-up of the past-due fire is the alarm.
+///
+/// No test in this tree constructs a `LoadContext` (the SDK offers
+/// no test constructor for one), so `load` cannot be driven from
+/// here and the rule is pinned where it lives: the body of `load`,
+/// from its signature to the next function at impl depth.
+#[test]
+fn load_makes_no_ledger_call() {
+    let src = include_str!("lib.rs");
+    let load_at = src
+        .find("    fn load<'a>(")
+        .expect("the plugin must have a load");
+    let body_end = src[load_at + 1..]
+        .find("\n    fn ")
+        .map(|i| load_at + 1 + i)
+        .unwrap_or(src.len());
+    let body = &src[load_at..body_end];
+    // The slice is load itself, not an empty or a stray match.
+    assert!(
+        body.contains("ctx.state_dir"),
+        "the slice must be load, which takes the state directory"
+    );
+    for token in [
+        "create_appointment",
+        "cancel_appointment",
+        "reissue",
+        "handle_reschedule",
+        "handle_set",
+        "handle_clear",
+    ] {
+        assert!(
+            !body.contains(token),
+            "load names {token:?}; load must make no ledger call"
+        );
     }
 }
 

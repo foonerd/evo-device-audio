@@ -19,6 +19,16 @@
 //!   playlist exists.
 //! - `alarm.clear { v }` cancels the appointment `alarm` and
 //!   answers `{ v, status: "ok" }`, also when no alarm is set.
+//! - `alarm.reschedule { v }` re-issues the stored alarm: it calls
+//!   create for `alarm` and never cancels, so the ledger computes
+//!   the next fire from the zone now in force. It answers
+//!   `{ v, alarm }`, or `{ v, status: "ok" }` with nothing stored.
+//!   A create the ledger refuses is a refused verb, and the stored
+//!   alarm stays.
+//!
+//! A successful set stores `{ weekdays, time, playlist_name }` in
+//! `alarm.toml` in the plugin's own state directory; a clear
+//! removes it.
 //!
 //! The alarm is one appointment on the framework appointment
 //! ledger, id `alarm`: weekly on the named days, zone `Local`,
@@ -30,9 +40,14 @@
 //!
 //! ## What this plugin does NOT do
 //!
-//! - Keep state. The ledger keeps the appointment across
-//!   restarts and the id is a constant, so set and clear reach it
-//!   after a restart without a store of their own.
+//! - Read its appointment back from the ledger. The ledger offers
+//!   create and cancel only, so the stored file is the plugin's
+//!   one record of what it set.
+//! - Re-issue at load. The device wakes at the alarm time and the
+//!   plugin loads after it; a create then would move that fire to
+//!   the next named day. The ledger restores the past-due fire
+//!   after load and catches it up within the miss grace, and that
+//!   fire is the alarm.
 //! - Fire, time, or wake anything itself. Recurrence, local time,
 //!   missed fires and the device wake are the ledger's.
 //! - Fade, or touch any playback setting. It is not the sleep
@@ -43,6 +58,7 @@
 #![allow(clippy::manual_async_fn)]
 
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use evo_plugin_sdk::contract::{
@@ -67,6 +83,12 @@ pub const VERB_SET: &str = "alarm.set";
 
 /// Take the alarm away.
 pub const VERB_CLEAR: &str = "alarm.clear";
+
+/// Schedule the stored alarm again, on the zone now in force.
+pub const VERB_RESCHEDULE: &str = "alarm.reschedule";
+
+/// The stored alarm's file in the plugin's state directory.
+pub const STATE_FILENAME: &str = "alarm.toml";
 
 /// The one appointment's id on the ledger. A constant, so a set
 /// or a clear after a restart reaches the appointment an earlier
@@ -104,8 +126,8 @@ fn plugin_crate_version() -> semver::Version {
         .expect("CARGO_PKG_VERSION is valid semver")
 }
 
-/// The alarm as set and as answered.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// The alarm as set, as stored, and as answered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Alarm {
     /// The day tokens, in the order given.
     pub weekdays: Vec<String>,
@@ -219,11 +241,15 @@ fn is_hh_mm(time: &str) -> bool {
 /// The plugin singleton.
 pub struct AlarmPlugin {
     loaded: bool,
-    /// Ledger handle from `LoadContext`. `None` refuses both verbs.
+    /// Ledger handle from `LoadContext`. `None` refuses set, clear,
+    /// and a reschedule with an alarm stored.
     appointments: Option<Arc<dyn AppointmentScheduler>>,
-    /// Serialises set and clear, so the last gesture to reach the
-    /// ledger is the one that stands.
+    /// Serialises set, clear and reschedule, so the last gesture to
+    /// reach the ledger is the one that stands and its file matches.
     gesture: tokio::sync::Mutex<()>,
+    /// Where the stored alarm lives; set at load from the state
+    /// directory unless a caller chose one. `None` stores nothing.
+    state_path: Option<PathBuf>,
 }
 
 impl AlarmPlugin {
@@ -233,6 +259,96 @@ impl AlarmPlugin {
             loaded: false,
             appointments: None,
             gesture: tokio::sync::Mutex::new(()),
+            state_path: None,
+        }
+    }
+
+    /// Store the alarm at this path rather than in the state
+    /// directory load is given.
+    pub fn with_state_path(mut self, path: PathBuf) -> Self {
+        self.state_path = Some(path);
+        self
+    }
+
+    /// The stored alarm, checked as a set is checked. `None` when
+    /// nothing is stored; an error when the file cannot be read or
+    /// does not hold a valid alarm. The file is never touched here.
+    async fn stored(&self, verb: &str) -> Result<Option<Alarm>, PluginError> {
+        let Some(path) = self.state_path.as_deref() else {
+            return Ok(None);
+        };
+        let body = match tokio::fs::read_to_string(path).await {
+            Ok(body) => body,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None)
+            }
+            Err(e) => {
+                return Err(PluginError::Transient(format!(
+                    "{verb}: could not read the stored alarm at {}: {e}",
+                    path.display()
+                )))
+            }
+        };
+        let stored: Alarm = toml::from_str(&body).map_err(|e| {
+            PluginError::Permanent(format!(
+                "{verb}: the stored alarm at {} does not parse: {e}",
+                path.display()
+            ))
+        })?;
+        Alarm::new(stored.weekdays, stored.time, &stored.playlist_name)
+            .map(Some)
+            .map_err(|e| {
+                PluginError::Permanent(format!(
+                    "{verb}: the stored alarm at {} is not valid: {e}",
+                    path.display()
+                ))
+            })
+    }
+
+    /// Re-issue the stored alarm: create for `alarm`, never a
+    /// cancel, so the ledger computes the next fire from the zone
+    /// now in force. `None` when nothing is stored. A refused create
+    /// is returned as the error and the stored file stays.
+    async fn reissue_stored(
+        &self,
+        verb: &str,
+    ) -> Result<Option<Alarm>, PluginError> {
+        let Some(alarm) = self.stored(verb).await? else {
+            return Ok(None);
+        };
+        let ledger = self.ledger()?;
+        let (spec, action) = alarm.appointment();
+        ledger
+            .create_appointment(spec, action)
+            .await
+            .map_err(|e| ledger_refused(verb, e))?;
+        Ok(Some(alarm))
+    }
+
+    async fn handle_reschedule(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let _: EmptyPayload = parse_versioned(req)?;
+        let _gesture = self.gesture.lock().await;
+        match self.reissue_stored(VERB_RESCHEDULE).await? {
+            Some(alarm) => {
+                tracing::info!(plugin = PLUGIN_NAME, "alarm rescheduled");
+                encode(
+                    req,
+                    &AlarmResponse {
+                        v: PAYLOAD_VERSION,
+                        alarm,
+                    },
+                )
+            }
+            None => encode(
+                req,
+                &StatusResponse {
+                    v: PAYLOAD_VERSION,
+                    status: "ok",
+                },
+            ),
         }
     }
 
@@ -263,6 +379,17 @@ impl AlarmPlugin {
             .create_appointment(spec, action)
             .await
             .map_err(|e| ledger_refused(VERB_SET, e))?;
+        // Stored only once the ledger took it: a refused create
+        // leaves the previous alarm and its file as they were.
+        if let Some(path) = self.state_path.as_deref() {
+            write_stored(path, &alarm).await.map_err(|e| {
+                PluginError::Transient(format!(
+                    "{VERB_SET}: the alarm is scheduled but could not be \
+                     stored at {}: {e}",
+                    path.display()
+                ))
+            })?;
+        }
         tracing::info!(
             plugin = PLUGIN_NAME,
             weekdays = ?alarm.weekdays,
@@ -290,6 +417,15 @@ impl AlarmPlugin {
             .cancel_appointment(AppointmentId::new(APPOINTMENT_ID))
             .await
             .map_err(|e| ledger_refused(VERB_CLEAR, e))?;
+        if let Some(path) = self.state_path.as_deref() {
+            remove_stored(path).await.map_err(|e| {
+                PluginError::Transient(format!(
+                    "{VERB_CLEAR}: the alarm is cancelled but its stored \
+                     file at {} could not be removed: {e}",
+                    path.display()
+                ))
+            })?;
+        }
         tracing::info!(plugin = PLUGIN_NAME, "alarm cleared");
         encode(
             req,
@@ -307,6 +443,28 @@ impl Default for AlarmPlugin {
     }
 }
 
+/// Store an alarm: a temporary file beside the target, then a
+/// rename.
+async fn write_stored(path: &Path, alarm: &Alarm) -> std::io::Result<()> {
+    let body = toml::to_string(alarm).map_err(std::io::Error::other)?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    tokio::fs::write(&tmp, body.as_bytes()).await?;
+    tokio::fs::rename(&tmp, path).await
+}
+
+/// Remove the stored alarm; a file already gone is not an error.
+async fn remove_stored(path: &Path) -> std::io::Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
 impl Plugin for AlarmPlugin {
     fn describe(&self) -> impl Future<Output = PluginDescription> + Send + '_ {
         async move {
@@ -320,6 +478,7 @@ impl Plugin for AlarmPlugin {
                     request_types: vec![
                         VERB_SET.to_string(),
                         VERB_CLEAR.to_string(),
+                        VERB_RESCHEDULE.to_string(),
                     ],
                     accepts_custody: false,
                     flags: Default::default(),
@@ -344,9 +503,12 @@ impl Plugin for AlarmPlugin {
             if self.appointments.is_none() {
                 tracing::warn!(
                     plugin = PLUGIN_NAME,
-                    "no appointment ledger handle; alarm.set and \
-                     alarm.clear will refuse"
+                    "no appointment ledger handle; alarm.set, \
+                     alarm.clear and alarm.reschedule will refuse"
                 );
+            }
+            if self.state_path.is_none() {
+                self.state_path = Some(ctx.state_dir.join(STATE_FILENAME));
             }
             self.loaded = true;
             tracing::info!(plugin = PLUGIN_NAME, "alarm plugin loaded");
@@ -395,6 +557,7 @@ impl Respondent for AlarmPlugin {
             match req.request_type.as_str() {
                 VERB_SET => self.handle_set(req).await,
                 VERB_CLEAR => self.handle_clear(req).await,
+                VERB_RESCHEDULE => self.handle_reschedule(req).await,
                 other => Err(PluginError::Permanent(format!(
                     "alarm: unknown verb {other:?}"
                 ))),

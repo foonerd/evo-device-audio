@@ -39,5 +39,5 @@ restart_budget = 5
 appointments = true
 
 [capabilities.respondent]
-request_types = ["alarm.set", "alarm.clear"]
+request_types = ["alarm.set", "alarm.clear", "alarm.reschedule"]
 response_budget_ms = 2000

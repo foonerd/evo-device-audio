@@ -4,18 +4,23 @@ owner: evo-device-audio
 isolation: oop
 has_os_dependencies: false
 
-# One alarm on the `audio.alarm` shelf. The plugin holds no state
-# of its own and touches no host resource: the alarm is one
+# One alarm on the `audio.alarm` shelf. The alarm is one
 # appointment on the framework appointment ledger, which keeps it
 # across restarts, fires it, and arms the device wake through the
 # distribution's own hook. On fire the ledger dispatches
-# `queue.load_playlist_to_queue` on `audio.queue`.
+# `queue.load_playlist_to_queue` on `audio.queue`. The plugin keeps
+# one file of its own, the alarm it last set, so it can schedule
+# it again on the zone in force; it touches no host resource.
 
 capability_intent:
   - id: appointment_ledger
     need: create and cancel the one appointment `alarm` on the framework appointment ledger (`capabilities.appointments = true`). The appointment is weekly on the weekdays the operator names, at a local HH:MM, with must_wake_device true; its action is `queue.load_playlist_to_queue` on `audio.queue` with `{ v: 1, playlist_name, start_position: 0 }`.
     access_path: framework/appointments
-    failure_mode: plugin admits; alarm.set and alarm.clear refuse with PluginError::Permanent naming the missing ledger handle; no alarm is scheduled.
+    failure_mode: plugin admits; alarm.set, alarm.clear, and alarm.reschedule with an alarm stored refuse with PluginError::Permanent naming the missing ledger handle; no alarm is scheduled.
+  - id: state_directory_read_write
+    need: read and write `alarm.toml` in the plugin's own state directory (/var/lib/evo/plugins/org.evoframework.alarm/state/), holding `{ weekdays, time, playlist_name }` of the alarm last set. Written after a successful alarm.set, through a temporary file and a rename; removed by alarm.clear; read by alarm.reschedule to schedule the alarm again; not read at load.
+    access_path: filesystem/state
+    failure_mode: a set whose file cannot be written answers a transient error though the alarm is scheduled; a missing file is no stored alarm; a file that cannot be read or does not hold a valid alarm refuses alarm.reschedule and is left as it is.
 
 required_binaries: []
 required_kernel_modules: []
