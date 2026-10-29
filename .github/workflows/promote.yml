@@ -1,7 +1,11 @@
-# Promote: move a channel pointer to a (piece, version) that is
-# already published in pieces/. No rebuild; no signing of the piece
-# itself. The channel-pointer file is signed with the commons key
-# so consumers can verify which version a channel points at.
+# Promote: move a channel pointer to a cut of a piece that is already
+# published on the plane, for every triple the plane ships. For an
+# org.evoframework.* plugin that is
+# bundles/<plugin>/<triple>/<plugin>-<cut>-<triple>.tar.gz; for
+# evo-device-audio it is binaries/evo-device-audio/<cut>/<triple>/
+# evo-device-audio. No rebuild; no signing of the piece itself. The
+# channel-pointer file is signed with the commons key so consumers
+# can verify which cut a channel points at.
 #
 # Format is v0. When the framework ships its release-plane contract
 # in `evo-core/docs/engineering/RELEASE_PLANE.md`, the channel-
@@ -17,7 +21,7 @@ name: promote
         type: string
         required: true
       version:
-        description: "Version already published under pieces/<piece>/<version>/"
+        description: "Cut already published on the plane for every triple (bundles/ for a plugin, binaries/ for evo-device-audio), e.g. 0.1.13.0"
         type: string
         required: true
       channel:
@@ -65,8 +69,33 @@ jobs:
           git clone "https://x-access-token:${GH_TOKEN}@github.com/${ARTEFACTS_REPO}.git" "$ART"
           cd "$ART"
 
-          if [ ! -d "pieces/${PIECE}/${VERSION}" ]; then
-            echo "::error::pieces/${PIECE}/${VERSION} not found in ${ARTEFACTS_REPO}; cannot promote a version that has not been published"
+          # The cut must be on the plane for every triple it ships. A
+          # cut is digits and dots and a plugin name has the
+          # org.evoframework.* shape, so neither can walk the path to
+          # a different file.
+          TRIPLES="aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu armv7-unknown-linux-gnueabihf"
+          if ! printf '%s' "$VERSION" | grep -Eqx '[0-9]+(\.[0-9]+)*'; then
+            echo "::error::'${VERSION}' is not a cut (digits and dots)"
+            exit 1
+          fi
+          if [ "$PIECE" != "evo-device-audio" ] \
+              && ! printf '%s' "$PIECE" | grep -Eqx 'org\.evoframework(\.[a-z0-9]+(-[a-z0-9]+)*)+'; then
+            echo "::error::${PIECE} is neither an org.evoframework.* plugin nor evo-device-audio; there is nothing on the plane to prove it against"
+            exit 1
+          fi
+          missing=0
+          for TRIPLE in $TRIPLES; do
+            if [ "$PIECE" = "evo-device-audio" ]; then
+              FILE="binaries/evo-device-audio/${VERSION}/${TRIPLE}/evo-device-audio"
+            else
+              FILE="bundles/${PIECE}/${TRIPLE}/${PIECE}-${VERSION}-${TRIPLE}.tar.gz"
+            fi
+            if [ ! -f "$FILE" ]; then
+              echo "::error::${FILE} not found in ${ARTEFACTS_REPO}; cannot promote a cut that has not been published"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
             exit 1
           fi
 
