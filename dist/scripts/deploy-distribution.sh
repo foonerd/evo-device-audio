@@ -16,6 +16,13 @@
 #     drop-ins (including `exec-start.conf` that overrides the
 #     framework `ExecStart` to point at `evo-device-audio`), and
 #     `/etc/evo/plugins.d/` configs are in place.
+#   - The target reaches raw.githubusercontent.com and has
+#     curl and openssl. `/opt/evo/bin/evo-plugin-tool` is fetched
+#     there from the signed 0.1.13.0 slot on the artefacts plane
+#     and verified against
+#     `/etc/evo/trust.d/commons-plugin-signing-public.pem`, by
+#     the installer's `place_plugin_tool` run through
+#     `sudo -n bash`.
 #
 # Prerequisites on the dev box:
 #   - `cross` (https://github.com/cross-rs/cross) installed
@@ -356,6 +363,23 @@ if ! ssh "${SSH_TARGET}" "
     exit 3
 fi
 echo "  ok (steward installed)"
+
+# evo-plugin-tool beside the steward. The installer's own
+# place_plugin_tool is shipped to the target and run there as
+# root, so a deploy fetches and verifies the tool exactly as an
+# install does: the pinned 0.1.13.0 slot, its sha256, then its
+# signature against the target's commons plugin key.
+PLACE_PLUGIN_TOOL="$(sed -n '/^place_plugin_tool() {$/,/^}$/p' "${SCRIPT_DIR}/evo-install.sh")"
+if [[ -z "${PLACE_PLUGIN_TOOL}" ]]; then
+    echo "FAIL: place_plugin_tool not found in ${SCRIPT_DIR}/evo-install.sh" >&2
+    exit 3
+fi
+if ! printf '%s\nplace_plugin_tool\n' "${PLACE_PLUGIN_TOOL}" \
+        | ssh "${SSH_TARGET}" 'sudo -n bash -s'; then
+    echo "FAIL: place evo-plugin-tool on target failed" >&2
+    exit 3
+fi
+echo "  ok (evo-plugin-tool installed)"
 
 for entry in "${OOP_PLUGINS[@]}"; do
     IFS=':' read -r p_name p_crate p_wire _ <<< "${entry}"
