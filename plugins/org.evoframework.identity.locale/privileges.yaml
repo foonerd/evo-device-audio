@@ -24,7 +24,7 @@ capability_intent:
     access_path: sudoers/command
     failure_mode: timezone.set answers PluginError::Transient carrying the sudo / wrapper stderr and the zone in force as timedatectl reads it afterwards; language.set is unaffected.
   - id: alarm_reschedule_dispatch
-    need: after a zone is applied, wait more than one second, then call `alarm.reschedule { v: 1 }` on `audio.alarm` through the shelf dispatcher so the pending alarm is scheduled again on the new zone.
+    need: 'after a zone is applied, wait more than one second, then call `alarm.reschedule { v: 1 }` on `audio.alarm` through the shelf dispatcher so the pending alarm is scheduled again on the new zone.'
     access_path: framework/shelf_dispatch
     failure_mode: a refused reschedule answers PluginError::Transient naming the zone in force, which stays applied; sending the same zone again runs the reschedule again. Without a dispatcher, timezone.set refuses before anything is applied.
 

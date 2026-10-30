@@ -54,10 +54,12 @@
 # Exit codes:
 #   0 — build + deploy + restart + smoke succeeded; service active.
 #   1 — operator error (wrong invocation, ssh refused, missing
-#       prerequisite on target).
+#       prerequisite on target or on this dev box).
 #   2 — build error (cross build failed; previous deploy untouched).
 #   3 — deploy error (scp / install failed; previous binary remains).
-#   4 — verify error (service did not become active within budget).
+#   4 — verify error (service did not become active within budget,
+#       or a shipped plugin was refused at admission or never
+#       admitted).
 #   5 — track_detail smoke gate refused the deploy; `.prev` binary
 #       has been restored on the target and evo restarted so no
 #       half-landed protocol work sits on a listening device.
@@ -195,6 +197,20 @@ if [[ ${#OOP_PLUGINS[@]} -gt 0 ]]; then
     echo "  ok (signing key: ${EVO_PLUGIN_SIGNING_KEY})"
     echo "  ok (framework tool source: ${ENG_ROOT})"
 fi
+
+# The track_detail smoke gate at step 7.5 imports websockets, which
+# scripts/preflight/track-detail-smoke.py declares in its script
+# header. Without it the gate dies at import after the target is
+# already running the new bundle, and the deploy rolls the steward
+# back. Refuse here, before anything on the target moves.
+if ! python3 -c 'import sys, websockets; sys.exit(int(websockets.__version__.split(".")[0]) < 10)' >/dev/null 2>&1; then
+    echo "FAIL: python3 on this dev box cannot import websockets>=10" >&2
+    echo "      The track_detail smoke gate needs it (scripts/preflight/track-detail-smoke.py)." >&2
+    echo "      Install it for this python3, or put a venv that has it first on PATH:" >&2
+    echo "        python3 -m pip install 'websockets>=10'" >&2
+    exit 1
+fi
+echo "  ok (python3 imports websockets for the smoke gate)"
 
 if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "${SSH_TARGET}" "
     set -e
@@ -703,6 +719,9 @@ done
 echo
 
 echo "[6/7] start steward ..."
+# The admission verdict at step 7 reads the journal from here on,
+# so a refusal from an earlier start cannot count against this one.
+STEWARD_STARTED_AT="$(ssh "${SSH_TARGET}" 'date "+%Y-%m-%d %H:%M:%S"')"
 if ! ssh "${SSH_TARGET}" 'sudo -n systemctl start evo'; then
     echo "FAIL: systemctl start evo returned non-zero" >&2
     exit 4
@@ -762,31 +781,40 @@ else
     echo "         (check 'journalctl -u evo --no-pager -n 80' on the target)"
 fi
 
-# Verify every OOP plugin in the bundle set admitted through
-# Phase 2 discovery on this boot. The framework's
-# `plugin_discovery::discover_and_admit` emits a per-bundle
-# admit line; presence of every plugin name in the recent
-# journal confirms the bundle layout was correct and the
-# admit handshake succeeded. Same `|| echo 0` guard as above
-# so zero-match on any single plugin never fails the whole
-# verify step under `set -e`.
+# Verify every OOP plugin this deploy shipped admitted on this
+# start. A plugin the framework refused (`skipping plugin <name>:
+# admission failed`), or one with no socket under
+# /run/evo/plugins/ once admission has settled, fails the deploy.
+# The decision is in lib/ so the regression suite can drive it
+# without a box.
+SHIPPED_PLUGINS=()
 for entry in "${OOP_PLUGINS[@]}"; do
     IFS=':' read -r p_name _ _ <<< "${entry}"
-    # Client-side expansion of ${p_name} is intentional: the deploy script owns
-    # the plugin name (a reverse-DNS literal from OOP_PLUGINS) and inlines it
-    # into the target's grep pattern so we can count admission hits per plugin.
-    # shellcheck disable=SC2029
-    PLUGIN_HITS="$(ssh "${SSH_TARGET}" \
-        "sudo -n journalctl -u evo --since '30 seconds ago' --no-pager 2>&1 \
-            | grep -cE 'plugin.*${p_name}|${p_name}.*admit' \
-            || true")"
-    if [[ "${PLUGIN_HITS}" -ge 1 ]]; then
-        echo "  [ok]  plugin ${p_name} discovered + admitted (${PLUGIN_HITS} matching lines)"
-    else
-        echo "  [WARN] no discovery / admit signal for ${p_name} in the last 30 s"
-        echo "         (check 'journalctl -u evo --no-pager -n 80' on the target)"
-    fi
+    SHIPPED_PLUGINS+=("${p_name}")
 done
+# Wait up to 60 s for every socket; a refused plugin never binds
+# one, so the wait ends at the deadline and the verdict names it.
+# Client-side expansion of ${#SHIPPED_PLUGINS[@]} is intentional: the
+# deploy owns the count and inlines it; escaped `\$` stays remote.
+# shellcheck disable=SC2029
+ADMITTED_PLUGINS="$(ssh "${SSH_TARGET}" "
+    deadline=\$(( \$(date +%s) + 60 ))
+    while [ \"\$(find /run/evo/plugins -maxdepth 1 -name '*.sock' 2>/dev/null | wc -l)\" -lt ${#SHIPPED_PLUGINS[@]} ] \
+        && [ \"\$(date +%s)\" -lt \"\${deadline}\" ]; do
+        sleep 1
+    done
+    find /run/evo/plugins -maxdepth 1 -name '*.sock' -printf '%f\n' 2>/dev/null | sed 's/\.sock\$//'
+" || true)"
+# shellcheck disable=SC2029
+STEWARD_JOURNAL="$(ssh "${SSH_TARGET}" \
+    "sudo -n journalctl -u evo --since '${STEWARD_STARTED_AT}' --no-pager -o cat 2>&1" || true)"
+# shellcheck source=lib/plugin-admission-verdict.sh
+source "${REPO_ROOT}/dist/scripts/lib/plugin-admission-verdict.sh"
+if ! plugin_admission_verdict "${STEWARD_JOURNAL}" "${ADMITTED_PLUGINS}" "${SHIPPED_PLUGINS[@]}"; then
+    echo "FAIL: a shipped plugin was refused at admission or never admitted" >&2
+    echo "      check 'journalctl -u evo -b --no-pager | grep \"skipping plugin\"' on the target" >&2
+    exit 4
+fi
 
 # ----------------------------------------------------------
 # Deploy gate: track_detail full-source smoke. Refuses to

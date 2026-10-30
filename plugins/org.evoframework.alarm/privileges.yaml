@@ -14,7 +14,7 @@ has_os_dependencies: false
 
 capability_intent:
   - id: appointment_ledger
-    need: create and cancel the one appointment `alarm` on the framework appointment ledger (`capabilities.appointments = true`). The appointment is weekly on the weekdays the operator names, at a local HH:MM, with must_wake_device true; its action is `queue.load_playlist_to_queue` on `audio.queue` with `{ v: 1, playlist_name, start_position: 0 }`.
+    need: 'create and cancel the one appointment `alarm` on the framework appointment ledger (`capabilities.appointments = true`). The appointment is weekly on the weekdays the operator names, at a local HH:MM, with must_wake_device true; its action is `queue.load_playlist_to_queue` on `audio.queue` with `{ v: 1, playlist_name, start_position: 0 }`.'
     access_path: framework/appointments
     failure_mode: plugin admits; alarm.set, alarm.clear, and alarm.reschedule with an alarm stored refuse with PluginError::Permanent naming the missing ledger handle; no alarm is scheduled.
   - id: state_directory_read_write
