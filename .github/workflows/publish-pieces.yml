@@ -12,6 +12,9 @@
 #              checkout (program stored; sources alone refused).
 #              Checkout uses ARTEFACTS_PUSH_TOKEN; that PAT already
 #              lists evo-kiosk-eng.
+#   registries — the plugin-registry manifests, one per channel and
+#              target, written from channels/<channel>.toml and the
+#              bundles those pointers name. Builds nothing.
 #
 # all does not imply kiosk. Kiosk mint needs the kiosk-eng
 # tree and three WebKit cross-builds; it is dispatched on
@@ -21,6 +24,9 @@
 #   binaries/evo-device-audio/<version>/<target>/
 #   bundles/<plugin>/<target>/<plugin>-<version>-<target>.tar.gz
 #   bundles/evo-kiosk/<version>/
+#
+# Derived, rewritten on every registries run (not slots):
+#   registries/evo-audio-<channel>/<target>/registry.toml + registry.sig
 #
 # Does not publish evo-core's `evo` or `evo-plugin-tool`. Those
 # live on evo-core's own publish.yml / evo-core-artefacts.
@@ -36,7 +42,7 @@ name: publish-pieces
       scope:
         description: "What to mint"
         type: choice
-        options: [all, steward, plugin, dist, kiosk]
+        options: [all, steward, plugin, dist, kiosk, registries]
         default: all
       plugin:
         description: "Plugin name when scope=plugin (must be in oop-plugins.sh)"
@@ -68,6 +74,7 @@ jobs:
       build_steward: ${{ steps.resolve.outputs.build_steward }}
       build_dist: ${{ steps.resolve.outputs.build_dist }}
       build_kiosk: ${{ steps.resolve.outputs.build_kiosk }}
+      build_registries: ${{ steps.resolve.outputs.build_registries }}
       plugin_count: ${{ steps.resolve.outputs.plugin_count }}
       plugin_matrix: ${{ steps.resolve.outputs.plugin_matrix }}
     steps:
@@ -81,6 +88,73 @@ jobs:
           bash scripts/release/resolve-publish-pieces.sh \
             "${{ inputs.scope }}" \
             "${{ inputs.plugin }}"
+
+  registries:
+    needs: resolve
+    if: needs.resolve.outputs.build_registries == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Write, sign, and push the registry manifests
+        env:
+          PLUGIN_SIGNING_KEY_PEM: ${{ secrets.PLUGIN_SIGNING_KEY_PEM }}
+          GH_TOKEN: ${{ secrets.ARTEFACTS_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PLUGIN_SIGNING_KEY_PEM" ]; then
+            echo "::error::PLUGIN_SIGNING_KEY_PEM is empty or unset"
+            exit 1
+          fi
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::ARTEFACTS_PUSH_TOKEN is empty or unset"
+            exit 1
+          fi
+          git config --global user.name "${COMMIT_USER}"
+          git config --global user.email "${COMMIT_EMAIL}"
+
+          ART=/tmp/artefacts
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${ARTEFACTS_REPO}.git" "$ART"
+          BASE="https://raw.githubusercontent.com/${ARTEFACTS_REPO}/main"
+          TRIPLES="aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu armv7-unknown-linux-gnueabihf"
+
+          # Write all nine before the key is on disk: a refusal leaves
+          # nothing signed and nothing pushed.
+          for CHANNEL in dev test prod; do
+            for TRIPLE in $TRIPLES; do
+              python3 scripts/release/generate-registry.py \
+                --artefacts "$ART" --channel "$CHANNEL" --triple "$TRIPLE" \
+                --base-url "$BASE" \
+                --out "$ART/registries/evo-audio-${CHANNEL}/${TRIPLE}/registry.toml"
+            done
+          done
+
+          umask 077
+          printenv PLUGIN_SIGNING_KEY_PEM > /tmp/key.pem
+          for CHANNEL in dev test prod; do
+            for TRIPLE in $TRIPLES; do
+              DIR="$ART/registries/evo-audio-${CHANNEL}/${TRIPLE}"
+              openssl pkeyutl -sign -inkey /tmp/key.pem -rawin \
+                -in "$DIR/registry.toml" -out "$DIR/registry.sig"
+              if [ "$(stat -c %s "$DIR/registry.sig")" -ne 64 ]; then
+                echo "::error::$DIR/registry.sig is not a 64-byte Ed25519 signature"
+                shred -u /tmp/key.pem
+                exit 1
+              fi
+            done
+          done
+          shred -u /tmp/key.pem
+
+          cd "$ART"
+          git add registries/
+          if git diff --cached --quiet; then
+            echo "Registry manifests unchanged."
+            exit 0
+          fi
+          git commit -m "registries: evo-audio-{dev,test,prod}"
+          git push origin main
+          git show --stat --format= HEAD
 
   host-tool:
     needs: resolve

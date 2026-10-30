@@ -7,13 +7,14 @@
 # Usage:
 #   scripts/release/resolve-publish-pieces.sh <scope> [plugin]
 #
-# scope: all | steward | plugin | dist | kiosk
+# scope: all | steward | plugin | dist | kiosk | registries
 # plugin: org.evoframework.<name> (required when scope=plugin)
 #
 # Writes GitHub Actions outputs when GITHUB_OUTPUT is set:
 #   build_steward=true|false
 #   build_dist=true|false
 #   build_kiosk=true|false
+#   build_registries=true|false
 #   plugin_count=<n>
 #   plugin_matrix=<JSON>
 #
@@ -25,7 +26,7 @@ SCOPE="${1:-}"
 PLUGIN="${2:-}"
 
 if [[ -z "${SCOPE}" ]]; then
-    echo "usage: $0 <all|steward|plugin|dist|kiosk> [plugin-name]" >&2
+    echo "usage: $0 <all|steward|plugin|dist|kiosk|registries> [plugin-name]" >&2
     exit 2
 fi
 
@@ -73,6 +74,7 @@ SELECTED=()
 BUILD_STEWARD=false
 BUILD_DIST=false
 BUILD_KIOSK=false
+BUILD_REGISTRIES=false
 
 case "${SCOPE}" in
     all)
@@ -89,6 +91,11 @@ case "${SCOPE}" in
     kiosk)
         BUILD_KIOSK=true
         ;;
+    registries)
+        # Builds nothing: the registry manifests are written from the
+        # channel pointers and the bundles already on the plane.
+        BUILD_REGISTRIES=true
+        ;;
     plugin)
         if [[ -z "${PLUGIN}" || "${PLUGIN}" == "none" ]]; then
             echo "resolve-publish-pieces: scope=plugin requires a plugin name" >&2
@@ -101,7 +108,7 @@ case "${SCOPE}" in
         SELECTED=("${entry}")
         ;;
     *)
-        echo "resolve-publish-pieces: scope must be all, steward, plugin, dist, or kiosk (got '${SCOPE}')" >&2
+        echo "resolve-publish-pieces: scope must be all, steward, plugin, dist, kiosk, or registries (got '${SCOPE}')" >&2
         exit 1
         ;;
 esac
@@ -131,6 +138,7 @@ emit() {
     printf 'build_steward=%s\n' "${BUILD_STEWARD}"
     printf 'build_dist=%s\n' "${BUILD_DIST}"
     printf 'build_kiosk=%s\n' "${BUILD_KIOSK}"
+    printf 'build_registries=%s\n' "${BUILD_REGISTRIES}"
     printf 'plugin_count=%s\n' "${PLUGIN_COUNT}"
     printf 'plugin_matrix=%s\n' "${MATRIX}"
 }
@@ -141,6 +149,7 @@ if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
         printf 'build_steward=%s\n' "${BUILD_STEWARD}"
         printf 'build_dist=%s\n' "${BUILD_DIST}"
         printf 'build_kiosk=%s\n' "${BUILD_KIOSK}"
+        printf 'build_registries=%s\n' "${BUILD_REGISTRIES}"
         printf 'plugin_count=%s\n' "${PLUGIN_COUNT}"
         printf 'plugin_matrix<<EOF\n%s\nEOF\n' "${MATRIX}"
     } >> "${GITHUB_OUTPUT}"
