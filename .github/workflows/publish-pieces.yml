@@ -15,6 +15,11 @@
 #   registries — the plugin-registry manifests, one per channel and
 #              target, written from channels/<channel>.toml and the
 #              bundles those pointers name. Builds nothing.
+#   plugin-tool — evo-core's evo-plugin-tool 0.1.13.0, already built:
+#              fetched from evo-core-artefacts at a pinned commit,
+#              verified against evo-core's release key, and signed
+#              again with the commons key. Builds nothing. Not part
+#              of all.
 #
 # all does not imply kiosk. Kiosk mint needs the kiosk-eng
 # tree and three WebKit cross-builds; it is dispatched on
@@ -24,6 +29,7 @@
 #   binaries/evo-device-audio/<version>/<target>/
 #   bundles/<plugin>/<target>/<plugin>-<version>-<target>.tar.gz
 #   bundles/evo-kiosk/<version>/
+#   binaries/evo-plugin-tool/<version>/<target>/
 #
 # Derived, rewritten on every registries run (not slots):
 #   registries/evo-audio-<channel>/<target>/registry.toml + registry.sig
@@ -42,7 +48,7 @@ name: publish-pieces
       scope:
         description: "What to mint"
         type: choice
-        options: [all, steward, plugin, dist, kiosk, registries]
+        options: [all, steward, plugin, dist, kiosk, registries, plugin-tool]
         default: all
       plugin:
         description: "Plugin name when scope=plugin (must be in oop-plugins.sh)"
@@ -75,6 +81,7 @@ jobs:
       build_dist: ${{ steps.resolve.outputs.build_dist }}
       build_kiosk: ${{ steps.resolve.outputs.build_kiosk }}
       build_registries: ${{ steps.resolve.outputs.build_registries }}
+      build_plugin_tool: ${{ steps.resolve.outputs.build_plugin_tool }}
       plugin_count: ${{ steps.resolve.outputs.plugin_count }}
       plugin_matrix: ${{ steps.resolve.outputs.plugin_matrix }}
     steps:
@@ -153,6 +160,123 @@ jobs:
             exit 0
           fi
           git commit -m "registries: evo-audio-{dev,test,prod}"
+          git push origin main
+          git show --stat --format= HEAD
+
+  plugin-tool:
+    needs: resolve
+    if: needs.resolve.outputs.build_plugin_tool == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch, verify, sign again, and push evo-plugin-tool 0.1.13.0
+        env:
+          PLUGIN_SIGNING_KEY_PEM: ${{ secrets.PLUGIN_SIGNING_KEY_PEM }}
+          GH_TOKEN: ${{ secrets.ARTEFACTS_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PLUGIN_SIGNING_KEY_PEM" ]; then
+            echo "::error::PLUGIN_SIGNING_KEY_PEM is empty or unset"
+            exit 1
+          fi
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::ARTEFACTS_PUSH_TOKEN is empty or unset"
+            exit 1
+          fi
+
+          PIECE=evo-plugin-tool
+          VERSION=0.1.13.0
+          EVO_CORE_TAG=v0.1.13.0
+          SOURCE_REPO=foonerd/evo-core-artefacts
+          SOURCE_COMMIT=07ea57d
+          SOURCE="https://raw.githubusercontent.com/${SOURCE_REPO}/${SOURCE_COMMIT}/binaries"
+          RELEASE_KEY_URL="https://raw.githubusercontent.com/foonerd/evo-core/${EVO_CORE_TAG}/keys/evo-core-release-signing-public.pem"
+          # SPKI SHA-256 of that key at the tag: a moved tag cannot
+          # bring a different key.
+          RELEASE_KEY_SPKI_SHA256=d1ca8766233a448aa551f75f63c7554760d9a8a95dc31893fb580ca74adc1eea
+          TRIPLES="aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu armv7-unknown-linux-gnueabihf"
+          W=/tmp/plugin-tool
+          mkdir -p "$W"
+
+          # Fetch and verify everything before the commons key is on
+          # disk. The release key is used here and nowhere else.
+          curl -fsSL --retry 3 "$RELEASE_KEY_URL" -o "$W/release.pem"
+          got=$(openssl pkey -pubin -in "$W/release.pem" -outform DER | sha256sum | cut -c1-64)
+          if [ "$got" != "$RELEASE_KEY_SPKI_SHA256" ]; then
+            echo "::error::release key at ${EVO_CORE_TAG} is ${got}, not ${RELEASE_KEY_SPKI_SHA256}"
+            exit 1
+          fi
+          for TRIPLE in $TRIPLES; do
+            mkdir -p "$W/$TRIPLE"
+            for NAME in evo-plugin-tool evo-plugin-tool.sig evo-plugin-tool.sha256; do
+              curl -fsSL --retry 3 "${SOURCE}/${TRIPLE}/${NAME}" -o "$W/$TRIPLE/$NAME"
+            done
+            want=$(cut -c1-64 "$W/$TRIPLE/evo-plugin-tool.sha256")
+            have=$(sha256sum "$W/$TRIPLE/evo-plugin-tool" | cut -c1-64)
+            if [ "$want" != "$have" ]; then
+              echo "::error::${TRIPLE}/evo-plugin-tool sha256 is ${have}, not ${want}"
+              exit 1
+            fi
+            if ! openssl pkeyutl -verify -pubin -inkey "$W/release.pem" -rawin \
+                -in "$W/$TRIPLE/evo-plugin-tool" -sigfile "$W/$TRIPLE/evo-plugin-tool.sig" >/dev/null; then
+              echo "::error::${TRIPLE}/evo-plugin-tool does not verify against the evo-core release key"
+              exit 1
+            fi
+          done
+          chmod 0755 "$W/x86_64-unknown-linux-gnu/evo-plugin-tool"
+          if ! "$W/x86_64-unknown-linux-gnu/evo-plugin-tool" --help | grep -Eq '^[[:space:]]+admin[[:space:]]'; then
+            echo "::error::x86_64 evo-plugin-tool --help lists no admin subcommand"
+            exit 1
+          fi
+
+          git config --global user.name "${COMMIT_USER}"
+          git config --global user.email "${COMMIT_EMAIL}"
+          ART=/tmp/artefacts
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${ARTEFACTS_REPO}.git" "$ART"
+
+          umask 077
+          printenv PLUGIN_SIGNING_KEY_PEM > /tmp/key.pem
+          for TRIPLE in $TRIPLES; do
+            SLOT="binaries/${PIECE}/${VERSION}/${TRIPLE}"
+            if [ -e "$ART/$SLOT" ]; then
+              echo "::warning::Skipping $SLOT — version slot already published (append-only)."
+              continue
+            fi
+            mkdir -p "$ART/$SLOT"
+            install -m 0755 "$W/$TRIPLE/evo-plugin-tool" "$ART/$SLOT/evo-plugin-tool"
+            sha256sum "$ART/$SLOT/evo-plugin-tool" | cut -c1-64 > "$ART/$SLOT/evo-plugin-tool.sha256"
+            {
+              echo "schema_version = 0"
+              echo "piece = \"${PIECE}\""
+              echo "version = \"${VERSION}\""
+              echo "target = \"${TRIPLE}\""
+              echo "source_repo = \"${SOURCE_REPO}\""
+              echo "source_commit = \"${SOURCE_COMMIT}\""
+              echo "evo_core_tag = \"${EVO_CORE_TAG}\""
+              echo "sha256 = \"$(cat "$ART/$SLOT/evo-plugin-tool.sha256")\""
+            } > "$ART/$SLOT/build-info.toml"
+            for FILE in evo-plugin-tool build-info.toml; do
+              SIG="$ART/$SLOT/${FILE%.toml}.sig"
+              openssl pkeyutl -sign -inkey /tmp/key.pem -rawin -in "$ART/$SLOT/$FILE" -out "$SIG"
+              if [ "$(stat -c %s "$SIG")" -ne 64 ]; then
+                echo "::error::$SIG is not a 64-byte Ed25519 signature"
+                shred -u /tmp/key.pem
+                exit 1
+              fi
+            done
+          done
+          shred -u /tmp/key.pem
+
+          cd "$ART"
+          git add "binaries/${PIECE}/${VERSION}/"
+          if git diff --cached --quiet; then
+            echo "No new slot to publish."
+            exit 0
+          fi
+          if git diff --cached --name-only | grep -v "^binaries/${PIECE}/${VERSION}/"; then
+            echo "::error::staged files outside binaries/${PIECE}/${VERSION}/"
+            exit 1
+          fi
+          git commit -m "publish: ${PIECE} ${VERSION} (signed again from ${SOURCE_REPO}@${SOURCE_COMMIT})"
           git push origin main
           git show --stat --format= HEAD
 
