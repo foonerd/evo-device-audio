@@ -132,6 +132,9 @@ pub(crate) struct LibraryContext {
     /// play-history reads — omits them. See
     /// [`crate::forgotten_tracks`].
     pub(crate) forgotten: crate::forgotten_tracks::ForgottenTracks,
+    /// When an index may start, and with which MPD handles. See
+    /// [`crate::scan_door`].
+    pub(crate) scan_gate: crate::scan_door::ScanGate,
 }
 
 impl LibraryContext {
@@ -151,6 +154,7 @@ impl LibraryContext {
             works_aggregate: Arc::new(Mutex::new(None)),
             shelf_dispatcher,
             forgotten: crate::forgotten_tracks::ForgottenTracks::default(),
+            scan_gate: crate::scan_door::ScanGate::settled(),
         }
     }
 
@@ -161,6 +165,17 @@ impl LibraryContext {
         forgotten: crate::forgotten_tracks::ForgottenTracks,
     ) -> Self {
         self.forgotten = forgotten;
+        self
+    }
+
+    /// Kick indexes through `gate`. Without this the context's
+    /// gate is open and holds no MPD handles, so `add_source` and
+    /// the restart pass start nothing.
+    pub(crate) fn with_scan_gate(
+        mut self,
+        gate: crate::scan_door::ScanGate,
+    ) -> Self {
+        self.scan_gate = gate;
         self
     }
 }
@@ -1059,12 +1074,16 @@ pub(crate) async fn handle_add_source(
     // Blocking, as `run_warm_start_probes_blocking` is: one
     // source, a bounded budget, and the response then carries a
     // state that was actually observed rather than a placeholder.
+    let mut became_online = false;
+    let mut local_usb = false;
     if let Some(registered) = ctx.registry.get(&id).await {
         let outcome = crate::source_registry::probe_source(
             &registered,
             crate::source_registry::PROBE_BUDGET,
         )
         .await;
+        local_usb = matches!(registered.kind, SourceKind::LocalUsb { .. });
+        let online = matches!(outcome.new_state, SourceState::Online);
         if let Err(e) = ctx.registry.transition(&id, outcome.new_state).await {
             tracing::warn!(
                 plugin = PLUGIN_NAME,
@@ -1073,11 +1092,25 @@ pub(crate) async fn handle_add_source(
                 "add_source: probe transition failed; source stays Probing \
                  until the next probe"
             );
+        } else {
+            became_online = online;
         }
     }
 
     let _ = ctx.registry.persist().await;
     publish_subjects(ctx).await;
+    // The first index: the same door as the shares sync and the
+    // restart pass. A USB store attached here was mounted, so its
+    // `on_mount_event` counts too. The kick waits for the gate and
+    // does not hold this verb.
+    crate::scan_door::kick_after_add(
+        ctx,
+        &id,
+        crate::scan_door::ScanTrigger::observed_now(
+            became_online,
+            became_online && local_usb,
+        ),
+    );
     Ok(AddSourceResponse {
         v: LIBRARY_PAYLOAD_VERSION,
         source_id: id,

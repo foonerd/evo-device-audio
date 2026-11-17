@@ -131,6 +131,7 @@ mod playlist_duplicate;
 mod playlist_export;
 mod playlist_import;
 mod queue;
+mod scan_door;
 mod scan_progress;
 mod selection;
 mod shelves;
@@ -2584,6 +2585,7 @@ impl Plugin for MpdPlaybackPlugin {
                     mute: self.mute.clone(),
                     shuffle: self.shuffle.clone(),
                     play_history,
+                    fragment_status: self.subscribe_fragment_status(),
                 },
             )
             .await;
@@ -2727,6 +2729,12 @@ impl Plugin for MpdPlaybackPlugin {
                 // awaits deterministic exit before we tear down
                 // the shelves (which owns the registry the sync
                 // upserts into).
+                // Its share kicks wait on the library's scan gate;
+                // release them first so this stop never waits for
+                // MPD to settle.
+                if let Some(shelves) = self.shelves.as_ref() {
+                    shelves.release_scan_waiters();
+                }
                 if let Some(handle) = self.network_shares_sync.take() {
                     handle.stop().await;
                 }

@@ -105,6 +105,10 @@ pub(crate) struct ShelfBundle {
     /// discovered.json sidecar and probes them on a fixed
     /// cadence. Held so unload can stop the task cleanly.
     pub(crate) dlna_sync: Option<DlnaSyncHandle>,
+    /// Opens the library's scan gate once MPD has settled after
+    /// load, then runs the one restart pass. Held so unload can
+    /// release waiting kicks and stop it.
+    pub(crate) scan_settle: Option<crate::scan_door::ScanSettleHandle>,
     /// Finished plays, recorded by the ambient observer; the
     /// library's `recently_played` / `most_played` read it.
     pub(crate) play_history: crate::play_history::PlayHistory,
@@ -121,6 +125,11 @@ pub(crate) struct ShelfInputs {
     pub(crate) mute: crate::mute_cell::MuteCell,
     pub(crate) shuffle: crate::album_shuffle::ShuffleModeCell,
     pub(crate) play_history: crate::play_history::PlayHistory,
+    /// The fragment worker's status, which the scan gate watches
+    /// to tell when MPD has stopped restarting after load. `None`
+    /// when no worker runs.
+    pub(crate) fragment_status:
+        Option<tokio::sync::watch::Receiver<crate::FragmentWorkerStatus>>,
 }
 
 impl ShelfBundle {
@@ -147,6 +156,7 @@ impl ShelfBundle {
             mute,
             shuffle,
             play_history,
+            fragment_status,
         } = inputs;
         let music_directory = source_probe::load_music_directory_from_mpd_conf(
             Path::new(source_probe::DEFAULT_MPD_CONF_PATH),
@@ -212,6 +222,10 @@ impl ShelfBundle {
             subjects.clone(),
             DEFAULT_FAVOURITES_PLAYLIST_NAME.to_string(),
         );
+        // No index starts until MPD has settled after load; see
+        // `scan_door`. Every clone of the library shares this gate.
+        let scan_gate =
+            crate::scan_door::ScanGate::waiting(endpoint.clone(), timeouts);
         let library = LibraryContext::new(
             music_directory.clone(),
             registry.clone(),
@@ -223,7 +237,8 @@ impl ShelfBundle {
                 state_dir.join("forgotten-tracks.toml"),
             )
             .await,
-        );
+        )
+        .with_scan_gate(scan_gate.clone());
         // The triage context clones the library, registry, and
         // subject announcer — every field is Arc-wrapped, so
         // the clone shares state rather than duplicating it.
@@ -299,7 +314,11 @@ impl ShelfBundle {
         // within the steward's load timeout. Per-source probes
         // run concurrently so worst-case wall-clock is the
         // slowest single probe, not the sum.
-        Self::run_warm_start_probes_blocking(&registry).await;
+        //
+        // Warm start starts no index: MPD may still restart under
+        // it. It only records which USB stores a mount brought
+        // Online, for the restart pass after settle.
+        Self::run_warm_start_probes_blocking(&registry, &scan_gate).await;
 
         // Warm-start rehydration: replace the empty envelopes
         // with MPD's persisted truth (queue, stored playlists,
@@ -345,6 +364,13 @@ impl ShelfBundle {
 
         let dlna_sync = Some(library::spawn_dlna_sync(library.clone()));
 
+        let scan_settle = Some(crate::scan_door::spawn_settle(
+            library.clone(),
+            fragment_status,
+            crate::scan_door::SETTLE_QUIET,
+            crate::scan_door::SETTLE_MAX,
+        ));
+
         tracing::info!(
             plugin = PLUGIN_NAME,
             music_directory = %music_directory.display(),
@@ -365,6 +391,7 @@ impl ShelfBundle {
             sticker_reconciler,
             idle_observer,
             dlna_sync,
+            scan_settle,
             play_history,
             endpoint,
             timeouts,
@@ -459,11 +486,15 @@ impl ShelfBundle {
     /// the source in Probing; the cascade emits `null` honestly
     /// for that source's items rather than fabricating a
     /// falsy default.
-    async fn run_warm_start_probes_blocking(registry: &SourceRegistry) {
+    async fn run_warm_start_probes_blocking(
+        registry: &SourceRegistry,
+        scan_gate: &crate::scan_door::ScanGate,
+    ) {
         let snapshot = registry.snapshot().await;
         let mut handles = Vec::with_capacity(snapshot.len());
         for record in snapshot {
             let registry = registry.clone();
+            let scan_gate = scan_gate.clone();
             let source_id = record.id.clone();
             handles.push(tokio::spawn(async move {
                 let full = match registry.get(&source_id).await {
@@ -475,15 +506,23 @@ impl ShelfBundle {
                     crate::source_registry::PROBE_BUDGET,
                 )
                 .await;
-                if let Err(e) =
-                    registry.transition(&source_id, outcome.new_state).await
-                {
-                    tracing::warn!(
-                        plugin = PLUGIN_NAME,
-                        source_id = %source_id,
-                        error = %e,
-                        "warm-start probe: registry transition failed"
-                    );
+                let mount_event = crate::scan_door::warm_start_mount_event(
+                    &full,
+                    &outcome.new_state,
+                );
+                match registry.transition(&source_id, outcome.new_state).await {
+                    Ok(_) if mount_event => {
+                        scan_gate.record_mount_event(&source_id);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = PLUGIN_NAME,
+                            source_id = %source_id,
+                            error = %e,
+                            "warm-start probe: registry transition failed"
+                        );
+                    }
                 }
             }));
         }
@@ -508,6 +547,11 @@ impl ShelfBundle {
     /// `emit` call so no explicit unload-time persist is
     /// needed.
     pub(crate) async fn shutdown(mut self) {
+        // Release any index still waiting for the scan gate. A
+        // kick must not start while the plugin goes down.
+        if let Some(handle) = self.scan_settle.take() {
+            handle.stop().await;
+        }
         // Keep the queue first, while MPD is most likely still
         // there to be asked. A reboot can lose it; this is what
         // `restore_last_queue` gives back afterwards. A failure
@@ -551,6 +595,14 @@ impl ShelfBundle {
                  next load may rehydrate from stale state"
             );
         }
+    }
+
+    /// Release every index kick still waiting for the scan gate
+    /// without starting it. Unload calls this before stopping the
+    /// tasks whose kicks wait there, so none of them holds the
+    /// unload until MPD settles.
+    pub(crate) fn release_scan_waiters(&self) {
+        self.library.scan_gate.stop();
     }
 
     /// Open a fresh MPD connection for one verb dispatch.
@@ -1657,6 +1709,7 @@ mod tests {
                 mute: crate::mute_cell::MuteCell::new(),
                 shuffle: crate::album_shuffle::ShuffleModeCell::new(),
                 play_history: crate::play_history::PlayHistory::disabled(),
+                fragment_status: None,
             },
         )
         .await
