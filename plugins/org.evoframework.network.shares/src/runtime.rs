@@ -2696,6 +2696,11 @@ pub struct NetworkSharesRuntime {
     l3_gate: Option<L3Gate>,
     /// How long boot-mount waits for L3 before giving up.
     l3_wait_ms: u64,
+    /// Set once the boot sweep has attempted every share or given
+    /// up waiting for L3. Until then the short poll leaves shares
+    /// with no recorded failure to the sweep, which attempts each
+    /// of them in turn.
+    boot_sweep_done: std::sync::atomic::AtomicBool,
     /// Bounded ring of the most recent share-lifecycle events
     /// (mount / unmount / mount-failed / unmount-failed).
     /// Published as the `network_share_events` singleton on
@@ -2757,6 +2762,7 @@ impl NetworkSharesRuntime {
             host_reachable: Arc::new(|_: &str, _: u16| true),
             l3_gate: None,
             l3_wait_ms: DEFAULT_L3_WAIT_MS,
+            boot_sweep_done: std::sync::atomic::AtomicBool::new(false),
             share_events_ring: Arc::new(StdMutex::new(
                 std::collections::VecDeque::with_capacity(
                     SHARE_EVENTS_RING_CAPACITY,
@@ -2833,6 +2839,7 @@ impl NetworkSharesRuntime {
             host_reachable: Arc::new(|_: &str, _: u16| true),
             l3_gate: None,
             l3_wait_ms: DEFAULT_L3_WAIT_MS,
+            boot_sweep_done: std::sync::atomic::AtomicBool::new(false),
             share_events_ring: Arc::new(StdMutex::new(
                 std::collections::VecDeque::with_capacity(
                     SHARE_EVENTS_RING_CAPACITY,
@@ -3727,6 +3734,7 @@ impl NetworkSharesRuntimeBuilder {
                 .unwrap_or_else(|| Arc::new(fuser_holders_blocking)),
             l3_gate: self.l3_gate,
             l3_wait_ms: self.l3_wait_ms.unwrap_or(DEFAULT_L3_WAIT_MS),
+            boot_sweep_done: std::sync::atomic::AtomicBool::new(false),
             share_events_ring: Arc::new(StdMutex::new(
                 std::collections::VecDeque::with_capacity(
                     SHARE_EVENTS_RING_CAPACITY,
@@ -4051,7 +4059,7 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
             let host = record.host.trim().to_string();
             if !host.is_empty() {
                 let port = probe_port_for_fstype(record.fstype);
-                if !(self.host_reachable)(&host, port) {
+                if !self.host_answers(&host, port).await {
                     let err = MountError::HostUnreachable { host, port };
                     // Classified, not bare: the short poll selects
                     // on this class, so a state written without it
@@ -4467,10 +4475,16 @@ impl NetworkSharesRuntime {
         let args = self.wrap_mount_args(build_cifs_mount_args(
             record, dialect, creds_path,
         ));
-        let output = self
+        let output = match self
             .executor
             .run(&self.mount_program, &args, self.mount_timeout_ms)
-            .await?;
+            .await
+        {
+            Ok(output) => output,
+            // A timed-out or unspawnable attempt says nothing about
+            // dialects. If the host has gone, that is what to report.
+            Err(e) => return Err(self.host_gone(record).await.unwrap_or(e)),
+        };
         if output.exit_code == Some(0) {
             return Ok(Some(
                 self.finalise_mount_success(record, dialect, start_ms)
@@ -4513,9 +4527,13 @@ impl NetworkSharesRuntime {
                     reason: classify_stderr,
                 })
             }
-            // Not a refusal and not a missing mount point: let the
-            // dialect ladder take its next step.
-            MountFailureKind::Other => Ok(None),
+            // Not a refusal and not a missing mount point. Ask the
+            // host before the ladder takes its next step: a server
+            // that went away mid-ladder has not refused a dialect.
+            MountFailureKind::Other => match self.host_gone(record).await {
+                Some(gone) => Err(gone),
+                None => Ok(None),
+            },
         }
     }
 
@@ -5017,10 +5035,16 @@ impl NetworkSharesRuntime {
         start_ms: u64,
     ) -> Result<MountReport, MountError> {
         let args = self.wrap_mount_args(build_nfs_mount_args(record));
-        let output = self
+        let output = match self
             .executor
             .run(&self.mount_program, &args, self.mount_timeout_ms)
-            .await?;
+            .await
+        {
+            Ok(output) => output,
+            // As on the CIFS path: a timed-out attempt against a
+            // host that has gone is an unreachable host.
+            Err(e) => return Err(self.host_gone(record).await.unwrap_or(e)),
+        };
         if output.exit_code != Some(0) {
             // Fetch the transient .mount unit's journal for the
             // real mount.nfs stderr — systemd-mount returns
@@ -5062,11 +5086,17 @@ impl NetworkSharesRuntime {
                         reason: classify_stderr,
                     })
                 }
-                MountFailureKind::Other => Err(MountError::MountFailed {
-                    id: record.share_id.clone(),
-                    exit_code: output.exit_code,
-                    stderr: classify_stderr,
-                }),
+                // The single attempt failed for no reason it names.
+                // If the host has stopped answering, say that: the
+                // short poll brings the share back when it returns.
+                MountFailureKind::Other => match self.host_gone(record).await {
+                    Some(gone) => Err(gone),
+                    None => Err(MountError::MountFailed {
+                        id: record.share_id.clone(),
+                        exit_code: output.exit_code,
+                        stderr: classify_stderr,
+                    }),
+                },
             };
         }
         // Best-effort read of /proc/mounts for the negotiated
@@ -5585,6 +5615,17 @@ pub const DEFAULT_REMOUNT_CADENCE_MS: u64 = 5 * 60 * 1_000;
 /// waiting for the share to appear.
 pub const DEFAULT_UNREACHABLE_POLL_MS: u64 = 5_000;
 
+/// How long a share with no recorded failure must have stayed that
+/// way before the short poll takes it.
+///
+/// Three gestures leave a share in that state for a moment before
+/// their own next step: Disconnect writes Unmounted before it marks
+/// the share as the operator's, an edit unmounts before it mounts
+/// again, and Add records the share before it mounts it. The poll
+/// must not step in between. Shorter than the poll cadence, so a
+/// mount found gone on one pass is taken on the next.
+const CLASSLESS_POLL_GRACE_MS: u64 = 2_000;
+
 /// Default cadence for the background discovery task (5 minutes).
 /// Aligns with the operator-widgets contract's
 /// `network.discovered.nas.card.list` refresh policy.
@@ -5679,8 +5720,10 @@ impl NetworkSharesRuntime {
                 plugin = crate::PLUGIN_NAME,
                 waited_ms = self.l3_wait_ms,
                 "no L3 connectivity; skipping boot mount. Shares will \
-                 mount from the remount pass once the link is up"
+                 mount from the short poll once their host answers"
             );
+            self.boot_sweep_done
+                .store(true, std::sync::atomic::Ordering::Release);
             return BootMountReport {
                 outcomes: Vec::new(),
             };
@@ -5729,25 +5772,45 @@ impl NetworkSharesRuntime {
             let result = self.mount_share(&share_id).await;
             outcomes.push(BootMountOutcome { share_id, result });
         }
+        self.boot_sweep_done
+            .store(true, std::sync::atomic::Ordering::Release);
         BootMountReport { outcomes }
     }
 
-    /// Retry only the shares whose last failure was
-    /// [`FailureClass::Unreachable`] — the ones waiting on a host
-    /// that has not answered.
+    /// Retry the shares waiting on a host that has not answered,
+    /// and take the shares nothing has attempted yet.
     ///
     /// Runs on its own short cadence so a NAS coming back is
     /// noticed in seconds rather than at the next remount tick.
-    /// It is affordable precisely because those shares short-
-    /// circuit on one refused connection: no dialect ladder, no
-    /// subprocess, no credential work. Shares in any other class
-    /// are untouched here and keep the remount cadence.
+    /// It is affordable because `mount_share` asks the host first:
+    /// a host that does not answer costs one refused connection —
+    /// no dialect ladder, no subprocess, no credential work — and
+    /// records [`FailureClass::Unreachable`].
+    ///
+    /// Two kinds of share are taken:
+    ///
+    /// - [`FailureClass::Unreachable`]: waiting on its host.
+    /// - No recorded class, not forced off by the operator: seeded
+    ///   at load and never attempted because boot gave up waiting
+    ///   for L3, or found unmounted by the mount table. Taken only
+    ///   once the boot sweep is done, which attempts every share
+    ///   itself, and only after `CLASSLESS_POLL_GRACE_MS` in that
+    ///   state. One attempt classifies the share, and from then on
+    ///   it follows its class.
+    ///
+    /// Every other class keeps the remount cadence. A share whose
+    /// host answered and refused a dialect is not asked again every
+    /// few seconds.
     pub async fn unreachable_poll_pass(&self) -> Vec<BootMountOutcome> {
         // Adopt any host mounts that came back first, exactly as
         // the remount pass does: a share whose OS mount is live
         // must not sit in a retry set.
         self.reconcile_os_mount_states().await;
 
+        let boot_done = self
+            .boot_sweep_done
+            .load(std::sync::atomic::Ordering::Acquire);
+        let now_ms = (self.now_fn)();
         let candidates: Vec<ShareId> = {
             let g = self.share_states.lock().await;
             g.iter()
@@ -5757,8 +5820,15 @@ impl NetworkSharesRuntime {
                         MountState::Failed | MountState::Unmounted
                     )
                 })
-                .filter(|(_, e)| {
-                    e.failure_class == Some(FailureClass::Unreachable)
+                .filter(|(_, e)| match e.failure_class {
+                    Some(FailureClass::Unreachable) => true,
+                    None => {
+                        boot_done
+                            && !e.operator_detached
+                            && now_ms.saturating_sub(e.last_transition_at_ms)
+                                >= CLASSLESS_POLL_GRACE_MS
+                    }
+                    Some(_) => false,
                 })
                 .map(|(id, _)| id.clone())
                 .collect()
@@ -5878,10 +5948,54 @@ impl NetworkSharesRuntime {
             return None;
         }
         let port = probe_port_for_fstype(record.fstype);
-        if (self.host_reachable)(&host, port) {
+        if self.host_answers(&host, port).await {
             return None;
         }
         Some(MountError::HostUnreachable { host, port })
+    }
+
+    /// Ask whether `host` answers on `port`, on a blocking thread.
+    ///
+    /// The production probe resolves the name and connects with a
+    /// timeout, and both calls block. Run on an async worker, every
+    /// question about an absent NAS would hold that worker for the
+    /// whole connect timeout, and the short poll asks every few
+    /// seconds. A probe that cannot be run at all is read as no
+    /// answer: the share then stays on the short poll, which asks
+    /// again, rather than walking a ladder on a guess.
+    async fn host_answers(&self, host: &str, port: u16) -> bool {
+        let probe = Arc::clone(&self.host_reachable);
+        let host = host.to_string();
+        tokio::task::spawn_blocking(move || probe(&host, port))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Has the share's host stopped answering since the attempt
+    /// began?
+    ///
+    /// Asked after a mount attempt fails for any reason other than
+    /// a refused credential or a missing mount point. The gate in
+    /// `mount_share` asks once, before the first attempt; a NAS
+    /// that goes away after that is otherwise reported attempt by
+    /// attempt as a dialect or protocol failure, the ladder walks
+    /// on, and the share lands on the remount cadence with a
+    /// verdict the server never gave. Returns the refusal to report
+    /// when the host no longer answers, so the share goes to the
+    /// short poll as unreachable instead.
+    async fn host_gone(&self, record: &ShareRecord) -> Option<MountError> {
+        let host = record.host.trim();
+        if host.is_empty() {
+            return None;
+        }
+        let port = probe_port_for_fstype(record.fstype);
+        if self.host_answers(host, port).await {
+            return None;
+        }
+        Some(MountError::HostUnreachable {
+            host: host.to_string(),
+            port,
+        })
     }
 }
 
@@ -11717,6 +11831,549 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
                 .and_then(|e| e.get("kind"))
                 .and_then(|v| v.as_str()),
             Some("unmounted")
+        );
+    }
+
+    // ---- An unreachable host is a class wherever it is seen ----
+
+    /// A clock the test moves by hand.
+    fn manual_clock(
+        start_ms: u64,
+    ) -> (
+        Arc<std::sync::atomic::AtomicU64>,
+        Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) {
+        let at = Arc::new(std::sync::atomic::AtomicU64::new(start_ms));
+        let read = Arc::clone(&at);
+        (at, Arc::new(move || read.load(Ordering::SeqCst)))
+    }
+
+    /// A host probe that answers while `up` is set, and counts the
+    /// questions.
+    fn switchable_host(
+        up: &Arc<AtomicBool>,
+        asked: &Arc<AtomicUsize>,
+    ) -> HostReachableProbe {
+        let up = Arc::clone(up);
+        let asked = Arc::clone(asked);
+        Arc::new(move |_: &str, _: u16| {
+            asked.fetch_add(1, Ordering::SeqCst);
+            up.load(Ordering::SeqCst)
+        })
+    }
+
+    /// A host probe that answers the first question only: the NAS
+    /// was there for the gate and went away during the attempt.
+    fn host_gone_after_gate() -> HostReachableProbe {
+        let asked = Arc::new(AtomicUsize::new(0));
+        Arc::new(move |_: &str, _: u16| {
+            asked.fetch_add(1, Ordering::SeqCst) == 0
+        })
+    }
+
+    /// An executor whose every run hits its deadline.
+    struct TimingOutExecutor {
+        runs: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl MountExecutor for TimingOutExecutor {
+        async fn run(
+            &self,
+            _program: &str,
+            _args: &[String],
+            timeout_ms: u64,
+        ) -> Result<CommandOutput, MountError> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            Err(MountError::Timeout {
+                id: ShareId::new_v4(),
+                timeout_ms,
+            })
+        }
+    }
+
+    async fn class_of(
+        rt: &NetworkSharesRuntime,
+        id: &ShareId,
+    ) -> (MountState, Option<FailureClass>) {
+        let g = rt.share_states.lock().await;
+        let e = g.get(id).expect("state entry");
+        (e.state, e.failure_class)
+    }
+
+    #[tokio::test]
+    async fn a_host_that_stops_answering_mid_attempt_ends_the_ladder() {
+        // The gate saw the NAS; the attempt did not. Without a
+        // second question the ladder walks all five dialects and
+        // reports exhaustion, and the share waits five minutes.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![
+            failure_output("mount error(112): Host is down"),
+            failure_output("mount error(112): Host is down"),
+            failure_output("mount error(112): Host is down"),
+            failure_output("mount error(112): Host is down"),
+            failure_output("mount error(112): Host is down"),
+        ]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            .with_host_reachable(host_gone_after_gate())
+            .build();
+        let record = built_record("flapping", "192.0.2.80");
+        let id = rt.add_share(record).await.unwrap();
+
+        let err = rt.mount_share(&id).await.unwrap_err();
+        match err {
+            MountError::HostUnreachable { ref host, port } => {
+                assert_eq!(host, "192.0.2.80");
+                assert_eq!(port, 445);
+            }
+            ref other => panic!("expected HostUnreachable, got {other:?}"),
+        }
+        assert_eq!(
+            executor.cursor.load(Ordering::SeqCst),
+            1,
+            "one attempt, then the host is asked and the ladder stops"
+        );
+        assert_eq!(
+            class_of(&rt, &id).await,
+            (MountState::Failed, Some(FailureClass::Unreachable)),
+            "the share goes to the short poll, not the remount cadence"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_attempt_against_a_gone_host_is_unreachable() {
+        let dir = tempdir();
+        let executor = Arc::new(TimingOutExecutor {
+            runs: AtomicUsize::new(0),
+        });
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            .with_host_reachable(host_gone_after_gate())
+            .build();
+        let id = rt
+            .add_share(built_record("stalled", "192.0.2.81"))
+            .await
+            .unwrap();
+
+        let err = rt.mount_share(&id).await.unwrap_err();
+        assert!(
+            matches!(err, MountError::HostUnreachable { .. }),
+            "a timeout against a host that has gone is an absent host, got {err:?}"
+        );
+        assert_eq!(executor.runs.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            class_of(&rt, &id).await,
+            (MountState::Failed, Some(FailureClass::Unreachable))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_attempt_against_a_live_host_stays_a_timeout() {
+        // The second question only changes the answer when the host
+        // has gone. A server that answers and then stalls a mount
+        // is still a timeout, and keeps the remount cadence.
+        let dir = tempdir();
+        let executor = Arc::new(TimingOutExecutor {
+            runs: AtomicUsize::new(0),
+        });
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            .with_host_reachable(Arc::new(|_: &str, _: u16| true))
+            .build();
+        let id = rt
+            .add_share(built_record("slow", "192.0.2.82"))
+            .await
+            .unwrap();
+
+        let err = rt.mount_share(&id).await.unwrap_err();
+        assert!(matches!(err, MountError::Timeout { .. }), "got {err:?}");
+        assert_eq!(
+            class_of(&rt, &id).await,
+            (MountState::Failed, Some(FailureClass::Transient))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_nfs_attempt_against_a_gone_host_is_unreachable() {
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![failure_output(
+            "mount.nfs: Connection timed out",
+        )]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            .with_host_reachable(host_gone_after_gate())
+            .build();
+        let mut record = built_record("nfs_flapping", "192.0.2.83");
+        record.fstype = FsType::Nfs;
+        let id = rt.add_share(record).await.unwrap();
+
+        let err = rt.mount_share(&id).await.unwrap_err();
+        match err {
+            MountError::HostUnreachable { port, .. } => assert_eq!(port, 2049),
+            ref other => panic!("expected HostUnreachable, got {other:?}"),
+        }
+        assert_eq!(executor.cursor.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            class_of(&rt, &id).await,
+            (MountState::Failed, Some(FailureClass::Unreachable))
+        );
+    }
+
+    /// A runtime whose boot gave up waiting for L3: every share is
+    /// still as load seeded it, with no class.
+    async fn booted_without_l3(
+        dir: &Path,
+        executor: Arc<dyn MountExecutor>,
+        up: &Arc<AtomicBool>,
+        asked: &Arc<AtomicUsize>,
+        now: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> (NetworkSharesRuntime, ShareId) {
+        let rt = NetworkSharesRuntime::builder(dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(now)
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            .with_host_reachable(switchable_host(up, asked))
+            .with_l3_gate(l3_gate_fixed(false))
+            .with_l3_wait_ms(1)
+            .build();
+        let id = rt
+            .add_share(built_record("seeded", "192.0.2.84"))
+            .await
+            .unwrap();
+        let report = rt.boot_mount_all().await;
+        assert!(report.outcomes.is_empty(), "boot gave up on L3");
+        assert_eq!(class_of(&rt, &id).await, (MountState::Unmounted, None));
+        (rt, id)
+    }
+
+    #[tokio::test]
+    async fn a_share_boot_never_reached_is_asked_about_on_the_next_poll() {
+        // Carrier came up after the boot wait; the NAS port is
+        // down. The share must not wait for the five-minute tick
+        // to be asked about.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(Vec::new());
+        let up = Arc::new(AtomicBool::new(false));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let (clock, now) = manual_clock(1_700_000_000_000);
+        let (rt, id) = booted_without_l3(
+            &dir,
+            Arc::clone(&executor) as Arc<dyn MountExecutor>,
+            &up,
+            &asked,
+            now,
+        )
+        .await;
+
+        clock.fetch_add(61_000, Ordering::SeqCst);
+        let outcomes = rt.unreachable_poll_pass().await;
+        assert_eq!(outcomes.len(), 1, "one poll takes the share");
+        assert!(matches!(
+            outcomes[0].result,
+            Err(MountError::HostUnreachable { .. })
+        ));
+        assert_eq!(
+            class_of(&rt, &id).await,
+            (MountState::Failed, Some(FailureClass::Unreachable))
+        );
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "one question");
+        assert_eq!(
+            executor.cursor.load(Ordering::SeqCst),
+            0,
+            "no mount subprocess against an absent host"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_share_boot_never_reached_mounts_on_the_next_poll_once_its_host_answers(
+    ) {
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
+        let up = Arc::new(AtomicBool::new(true));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let (clock, now) = manual_clock(1_700_000_000_000);
+        let (rt, id) = booted_without_l3(
+            &dir,
+            Arc::clone(&executor) as Arc<dyn MountExecutor>,
+            &up,
+            &asked,
+            now,
+        )
+        .await;
+
+        clock.fetch_add(61_000, Ordering::SeqCst);
+        let outcomes = rt.unreachable_poll_pass().await;
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].result.is_ok(), "{:?}", outcomes[0].result);
+        assert_eq!(class_of(&rt, &id).await, (MountState::Mounted, None));
+        assert_eq!(executor.cursor.load(Ordering::SeqCst), 1, "one mount");
+    }
+
+    #[tokio::test]
+    async fn the_poll_leaves_unattempted_shares_to_the_boot_sweep() {
+        // Until boot has attempted every share, a share with no
+        // class is the sweep's to attempt. The poll stepping in
+        // would race it.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(Vec::new());
+        let up = Arc::new(AtomicBool::new(false));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let (clock, now) = manual_clock(1_700_000_000_000);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(now)
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            .with_host_reachable(switchable_host(&up, &asked))
+            .build();
+        let id = rt
+            .add_share(built_record("waiting", "192.0.2.85"))
+            .await
+            .unwrap();
+
+        clock.fetch_add(61_000, Ordering::SeqCst);
+        assert!(rt.unreachable_poll_pass().await.is_empty());
+        assert_eq!(asked.load(Ordering::SeqCst), 0);
+        assert_eq!(class_of(&rt, &id).await, (MountState::Unmounted, None));
+    }
+
+    #[tokio::test]
+    async fn a_mount_found_gone_with_its_host_down_is_unreachable_on_the_next_poll(
+    ) {
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
+        let up = Arc::new(AtomicBool::new(true));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let live = Arc::new(AtomicBool::new(false));
+        let live_for_rt = Arc::clone(&live);
+        let (clock, now) = manual_clock(1_700_000_000_000);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(now)
+            .with_mount_point_check(Arc::new(move |_: &Path| {
+                live_for_rt.load(Ordering::SeqCst)
+            }))
+            .with_host_reachable(switchable_host(&up, &asked))
+            .build();
+        let id = rt
+            .add_share(built_record("dropped", "192.0.2.86"))
+            .await
+            .unwrap();
+        let report = rt.boot_mount_all().await;
+        assert_eq!(report.success_count(), 1);
+        live.store(true, Ordering::SeqCst);
+        assert_eq!(class_of(&rt, &id).await.0, MountState::Mounted);
+
+        // The mount goes and the NAS port with it.
+        live.store(false, Ordering::SeqCst);
+        up.store(false, Ordering::SeqCst);
+        clock.fetch_add(10_000, Ordering::SeqCst);
+
+        // The pass that finds it gone leaves it: Disconnect writes
+        // the same Unmounted before it marks the share as the
+        // operator's, and the poll must not mount it in between.
+        assert!(rt.unreachable_poll_pass().await.is_empty());
+        assert_eq!(class_of(&rt, &id).await, (MountState::Unmounted, None));
+
+        // The next poll asks the host and records the answer.
+        clock.fetch_add(DEFAULT_UNREACHABLE_POLL_MS, Ordering::SeqCst);
+        let outcomes = rt.unreachable_poll_pass().await;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            class_of(&rt, &id).await,
+            (MountState::Failed, Some(FailureClass::Unreachable))
+        );
+        assert_eq!(
+            executor.cursor.load(Ordering::SeqCst),
+            1,
+            "only the boot mount reached a subprocess"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dialect_refusal_from_a_live_host_is_not_re_asked_by_the_poll() {
+        // The host answered and refused every dialect. The full
+        // ladder still runs — asking the host between dialects
+        // changes nothing while it answers — and the share keeps
+        // the remount cadence.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![
+            failure_output("cifs: bad option 'vers=2.0'"),
+            failure_output("cifs: bad option 'vers=2.1'"),
+            failure_output("cifs: bad option 'vers=3.0'"),
+            failure_output("cifs: bad option 'vers=3.02'"),
+            failure_output("cifs: bad option 'vers=3.1.1'"),
+        ]);
+        let up = Arc::new(AtomicBool::new(true));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let (clock, now) = manual_clock(1_700_000_000_000);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(now)
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            .with_host_reachable(switchable_host(&up, &asked))
+            .build();
+        let id = rt
+            .add_share(built_record("old_nas", "192.0.2.87"))
+            .await
+            .unwrap();
+        let report = rt.boot_mount_all().await;
+        assert!(matches!(
+            report.outcomes[0].result,
+            Err(MountError::DialectProbeExhausted { .. })
+        ));
+        assert_eq!(executor.cursor.load(Ordering::SeqCst), 5, "full ladder");
+        assert_eq!(
+            class_of(&rt, &id).await,
+            (MountState::Failed, Some(FailureClass::Transient))
+        );
+
+        clock.fetch_add(61_000, Ordering::SeqCst);
+        assert!(rt.unreachable_poll_pass().await.is_empty());
+        assert_eq!(
+            executor.cursor.load(Ordering::SeqCst),
+            5,
+            "the poll makes no extra attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_auth_refusal_is_not_re_asked_by_the_poll() {
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![failure_output(
+            "mount error(13): Permission denied",
+        )]);
+        let up = Arc::new(AtomicBool::new(true));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let (clock, now) = manual_clock(1_700_000_000_000);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(now)
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            .with_host_reachable(switchable_host(&up, &asked))
+            .build();
+        let id = rt
+            .add_share(built_record("refused", "192.0.2.88"))
+            .await
+            .unwrap();
+        let report = rt.boot_mount_all().await;
+        assert!(matches!(
+            report.outcomes[0].result,
+            Err(MountError::AuthenticationRefused { .. })
+        ));
+        assert_eq!(
+            class_of(&rt, &id).await,
+            (MountState::Failed, Some(FailureClass::Permanent))
+        );
+
+        clock.fetch_add(61_000, Ordering::SeqCst);
+        assert!(rt.unreachable_poll_pass().await.is_empty());
+        assert_eq!(executor.cursor.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_disconnected_share_is_not_taken_by_the_poll() {
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![
+            // the boot mount
+            ok_mount_output(),
+            // the Disconnect
+            ok_mount_output(),
+            // a mount the poll would spend if it tried
+            ok_mount_output(),
+        ]);
+        let up = Arc::new(AtomicBool::new(true));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let (clock, now) = manual_clock(1_700_000_000_000);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(now)
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            .with_host_reachable(switchable_host(&up, &asked))
+            .build();
+        let id = rt
+            .add_share(built_record("off", "192.0.2.89"))
+            .await
+            .unwrap();
+        assert_eq!(rt.boot_mount_all().await.success_count(), 1);
+
+        let payload =
+            serde_json::to_vec(&serde_json::json!({ "share_id": id })).unwrap();
+        rt.dispatch_verb("network.share.unmount", &payload)
+            .await
+            .unwrap();
+        let after_disconnect = executor.cursor.load(Ordering::SeqCst);
+
+        clock.fetch_add(61_000, Ordering::SeqCst);
+        assert!(rt.unreachable_poll_pass().await.is_empty());
+        assert_eq!(executor.cursor.load(Ordering::SeqCst), after_disconnect);
+        assert_eq!(class_of(&rt, &id).await, (MountState::Unmounted, None));
+    }
+
+    #[tokio::test]
+    async fn the_host_probe_runs_off_the_async_workers() {
+        // The production probe blocks on name resolution and a
+        // connect timeout. It must not hold the thread the runtime
+        // drives futures on.
+        let dir = tempdir();
+        let test_thread = std::thread::current().id();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_rt = Arc::clone(&seen);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(ScriptedExecutor::new(Vec::new()))
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            .with_host_reachable(Arc::new(move |_: &str, _: u16| {
+                seen_for_rt
+                    .lock()
+                    .unwrap()
+                    .push(std::thread::current().id());
+                false
+            }))
+            .build();
+        let id = rt
+            .add_share(built_record("probed", "192.0.2.90"))
+            .await
+            .unwrap();
+
+        let _ = rt.mount_share(&id).await;
+        let _ = rt.remount_retry_pass().await;
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "the gate and the remount pass both asked");
+        assert!(
+            seen.iter().all(|t| *t != test_thread),
+            "every probe ran on a blocking thread"
         );
     }
 }
