@@ -1137,6 +1137,7 @@ mod tests {
 
     #[tokio::test]
     async fn admitting_a_reachable_share_starts_the_first_index() {
+        let _watcher = crate::scan_progress::exclusive_watcher().await;
         // Operator invert: Browse NFS Online, index 0 until a
         // hand Rescan. Online + on_online must issue the same
         // update PATH Rescan uses.
@@ -1217,6 +1218,7 @@ mod tests {
     #[tokio::test]
     async fn a_share_admitted_before_settle_starts_exactly_one_index_after_it()
     {
+        let _watcher = crate::scan_progress::exclusive_watcher().await;
         // The NAS kick waits on the library's scan gate like every
         // other: nothing reaches MPD while it may still restart,
         // then exactly one index starts.
@@ -1312,7 +1314,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_share_door_index_settles_the_count_mpd_holds_for_its_path() {
+        // A share's first index goes through the same door, so it
+        // gets the same watcher: MPD's count for the share's path
+        // lands on the row when the job ends.
+        let _watcher = crate::scan_progress::exclusive_watcher().await;
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let music = tempfile::tempdir().unwrap();
+        let mount = music.path().join("NAS").join("NFS");
+        std::fs::create_dir_all(&mount).unwrap();
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let job_done = || ConnBehaviour::PrunesAfterUpdate {
+            internal: Vec::new(),
+            usb: vec![
+                "NAS/NFS/one.flac".to_string(),
+                "NAS/NFS/two.flac".to_string(),
+            ],
+            in_flight_polls: 0,
+        };
+        // The kick, then the watcher's poll and its count.
+        let (endpoint, _mock) = spawn_mock_mpd(vec![
+            ConnBehaviour::StoredPlaylists {
+                commands: Arc::clone(&commands),
+                playlists: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+                library: Vec::new(),
+                queue: Vec::new(),
+            },
+            job_done(),
+            job_done(),
+        ])
+        .await;
+        let registry = SourceRegistry::new();
+        let ann = Arc::new(RecordingAnn::default());
+        let library = crate::library::LibraryContext::new(
+            music.path().to_path_buf(),
+            registry.clone(),
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            None,
+        );
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let queue = crate::queue::QueueContext::new(
+            music.path().to_path_buf(),
+            registry.clone(),
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+            crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
+        );
+        let retract = RetractHandles {
+            library,
+            queue,
+            endpoint,
+            timeouts: short_timeouts(),
+        };
+        let mut env = wire_share_envelope();
+        env["shares"][0]["mount_root"] =
+            serde_json::Value::String(mount.display().to_string());
+
+        apply_envelope(&registry, &retract, &env).await;
+
+        let id = "nas-82befb0b-740a-4e65-bae2-5c29e81a6a58";
+        let mut settled = None;
+        for _ in 0..500 {
+            let rec = registry.get(id).await.expect("admitted");
+            if rec.track_count == 2 {
+                settled = Some(rec);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let rec = settled.expect("the watcher settles the count");
+        assert_eq!(rec.track_count_available, 2);
+        assert!(rec.last_scan_at_ms.is_some());
+        let updates = commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.starts_with("update"))
+            .count();
+        assert_eq!(updates, 1, "one index");
+    }
+
+    #[tokio::test]
     async fn a_later_tick_after_the_mount_lands_goes_online_and_indexes() {
+        let _watcher = crate::scan_progress::exclusive_watcher().await;
         // Operator invert: Add publishes configured before the
         // OS mount exists. First tick is Offline / Wake. The
         // Mounted tick must re-probe, go Online, and start the

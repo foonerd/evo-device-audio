@@ -3,8 +3,11 @@
 //! The one door that starts a source's index.
 //!
 //! An attached store is indexed by `library.update_source`, the
-//! verb an operator Rescan uses. Its [`ScanPolicy`] says when the
-//! library starts that index on its own:
+//! verb an operator Rescan uses, followed by the same scan-progress
+//! watcher that verb starts: it shows the index running and, once
+//! MPD's job ends, writes the store's track count from MPD. Its
+//! [`ScanPolicy`] says when the library starts that index on its
+//! own:
 //!
 //! - `on_online`: when the store comes Online, and once for an
 //!   Online store that has never been scanned;
@@ -229,8 +232,10 @@ impl ScanGate {
 /// one kick at a time, re-reads the record, decides with
 /// [`scan_due`], sends `library.update_source` and stamps
 /// `last_scan_at_ms` at the kick, so a later observation does not
-/// start a second index while this one walks. Fire and warn:
-/// whatever asked has already landed. Returns whether it kicked.
+/// start a second index while this one walks. Then it starts the
+/// scan-progress watcher, as an operator Rescan does, and returns
+/// without waiting for it. Fire and warn: whatever asked has
+/// already landed. Returns whether it kicked.
 pub(crate) async fn start_scan_if_due(
     library: &LibraryContext,
     endpoint: &MpdEndpoint,
@@ -279,8 +284,8 @@ pub(crate) async fn start_scan_if_due(
         );
         return false;
     }
-    // Stamp at the kick. Scan progress overwrites it with the
-    // completion time.
+    // Stamp at the kick, keeping the counts the record has: the
+    // index is only queued.
     let _ = library
         .registry
         .update_track_counts(
@@ -289,6 +294,19 @@ pub(crate) async fn start_scan_if_due(
             record.track_count_available,
         )
         .await;
+    // The watcher an operator Rescan starts. When MPD's job ends it
+    // writes this store's count from what MPD holds under its path
+    // and stamps `last_scan_at_ms` again. The turn is not held for
+    // it. Only one watcher runs at a time: while another is in
+    // flight this one does not start, and the count waits for the
+    // store's next index.
+    drop(crate::scan_progress::spawn(
+        library.clone(),
+        endpoint.clone(),
+        timeouts,
+        source_id.to_string(),
+        crate::scan_progress::ScanKind::Update,
+    ));
     true
 }
 
@@ -673,6 +691,7 @@ mod tests {
 
     #[tokio::test]
     async fn usb_add_source_starts_exactly_one_index_after_settle() {
+        let _watcher = crate::scan_progress::exclusive_watcher().await;
         let music = tempfile::tempdir().unwrap();
         let mount = music.path().join("USB").join("stick");
         std::fs::create_dir_all(&mount).unwrap();
@@ -699,6 +718,7 @@ mod tests {
 
     #[tokio::test]
     async fn nothing_kicks_before_settle() {
+        let _watcher = crate::scan_progress::exclusive_watcher().await;
         let music = tempfile::tempdir().unwrap();
         let stick = music.path().join("USB").join("stick");
         let share = music.path().join("NAS").join("share");
@@ -768,6 +788,7 @@ mod tests {
 
     #[tokio::test]
     async fn restart_pass_kicks_due_rows_exactly_once() {
+        let _watcher = crate::scan_progress::exclusive_watcher().await;
         let music = tempfile::tempdir().unwrap();
         let dir = |leaf: &str| {
             let p = music.path().join("USB").join(leaf);
@@ -840,6 +861,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_gate_settles_after_the_quiet_window_then_runs_the_pass_once() {
+        let _watcher = crate::scan_progress::exclusive_watcher().await;
         let music = tempfile::tempdir().unwrap();
         let stick = music.path().join("USB").join("stick");
         std::fs::create_dir_all(&stick).unwrap();
@@ -977,5 +999,48 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let rec = library.registry.get(&res.source_id).await.unwrap();
         assert_eq!(rec.last_scan_at_ms, None, "no stamp without a kick");
+    }
+
+    #[tokio::test]
+    async fn a_usb_door_index_settles_the_count_mpd_holds_for_its_path() {
+        // The door starts the watcher an operator Rescan starts.
+        // When MPD's job ends the row carries MPD's count for its
+        // path, and last_scan_at_ms is stamped again.
+        let _watcher = crate::scan_progress::exclusive_watcher().await;
+        let music = tempfile::tempdir().unwrap();
+        let stick = music.path().join("USB").join("stick");
+        std::fs::create_dir_all(&stick).unwrap();
+        let held: Vec<String> = ["a.flac", "b.flac", "c.flac"]
+            .iter()
+            .map(|f| format!("USB/stick/{f}"))
+            .collect();
+        let job_done = || ConnBehaviour::PrunesAfterUpdate {
+            internal: Vec::new(),
+            usb: held.clone(),
+            in_flight_polls: 0,
+        };
+        let log: Log = Arc::default();
+        // The kick, then the watcher's poll and its count.
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![recording(&log), job_done(), job_done()]).await;
+        let gate = ScanGate::waiting(endpoint, short_timeouts());
+        gate.open();
+        let library = library_with(music.path(), gate);
+
+        let res = handle_add_source(&library, add_usb(stick)).await.unwrap();
+
+        let mut settled = None;
+        for _ in 0..500 {
+            let rec = library.registry.get(&res.source_id).await.unwrap();
+            if rec.track_count == 3 {
+                settled = Some(rec);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let rec = settled.expect("the watcher settles the count");
+        assert_eq!(rec.track_count_available, 3);
+        assert!(rec.last_scan_at_ms.is_some());
+        assert_eq!(updates(&log), ["update \"USB/stick\""], "one index");
     }
 }
