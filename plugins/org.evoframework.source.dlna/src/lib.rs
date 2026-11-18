@@ -516,6 +516,23 @@ fn shelf_err_to_plugin(e: ShelfDispatchError) -> PluginError {
         } => PluginError::Permanent(format!(
             "verb {request_type:?} not stocked on shelf {shelf:?}"
         )),
+        // The steward refused the handoff by name: pass the name on,
+        // not retryable, so the caller meets the refusal it would
+        // have met asking audio.playback directly.
+        ShelfDispatchError::Refused { subclass, detail } => {
+            PluginError::WithSubclass {
+                class:
+                    evo_plugin_sdk::error_taxonomy::ErrorClass::PermissionDenied,
+                subclass,
+                message: detail,
+            }
+        }
+        // A category this SDK does not name yet: retry only what the
+        // SDK says may be retried.
+        other if other.is_retryable() => {
+            PluginError::Transient(other.to_string())
+        }
+        other => PluginError::Permanent(other.to_string()),
     }
 }
 
@@ -861,6 +878,41 @@ async fn browse_metadata_uri(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_handoff_keeps_its_name_and_is_not_retried() {
+        match shelf_err_to_plugin(ShelfDispatchError::Refused {
+            subclass: "household_policy_locked".into(),
+            detail: "protected".into(),
+        }) {
+            PluginError::WithSubclass {
+                class,
+                subclass,
+                message,
+            } => {
+                assert_eq!(
+                    class,
+                    evo_plugin_sdk::error_taxonomy::ErrorClass::PermissionDenied
+                );
+                assert_eq!(subclass, "household_policy_locked");
+                assert_eq!(message, "protected");
+            }
+            other => panic!("expected WithSubclass, got {other:?}"),
+        }
+        // The categories it always mapped keep their mapping.
+        assert!(matches!(
+            shelf_err_to_plugin(ShelfDispatchError::SubstrateFailure {
+                detail: "gone".into(),
+            }),
+            PluginError::Transient(_)
+        ));
+        assert!(matches!(
+            shelf_err_to_plugin(ShelfDispatchError::Permanent {
+                detail: "bad".into(),
+            }),
+            PluginError::Permanent(_)
+        ));
+    }
 
     #[test]
     fn manifest_parses() {

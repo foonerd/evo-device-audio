@@ -633,6 +633,16 @@ pub(crate) enum VerbError {
     ForgetAlbumEmpty,
     #[error("library.forget_album: album {album:?} resolves to no track")]
     ForgetAlbumUnknown { album: String },
+    /// A verb this one handed work to was refused by the steward, by
+    /// name: `household_policy_locked` when the household protects
+    /// it. Carried out under the same name, so the operator meets
+    /// the refusal they would have met asking directly.
+    #[error("library.{verb}: refused ({subclass}): {reason}")]
+    Refused {
+        verb: String,
+        subclass: String,
+        reason: String,
+    },
 }
 
 fn check_version(v: u32, verb: &str) -> Result<(), VerbError> {
@@ -789,6 +799,11 @@ fn shelf_error_reason(e: &ShelfDispatchError) -> String {
         ShelfDispatchError::SubstrateFailure { detail } => {
             format!("substrate failure: {detail}")
         }
+        ShelfDispatchError::Refused { subclass, detail } => {
+            format!("refused ({subclass}): {detail}")
+        }
+        // A category this SDK does not name yet: its own message.
+        other => other.to_string(),
     }
 }
 
@@ -1682,17 +1697,28 @@ async fn remove_usb_via_safe_remove(
         verb: "remove_source".into(),
         reason: e.to_string(),
     })?;
-    // plugin-system holds no scopes. safe_remove is admitted
-    // without step-up so this handoff is the same gesture the
-    // glass already ran (library.remove_source). A storage_admin
-    // gate here is the 8 ms 400: permission_denied, volume still
-    // mounted, toast `refused: 400 Bad Request`.
+    // The handoff is a nested dispatch. It holds network_admin as
+    // the framework's plugin principal, and at a household level
+    // that protects that group it carries the sitting of the
+    // operator whose library.remove_source this is. Without one,
+    // the steward refuses it by name, and that name goes back to
+    // the glass: household_policy_locked opens the household door,
+    // where a bare 400 told the operator nothing.
     dispatcher
         .dispatch("storage.usb", "storage.usb.safe_remove", bytes, None)
         .await
-        .map_err(|e| VerbError::Mpd {
-            verb: "remove_source".into(),
-            reason: format!("storage.usb.safe_remove refused: {e}"),
+        .map_err(|e| match e {
+            ShelfDispatchError::Refused { subclass, detail } => {
+                VerbError::Refused {
+                    verb: "remove_source".into(),
+                    subclass,
+                    reason: detail,
+                }
+            }
+            other => VerbError::Mpd {
+                verb: "remove_source".into(),
+                reason: format!("storage.usb.safe_remove refused: {other}"),
+            },
         })?;
     Ok(())
 }
@@ -5799,6 +5825,13 @@ mod tests {
             budget_ms: 15_000
         })
         .contains("15000ms"));
+        assert_eq!(
+            shelf_error_reason(&ShelfDispatchError::Refused {
+                subclass: "household_policy_locked".into(),
+                detail: "protected".into(),
+            }),
+            "refused (household_policy_locked): protected"
+        );
         assert!(shelf_error_reason(&ShelfDispatchError::SubstrateFailure {
             detail: "router down".into()
         })
@@ -5931,6 +5964,84 @@ mod tests {
         assert_eq!(entries[1]["kind"], "file");
         assert_eq!(entries[1]["uri"], "dlna:uuid:server-1/12$1");
         assert!(!entries[1].as_object().unwrap().contains_key("stable_uri"));
+    }
+
+    /// The household refusal on the safe_remove handoff leaves
+    /// remove_source under its own name, not as an MPD error.
+    #[tokio::test]
+    async fn a_household_refusal_of_safe_remove_keeps_its_name() {
+        let captured = Arc::new(Mutex::new(None));
+        let disp: Arc<dyn ShelfRequestDispatcher> = Arc::new(FakeDispatcher {
+            response: Vec::new(),
+            error: Some(ShelfDispatchError::Refused {
+                subclass: "household_policy_locked".into(),
+                detail: "verb \"storage.usb.safe_remove\" touches a settings \
+                         group the household policy protects"
+                    .into(),
+            }),
+            captured: Arc::clone(&captured),
+        });
+        let ctx = LibraryContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            SourceRegistry::new(),
+            Arc::new(NullAnn),
+            Some(disp),
+        );
+        let err = remove_usb_via_safe_remove(
+            &ctx,
+            "usb-audio",
+            &usb_record("usb-audio", "MUSIC"),
+        )
+        .await
+        .expect_err("the refusal must surface");
+        match err {
+            VerbError::Refused {
+                verb,
+                subclass,
+                reason,
+            } => {
+                assert_eq!(verb, "remove_source");
+                assert_eq!(subclass, "household_policy_locked");
+                assert!(reason.contains("household policy"), "{reason}");
+            }
+            other => panic!("expected VerbError::Refused, got {other:?}"),
+        }
+        let (shelf, verb, _) =
+            captured.lock().await.clone().expect("the handoff was made");
+        assert_eq!(
+            (shelf.as_str(), verb.as_str()),
+            ("storage.usb", "storage.usb.safe_remove")
+        );
+    }
+
+    /// Any other handoff failure stays the MPD-side error it was.
+    #[tokio::test]
+    async fn an_unnamed_safe_remove_failure_stays_an_mpd_error() {
+        let disp: Arc<dyn ShelfRequestDispatcher> = Arc::new(FakeDispatcher {
+            response: Vec::new(),
+            error: Some(ShelfDispatchError::SubstrateFailure {
+                detail: "wire transport closed".into(),
+            }),
+            captured: Arc::new(Mutex::new(None)),
+        });
+        let ctx = LibraryContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            SourceRegistry::new(),
+            Arc::new(NullAnn),
+            Some(disp),
+        );
+        let err = remove_usb_via_safe_remove(
+            &ctx,
+            "usb-audio",
+            &usb_record("usb-audio", "MUSIC"),
+        )
+        .await
+        .expect_err("the failure must surface");
+        assert!(
+            matches!(&err, VerbError::Mpd { reason, .. }
+                if reason.contains("wire transport closed")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

@@ -1387,6 +1387,11 @@ pub(crate) fn shelf_error_reason(
         E::SubstrateFailure { detail } => {
             format!("substrate failure: {detail}")
         }
+        E::Refused { subclass, detail } => {
+            format!("refused ({subclass}): {detail}")
+        }
+        // A category this SDK does not name yet: its own message.
+        other => other.to_string(),
     }
 }
 

@@ -1663,6 +1663,16 @@ fn library_verb_to_plugin_error(e: library::VerbError) -> PluginError {
         VerbError::Mpd { .. } | VerbError::WorkAggregateNotReady => {
             PluginError::Transient(e.to_string())
         }
+        // A refusal by name stays one: not retryable, and the glass
+        // routes on the subclass (household_policy_locked opens the
+        // household door).
+        VerbError::Refused {
+            subclass, reason, ..
+        } => PluginError::WithSubclass {
+            class: evo_plugin_sdk::error_taxonomy::ErrorClass::PermissionDenied,
+            subclass,
+            message: reason,
+        },
     }
 }
 
@@ -1903,5 +1913,31 @@ mod tests {
         assert_eq!(kept.uris, vec!["INTERNAL/a/1.flac", "INTERNAL/b/2.flac"]);
         assert_eq!(kept.current, Some(1));
         assert_eq!(kept.reason, crate::last_queue::SnapshotReason::Shutdown);
+    }
+
+    /// A nested refusal by name reaches the glass by name, as a
+    /// permission refusal, not as a retryable MPD error.
+    #[test]
+    fn a_library_refusal_keeps_its_subclass() {
+        let e = library::VerbError::Refused {
+            verb: "remove_source".into(),
+            subclass: "household_policy_locked".into(),
+            reason: "the household policy protects this group".into(),
+        };
+        match library_verb_to_plugin_error(e) {
+            PluginError::WithSubclass {
+                class,
+                subclass,
+                message,
+            } => {
+                assert_eq!(
+                    class,
+                    evo_plugin_sdk::error_taxonomy::ErrorClass::PermissionDenied
+                );
+                assert_eq!(subclass, "household_policy_locked");
+                assert_eq!(message, "the household policy protects this group");
+            }
+            other => panic!("expected WithSubclass, got {other:?}"),
+        }
     }
 }
