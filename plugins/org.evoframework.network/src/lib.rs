@@ -6318,6 +6318,28 @@ impl NmInner {
         Ok(())
     }
 
+    /// Set the saved country again at load.
+    ///
+    /// `iw reg set` lasts only until the next boot. The operator's
+    /// country was applied when it was saved, and nothing set it
+    /// again: a restart came back on whatever regulatory domain the
+    /// operating system boots with, while the saved intent, and the
+    /// glass reading it, still named the operator's choice.
+    ///
+    /// Runs before the saved access point is raised, so the access
+    /// point comes up under the country it is meant to obey. An
+    /// intent with no country leaves the operating system's domain
+    /// as it is; a code `iw` refuses is a recorded step, and the
+    /// load continues.
+    async fn set_saved_country_at_load(
+        &self,
+        intent: &NetworkIntent,
+    ) -> Vec<String> {
+        let mut steps: Vec<String> = Vec::new();
+        self.apply_regdomain(&intent.radio_policy, &mut steps).await;
+        steps
+    }
+
     /// Bring the saved hotspot back up at load.
     ///
     /// NetworkManager used to do this. The saved profile carries
@@ -8651,6 +8673,15 @@ impl Plugin for NetworkPlugin {
                 .store(intent.radio_policy.flight_mode, Relaxed);
             self.wifi_preference_enabled
                 .store(intent.radio_policy.wifi_enabled_pref, Relaxed);
+            // The saved country does not outlive a boot on its own.
+            // Set it again before the access point comes up.
+            for step in self.inner.set_saved_country_at_load(&intent).await {
+                if step.starts_with("warning:") {
+                    tracing::warn!(plugin = PLUGIN_NAME, step = %step, "load: country");
+                } else {
+                    tracing::info!(plugin = PLUGIN_NAME, step = %step, "load: country");
+                }
+            }
             // The saved access point comes back by itself or it
             // does not come back at all — nothing else on the box
             // raises it now that its vif is unmanaged. Runs before
@@ -15586,6 +15617,109 @@ exit 0\n",
              that the access point's vif is unmanaged and \
              NetworkManager no longer autoconnects it"
         );
+    }
+
+    /// The saved country has to be set again by `load`, after the
+    /// intent is read and before the access point is raised or the
+    /// supervisor starts.
+    ///
+    /// `iw reg set` does not outlive a boot, and nothing else sets
+    /// the country again: a restart came back on the operating
+    /// system's domain while the intent still named the operator's.
+    /// `load` cannot be driven from here, so the wiring and its
+    /// order are pinned where they live, as for the hotspot raise.
+    #[test]
+    fn load_sets_the_saved_country_before_the_hotspot_and_the_supervisor() {
+        let src = include_str!("lib.rs");
+        let load_at = src
+            .find("    fn load<'a>(")
+            .expect("the plugin must have a load");
+        let body_end = src[load_at + 1..]
+            .find("\n    fn ")
+            .map(|i| load_at + 1 + i)
+            .unwrap_or(src.len());
+        let body = &src[load_at..body_end];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("load must call {needle}"))
+        };
+        let intent = at("self.load_intent().await?");
+        let country = at("set_saved_country_at_load(&intent)");
+        let hotspot = at("raise_saved_hotspot_at_load(&intent)");
+        let supervisor = at("self.spawn_supervisor().await");
+        assert!(
+            intent < country,
+            "the country is the saved one, so it is set after the intent is read"
+        );
+        assert!(
+            country < hotspot,
+            "the access point must come up under the saved country"
+        );
+        assert!(
+            hotspot < supervisor,
+            "nothing may watch the device before its country and access point are set"
+        );
+    }
+
+    /// A restart sets the saved country, once, even where the
+    /// operating system boots on another one.
+    #[tokio::test]
+    async fn a_restart_sets_the_saved_country_once() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (nmcli, iw) = load_raise_mocks(dir.path(), "ap0");
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+
+        // The operating system boots on another country; the
+        // operator saved US.
+        let intent = NetworkIntent {
+            radio_policy: RadioPolicy {
+                country: "us".to_string(),
+                ..RadioPolicy::default()
+            },
+            ..NetworkIntent::default()
+        };
+
+        let steps = p.set_saved_country_at_load(&intent).await;
+        let calls = std::fs::read_to_string(dir.path().join("calls.log"))
+            .unwrap_or_default();
+        let sets: Vec<&str> = calls
+            .lines()
+            .filter(|l| l.starts_with("iw reg set"))
+            .collect();
+
+        assert_eq!(
+            sets,
+            vec!["iw reg set US"],
+            "the saved country is set exactly once, upper-cased: {calls}"
+        );
+        assert!(
+            !calls.lines().any(|l| l.starts_with("nmcli")),
+            "setting the country touches no connection: {calls}"
+        );
+        assert_eq!(steps, vec!["regulatory domain set to US".to_string()]);
+    }
+
+    /// An intent with no country leaves the operating system's
+    /// domain as it is: nothing is set at load.
+    #[tokio::test]
+    async fn a_restart_with_no_saved_country_leaves_the_domain_alone() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (nmcli, iw) = load_raise_mocks(dir.path(), "ap0");
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+
+        let steps =
+            p.set_saved_country_at_load(&NetworkIntent::default()).await;
+        let calls = std::fs::read_to_string(dir.path().join("calls.log"))
+            .unwrap_or_default();
+
+        assert!(calls.is_empty(), "no country, no call: {calls}");
+        assert!(steps.is_empty(), "no country, no step: {steps:?}");
     }
 
     /// A rig for the raise at load: an `nmcli` that knows one
