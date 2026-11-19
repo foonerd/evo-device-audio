@@ -305,7 +305,7 @@ pub(crate) async fn spawn(
     custody_handle: CustodyHandle,
     reporter: Arc<dyn CustodyStateReporter>,
     subject_emitter: SubjectEmitter,
-    audio_protocol_settings_rx: watch::Receiver<AudioProtocolSettings>,
+    audio_protocol_settings_rx: watch::Receiver<Option<AudioProtocolSettings>>,
     io: SupervisorSpawn,
 ) -> Result<SupervisorHandle, PlaybackError> {
     tracing::info!(
@@ -325,15 +325,17 @@ pub(crate) async fn spawn(
             .map_err(classify_connect_error)?;
 
     // Apply the operator's MPD-protocol settings to the freshly
-    // opened command connection before the initial report. The
-    // settings are persisted across MPD restarts within a single
-    // server session but reset to defaults when MPD itself
-    // restarts; applying on every supervisor spawn restores them
-    // deterministically. Best-effort: if MPD refuses the verb
-    // (e.g. older server without `crossfade` support — unlikely
-    // on a modern build), the apply is logged and skipped, the
+    // opened command connection before the initial report, as
+    // the custody starts. With no settings delivered yet this is
+    // the audiophile-grade defaults. Every MPD session and every
+    // later change is the protocol-settings applier's: it runs
+    // whether or not a custody is live, and it sends again when
+    // MPD has dropped the connection. Best-effort here: if MPD
+    // refuses the verb, the apply is logged and skipped, the
     // session still proceeds.
-    let initial_protocol_settings = *audio_protocol_settings_rx.borrow();
+    let initial_protocol_settings = audio_protocol_settings_rx
+        .borrow()
+        .unwrap_or(AudioProtocolSettings::audiophile_default());
     apply_audio_protocol_settings(&mut cmd_conn, initial_protocol_settings)
         .await;
 
@@ -399,12 +401,8 @@ pub(crate) async fn spawn(
         shuffle_mode: io.shuffle,
         pre_mute_volume: initial_pre_mute_volume,
     };
-    let task_handle = tokio::spawn(task_state.run(
-        command_rx,
-        shutdown_rx,
-        idle_rx,
-        audio_protocol_settings_rx,
-    ));
+    let task_handle =
+        tokio::spawn(task_state.run(command_rx, shutdown_rx, idle_rx));
 
     Ok(SupervisorHandle {
         command_tx,
@@ -711,19 +709,16 @@ struct SupervisorTask {
 
 impl SupervisorTask {
     /// The supervisor task body. Consumes `self` (the run is the
-    /// whole life of the task) and the four channel receivers,
+    /// whole life of the task) and the three channel receivers,
     /// and loops until shutdown or one of the channels closes.
-    /// The watch receiver carries operator-toggled MPD-protocol
-    /// settings (crossfade + single mode); on change, the task
-    /// applies them to the command connection through the same
-    /// canonical dispatch path that handles steward-issued
-    /// commands.
+    /// A change to the operator's MPD-protocol settings while the
+    /// custody is live is applied by the protocol-settings
+    /// applier, not here.
     async fn run(
         mut self,
         mut command_rx: mpsc::Receiver<SupervisorMessage>,
         mut shutdown_rx: oneshot::Receiver<()>,
         mut idle_rx: mpsc::Receiver<IdleEvent>,
-        mut audio_protocol_settings_rx: watch::Receiver<AudioProtocolSettings>,
     ) {
         tracing::info!(
             plugin = PLUGIN_NAME,
@@ -873,39 +868,6 @@ impl SupervisorTask {
                                 }
                                 .read(),
                             ).await;
-                        }
-                    }
-                }
-                changed = audio_protocol_settings_rx.changed() => {
-                    match changed {
-                        Ok(()) => {
-                            let settings = *audio_protocol_settings_rx.borrow();
-                            tracing::debug!(
-                                plugin = PLUGIN_NAME,
-                                handle = %self.custody_handle.id,
-                                crossfade_seconds = settings.crossfade_seconds,
-                                gapless = settings.gapless,
-                                "operator changed mpd-protocol settings; \
-                                 applying to live session"
-                            );
-                            apply_audio_protocol_settings(
-                                &mut self.cmd_conn,
-                                settings,
-                            ).await;
-                        }
-                        Err(_) => {
-                            tracing::debug!(
-                                plugin = PLUGIN_NAME,
-                                handle = %self.custody_handle.id,
-                                "audio_protocol_settings watch sender dropped; \
-                                 stopping settings-following arm"
-                            );
-                            // The watch sender on the plugin side has
-                            // dropped, which only happens when the
-                            // plugin itself is being torn down. The
-                            // supervisor will receive shutdown via the
-                            // dedicated channel shortly; stay in the
-                            // select loop on the other arms.
                         }
                     }
                 }
@@ -1608,9 +1570,10 @@ mod tests {
     /// Returns a receiver bound to a sender that lives in a leaked
     /// channel — fine for tests, the sender ownership doesn't
     /// matter because the receiver only reads the default value.
-    fn null_protocol_settings_rx() -> watch::Receiver<AudioProtocolSettings> {
+    fn null_protocol_settings_rx(
+    ) -> watch::Receiver<Option<AudioProtocolSettings>> {
         let (tx, rx) =
-            watch::channel(AudioProtocolSettings::audiophile_default());
+            watch::channel(Some(AudioProtocolSettings::audiophile_default()));
         // Leak the sender so the receiver stays usable. Tests
         // don't poll for sender-drop here.
         Box::leak(Box::new(tx));
@@ -1774,11 +1737,11 @@ mod tests {
     /// A protocol-settings receiver carrying one chosen mode.
     fn protocol_settings_rx_with(
         replay_gain_mode: &'static str,
-    ) -> watch::Receiver<AudioProtocolSettings> {
-        let (tx, rx) = watch::channel(AudioProtocolSettings {
+    ) -> watch::Receiver<Option<AudioProtocolSettings>> {
+        let (tx, rx) = watch::channel(Some(AudioProtocolSettings {
             replay_gain_mode,
             ..AudioProtocolSettings::audiophile_default()
-        });
+        }));
         Box::leak(Box::new(tx));
         rx
     }

@@ -130,6 +130,7 @@ mod playlist;
 mod playlist_duplicate;
 mod playlist_export;
 mod playlist_import;
+mod protocol_settings_applier;
 mod queue;
 mod scan_door;
 mod scan_progress;
@@ -542,21 +543,18 @@ pub struct MpdPlaybackPlugin {
     /// re-rendering the mpd_fragment on either change.
     mixer_config_tx: watch::Sender<MixerConfig>,
     /// Watch channel carrying the operator's currently-selected
-    /// MPD-protocol settings (`crossfade_seconds` + `gapless`).
-    /// Seeded with the audiophile-grade defaults at construction
-    /// (no crossfade, gapless on); updated by the
-    /// `playback.options` settings subscriber on every relevant
-    /// subject change. Each spawned supervisor subscribes via
-    /// [`watch::Sender::subscribe`] and the task body's
-    /// `tokio::select!` arm dispatches `SetCrossfade` +
-    /// `SetSingle` whenever the value changes, so MPD's
-    /// protocol-level crossfade + single-mode follow the
-    /// operator's settings without a separate apply gesture.
-    /// Each new supervisor session also reads the channel's
-    /// current value on connect to apply the operator's choice
-    /// from the start (single canonical apply path, no
-    /// session-init / settings-update fork).
-    audio_protocol_settings_tx: watch::Sender<AudioProtocolSettings>,
+    /// The operator's MPD-protocol settings (ReplayGain mode,
+    /// crossfade, gapless). `None` until the `playback.options`
+    /// settings subscriber has delivered them; every delivery
+    /// after that replaces the value, whether or not anything is
+    /// subscribed at the time.
+    ///
+    /// The protocol-settings applier subscribes at load and
+    /// applies the value to every MPD session and on every
+    /// change. Each spawned supervisor subscribes too and applies
+    /// the current value once, as its custody starts; with no
+    /// value yet it applies the audiophile-grade defaults.
+    audio_protocol_settings_tx: watch::Sender<Option<AudioProtocolSettings>>,
     /// Watch channel carrying the operator's declared
     /// startup-volume settings (startup + max). Seeded with
     /// `None` at construction; the options-settings subscriber
@@ -575,6 +573,12 @@ pub struct MpdPlaybackPlugin {
     /// stop it cleanly if it is still waiting.
     startup_volume_applier:
         Option<playback_supervisor::StartupVolumeApplierHandle>,
+    /// Protocol-settings applier task handle. Spawned at
+    /// `Plugin::load`; keeps the operator's ReplayGain mode,
+    /// crossfade and single mode on every MPD session for the
+    /// load's lifetime. Stopped in `Plugin::unload`.
+    protocol_settings_applier:
+        Option<protocol_settings_applier::ProtocolSettingsApplierHandle>,
     /// Concrete handle on the auto-restarter composite so a
     /// future capabilities-watch reactor can call `re_resolve`
     /// on it without going through the `Arc<dyn MpdRestarter>`
@@ -612,10 +616,11 @@ pub struct MpdPlaybackPlugin {
 /// Operator-selected MPD-protocol settings carried on the
 /// plugin's `audio_protocol_settings_tx` watch channel. The
 /// subject subscriber extracts these from the
-/// `audio.options.settings` subject; each spawned supervisor
-/// subscribes to the channel and applies the values via MPD's
-/// protocol-layer verbs (`crossfade <n>` + `single <0|1>`) on
-/// session-init and on every change while a session is live.
+/// `audio.options.settings` subject. The protocol-settings
+/// applier sends them to MPD (`crossfade`, `single`,
+/// `replay_gain_mode`) at every MPD session and on every change;
+/// each spawned supervisor also sends them once, as its custody
+/// starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AudioProtocolSettings {
     /// Between-track crossfade duration in seconds (0..=30,
@@ -727,8 +732,7 @@ impl MpdPlaybackPlugin {
         timeouts: ConnectTimeouts,
     ) -> Self {
         let (mixer_config_tx, _) = watch::channel(MixerConfig::Software);
-        let (audio_protocol_settings_tx, _) =
-            watch::channel(AudioProtocolSettings::audiophile_default());
+        let (audio_protocol_settings_tx, _) = watch::channel(None);
         let (startup_volume_tx, _) = watch::channel(None);
         Self {
             loaded: false,
@@ -758,6 +762,7 @@ impl MpdPlaybackPlugin {
             audio_protocol_settings_tx,
             startup_volume_tx,
             startup_volume_applier: None,
+            protocol_settings_applier: None,
             auto_restarter: None,
             capabilities_watcher: None,
             shelves: None,
@@ -1129,8 +1134,7 @@ impl MpdPlaybackPlugin {
                 {
                     publish_mixer_config_if_changed(&mixer_tx, cfg);
                 }
-                let protocol = parse_audio_protocol_settings_from_state(&state);
-                let _ = protocol_tx.send(protocol);
+                publish_audio_protocol_settings(&protocol_tx, &state);
                 if let Some(sv) =
                     parse_startup_volume_from_settings_state(&state)
                 {
@@ -1147,15 +1151,10 @@ impl MpdPlaybackPlugin {
                             {
                                 publish_mixer_config_if_changed(&mixer_tx, cfg);
                             }
-                            let protocol =
-                                parse_audio_protocol_settings_from_state(state);
-                            // send() returns Err only when every
-                            // subscriber has dropped — no live
-                            // supervisor yet. Updating the channel
-                            // value is fine; the next supervisor
-                            // session reads the latest value on
-                            // subscribe.
-                            let _ = protocol_tx.send_replace(protocol);
+                            publish_audio_protocol_settings(
+                                &protocol_tx,
+                                state,
+                            );
                             // Publish updated startup volume too.
                             // The applier consumes only the FIRST
                             // Some(...); subsequent updates flow
@@ -1410,6 +1409,22 @@ fn parse_startup_volume_from_settings_state(
         startup_percent,
         max_percent,
     })
+}
+
+/// Store the operator's MPD-protocol settings carried by an
+/// `audio.options.settings` subject state, for the
+/// protocol-settings applier and for every supervisor that
+/// starts after this.
+///
+/// The value is kept whether or not anything is subscribed. At
+/// load nothing usually is: no custody is live when the settings
+/// first arrive, and a value sent to a channel with no receiver
+/// is dropped.
+fn publish_audio_protocol_settings(
+    tx: &watch::Sender<Option<AudioProtocolSettings>>,
+    state: &serde_json::Value,
+) {
+    tx.send_replace(Some(parse_audio_protocol_settings_from_state(state)));
 }
 
 /// Extract the operator's MPD-protocol settings (crossfade +
@@ -2555,6 +2570,20 @@ impl Plugin for MpdPlaybackPlugin {
                  MPD acceptance"
             );
 
+            // Spawn the protocol-settings applier. MPD forgets its
+            // ReplayGain mode on every restart, and restarts do not
+            // wait for a custody; the applier gives every MPD
+            // session the operator's ReplayGain mode, crossfade
+            // and single mode, and sends every change, from the
+            // moment the options-settings subscriber above
+            // delivers them.
+            self.protocol_settings_applier =
+                Some(protocol_settings_applier::spawn(
+                    self.endpoint.clone(),
+                    self.timeouts,
+                    self.audio_protocol_settings_tx.subscribe(),
+                ));
+
             // Spawn the /etc/asound.d/ composition-change
             // watcher. On every detected change the watcher
             // dispatches a CycleOutput to the active custody's
@@ -2752,6 +2781,9 @@ impl Plugin for MpdPlaybackPlugin {
                 // `setvol`); the take + stop is a no-op when
                 // the join handle is completed.
                 if let Some(handle) = self.startup_volume_applier.take() {
+                    handle.stop().await;
+                }
+                if let Some(handle) = self.protocol_settings_applier.take() {
                     handle.stop().await;
                 }
                 // Stop the asound watcher last. The
@@ -6786,6 +6818,33 @@ mod tests {
         );
     }
 
+    /// The operator's settings are kept when they arrive with no
+    /// custody live, as they do at load: nothing is subscribed to
+    /// the channel then, and a value sent to a channel with no
+    /// receiver is dropped.
+    #[test]
+    fn settings_that_arrive_with_no_custody_are_kept() {
+        let (tx, _) = watch::channel(None);
+        publish_audio_protocol_settings(
+            &tx,
+            &json!({
+                "volume_normalization": "album",
+                "crossfade_seconds": 4,
+                "gapless": false,
+            }),
+        );
+        let kept = *tx.subscribe().borrow();
+        assert_eq!(
+            kept,
+            Some(AudioProtocolSettings {
+                crossfade_seconds: 4,
+                gapless: false,
+                replay_gain_mode: REPLAY_GAIN_ALBUM,
+            }),
+            "the stored settings must be there for whoever starts next"
+        );
+    }
+
     // ---- supervisor session-init apply path ----
 
     #[tokio::test]
@@ -6809,11 +6868,11 @@ mod tests {
         // Seed the watch channel with non-default values BEFORE
         // spawning the supervisor; this is the operator's
         // persisted state at the moment a new custody starts.
-        let (tx, rx) = watch::channel(AudioProtocolSettings {
+        let (tx, rx) = watch::channel(Some(AudioProtocolSettings {
             crossfade_seconds: 7,
             gapless: false,
             replay_gain_mode: REPLAY_GAIN_OFF,
-        });
+        }));
 
         let handle = playback_supervisor::spawn(
             endpoint,
