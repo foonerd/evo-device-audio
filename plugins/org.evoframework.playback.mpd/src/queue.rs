@@ -909,14 +909,25 @@ async fn handle_enqueue_selection_criteria(
             if criteria.dimension
                 == crate::selection::SelectionDimension::Folder =>
         {
-            Some(
-                materialise_to_uris(conn, &resolved, criteria.dimension)
-                    .await
-                    .map_err(|e| VerbError::Mpd {
+            match materialise_to_uris(conn, &resolved, criteria.dimension).await
+            {
+                Ok(files) => Some(files),
+                // MPD's ACK_ERROR_NO_EXIST: it holds no such
+                // directory (a share removed, or a mount point it
+                // has pruned since the glass listed it). That is a
+                // folder with nothing to play, not a failure, and
+                // `add DIR` would have ACKed after Replace's
+                // `clear`.
+                Err(crate::mpd::MpdError::Ack { code: 50, .. }) => {
+                    Some(Vec::new())
+                }
+                Err(e) => {
+                    return Err(VerbError::Mpd {
                         verb: "enqueue_selection".to_string(),
                         reason: e.to_string(),
-                    })?,
-            )
+                    });
+                }
+            }
         }
         _ => None,
     };
@@ -4292,25 +4303,29 @@ mod tests {
         // (which fails on an empty queue) — the operator's
         // queue gone for a folder with nothing in it. The
         // folder is asked what it holds before any mutation.
-        for mode in [
-            EnqueueSelectionMode::Replace,
-            EnqueueSelectionMode::Append,
-            EnqueueSelectionMode::Next,
+        // `NAS` is a mount point MPD lists with nothing under it;
+        // `no-such-share` is one MPD has pruned since it was
+        // listed, which it answers with ACK 50.
+        for (folder, mode) in [
+            ("NAS", EnqueueSelectionMode::Replace),
+            ("NAS", EnqueueSelectionMode::Append),
+            ("NAS", EnqueueSelectionMode::Next),
+            ("no-such-share", EnqueueSelectionMode::Replace),
+            ("no-such-share", EnqueueSelectionMode::Append),
+            ("no-such-share", EnqueueSelectionMode::Next),
         ] {
-            let label = mode.as_str().to_string();
-            // The scripted MPD answers `listallinfo` with no
-            // files: a mount point with nothing under it.
+            let label = format!("{folder}/{}", mode.as_str());
             let (ctx, mut conn, ann, commands) = zero_match_harness().await;
 
             let body = handle_enqueue_selection_criteria(
                 &ctx,
                 &mut conn,
                 &FixedResolver(crate::selection::ResolvedSelection::UriList(
-                    vec!["NAS".to_string()],
+                    vec![folder.to_string()],
                 )),
                 crate::selection::SelectionCriteria {
                     dimension: crate::selection::SelectionDimension::Folder,
-                    value: "NAS".to_string(),
+                    value: folder.to_string(),
                     parent: None,
                 },
                 mode,

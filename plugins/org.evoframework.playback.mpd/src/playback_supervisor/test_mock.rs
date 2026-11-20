@@ -871,7 +871,10 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                         .rsplit('/')
                         .next()
                         .is_some_and(|leaf| leaf.contains('.'));
-                    let out = if is_file {
+                    let out = if path.contains("no-such") {
+                        "ACK [50@0] {listallinfo} No such directory\n"
+                            .to_string()
+                    } else if is_file {
                         format!("file: {path}\nOK\n")
                     } else {
                         "OK\n".to_string()
