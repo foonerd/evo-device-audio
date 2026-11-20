@@ -141,6 +141,9 @@ pub(crate) struct QueueContext {
             dyn evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher,
         >,
     >,
+    /// Scan-time local artwork hashes carried on list rows as
+    /// `artwork_hash`. See [`crate::artwork_hash`].
+    pub(crate) artwork_hashes: crate::artwork_hash::ArtworkHashIndex,
 }
 
 impl QueueContext {
@@ -169,7 +172,18 @@ impl QueueContext {
             last_queue: LastQueueStore::default(),
             mirror: Arc::new(Mutex::new(None)),
             shelf_dispatcher,
+            artwork_hashes: Default::default(),
         }
+    }
+
+    /// Share the scan-time artwork hash index. Without this the
+    /// context carries an empty one and no row has `artwork_hash`.
+    pub(crate) fn with_artwork_hashes(
+        mut self,
+        index: crate::artwork_hash::ArtworkHashIndex,
+    ) -> Self {
+        self.artwork_hashes = index;
+        self
     }
 
     /// Keep the last queue here. Without this the context keeps
@@ -300,7 +314,7 @@ pub(crate) async fn build_envelope(
             &ctx.registry,
         )
         .await;
-        rendered.push(json!({
+        let mut row = json!({
             "id":              item.id,
             "position":        item.position,
             "uri":             item.file_path,
@@ -331,7 +345,12 @@ pub(crate) async fn build_envelope(
             "recording_date":  item.classical.recording_date,
             "label":           item.classical.label,
             "medium":          item.classical.medium,
-        }));
+        });
+        crate::artwork_hash::attach(
+            &mut row,
+            ctx.artwork_hashes.hash_for_path(&item.file_path),
+        );
+        rendered.push(row);
     }
 
     let mut envelope = json!({
@@ -4208,6 +4227,38 @@ mod tests {
             crate::album_shuffle::ShuffleModeCell::new(),
         );
         (ctx, conn, ann)
+    }
+
+    /// A queue row carries `artwork_hash` when the scan-time index
+    /// has its album, and no key when it does not.
+    #[tokio::test]
+    async fn a_queue_row_carries_the_scan_time_artwork_hash() {
+        let (ctx, mut conn, _ann, _commands) = zero_match_harness().await;
+        let hashed =
+            evo_device_audio_shared::folder_album::canonical_album_folder(
+                "INTERNAL/keep-one.flac",
+            );
+        let index = crate::artwork_hash::ArtworkHashIndex::default();
+        index.seed(&hashed, Some("abc123"));
+        let ctx = ctx.with_artwork_hashes(index);
+        let env = build_envelope(&ctx, &mut conn).await.unwrap();
+        let items = env["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        for row in items {
+            assert_eq!(row["artwork_hash"], "abc123", "{row}");
+            assert!(row["artwork_url"].is_string(), "the URL stays: {row}");
+        }
+    }
+
+    /// Nothing indexed: no key, URL unchanged.
+    #[tokio::test]
+    async fn a_queue_row_without_a_hash_has_no_key() {
+        let (ctx, mut conn, _ann, _commands) = zero_match_harness().await;
+        let env = build_envelope(&ctx, &mut conn).await.unwrap();
+        for row in env["items"].as_array().unwrap() {
+            assert!(row.get("artwork_hash").is_none(), "{row}");
+            assert!(row["artwork_url"].is_string());
+        }
     }
 
     /// Nothing that could mutate the queue may have been sent.

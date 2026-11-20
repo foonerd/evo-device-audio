@@ -196,6 +196,12 @@ impl ShelfBundle {
         let skip_traversal =
             SkipTraversal::new(registry.clone(), disposition_emitter.clone());
 
+        // One scan-time artwork hash table, shared by every shelf
+        // that renders list rows.
+        let artwork_hashes = crate::artwork_hash::ArtworkHashIndex::open(
+            state_dir.join("artwork-hashes.json"),
+        );
+
         // Construct each shelf's context.
         let queue = QueueContext::new(
             music_directory.clone(),
@@ -208,20 +214,23 @@ impl ShelfBundle {
         )
         .with_last_queue_store(crate::last_queue::LastQueueStore::at(
             state_dir.join("last-queue.toml"),
-        ));
+        ))
+        .with_artwork_hashes(artwork_hashes.clone());
         let playlist = PlaylistContext::new(
             music_directory.clone(),
             registry.clone(),
             subjects.clone(),
             DEFAULT_FAVOURITES_PLAYLIST_NAME.to_string(),
             shelf_dispatcher.clone(),
-        );
+        )
+        .with_artwork_hashes(artwork_hashes.clone());
         let favourites = FavouritesContext::new(
             music_directory.clone(),
             registry.clone(),
             subjects.clone(),
             DEFAULT_FAVOURITES_PLAYLIST_NAME.to_string(),
-        );
+        )
+        .with_artwork_hashes(artwork_hashes.clone());
         // No index starts until MPD has settled after load; see
         // `scan_door`. Every clone of the library shares this gate.
         let scan_gate =
@@ -238,7 +247,8 @@ impl ShelfBundle {
             )
             .await,
         )
-        .with_scan_gate(scan_gate.clone());
+        .with_scan_gate(scan_gate.clone())
+        .with_artwork_hashes(artwork_hashes.clone());
         // The triage context clones the library, registry, and
         // subject announcer — every field is Arc-wrapped, so
         // the clone shares state rather than duplicating it.
@@ -1470,7 +1480,7 @@ impl ShelfBundle {
         let mut conn = self.open_conn().await?;
         let env = library::handle_browse_by_tag(
             &mut conn,
-            &self.library.forgotten,
+            &self.library,
             payload,
             verb_name,
             tag,

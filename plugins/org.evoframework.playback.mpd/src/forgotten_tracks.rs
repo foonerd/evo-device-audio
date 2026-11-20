@@ -658,7 +658,7 @@ mod tests {
     ) -> Vec<(String, u64)> {
         let v = crate::library::handle_browse_by_tag(
             conn,
-            &ctx.forgotten,
+            ctx,
             crate::library::BrowseByTagPayload {
                 v: 1,
                 page: None,

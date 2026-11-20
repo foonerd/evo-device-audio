@@ -107,6 +107,7 @@
 #![allow(clippy::manual_async_fn)]
 
 mod album_shuffle;
+mod artwork_hash;
 mod asound_watcher;
 mod availability;
 mod config;

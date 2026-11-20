@@ -135,6 +135,9 @@ pub(crate) struct LibraryContext {
     /// When an index may start, and with which MPD handles. See
     /// [`crate::scan_door`].
     pub(crate) scan_gate: crate::scan_door::ScanGate,
+    /// Scan-time local artwork hashes carried on list rows as
+    /// `artwork_hash`. See [`crate::artwork_hash`].
+    pub(crate) artwork_hashes: crate::artwork_hash::ArtworkHashIndex,
 }
 
 impl LibraryContext {
@@ -155,7 +158,18 @@ impl LibraryContext {
             shelf_dispatcher,
             forgotten: crate::forgotten_tracks::ForgottenTracks::default(),
             scan_gate: crate::scan_door::ScanGate::settled(),
+            artwork_hashes: Default::default(),
         }
+    }
+
+    /// Share the scan-time artwork hash index. Without this the
+    /// context carries an empty one and no row has `artwork_hash`.
+    pub(crate) fn with_artwork_hashes(
+        mut self,
+        index: crate::artwork_hash::ArtworkHashIndex,
+    ) -> Self {
+        self.artwork_hashes = index;
+        self
     }
 
     /// Keep the forgotten set here. Without this the context
@@ -2140,10 +2154,13 @@ pub(crate) async fn handle_browse_library(
     let render_ctx = RenderCtx {
         music_directory: &ctx.music_directory,
     };
-    let rendered: Vec<serde_json::Value> = entries
-        .iter()
-        .map(|e| render_library_entry(e, Some(render_ctx)))
-        .collect();
+    let rendered: Vec<serde_json::Value> = with_artwork_hashes(
+        entries
+            .iter()
+            .map(|e| render_library_entry(e, Some(render_ctx)))
+            .collect(),
+        &ctx.artwork_hashes,
+    );
     // Cache the fresh listing (full, unpaginated — the cache is
     // the source of truth for subsequent page requests without
     // re-issuing lsinfo).
@@ -2285,7 +2302,7 @@ pub(crate) struct BrowseSelectorParent {
 /// [`handle_search_library`].
 pub(crate) async fn handle_browse_by_tag(
     conn: &mut MpdConnection,
-    forgotten: &crate::forgotten_tracks::ForgottenTracks,
+    ctx: &LibraryContext,
     payload: BrowseByTagPayload,
     verb_name: &'static str,
     tag: &'static str,
@@ -2299,14 +2316,15 @@ pub(crate) async fn handle_browse_by_tag(
     let range_start = page.saturating_mul(page_size);
 
     // What the operator has forgotten, once for this answer.
-    let forgotten = forgotten.snapshot().await;
+    let forgotten = ctx.forgotten.snapshot().await;
+    let hashes = &ctx.artwork_hashes;
 
     // Drill path — return TRACKS matching the selector, minus
     // what the operator has forgotten.
     if let Some(selector) = payload.select.as_ref() {
         return drill_by_tag(
             conn, verb_name, tag, facet_key, selector, page, page_size,
-            &forgotten,
+            &forgotten, hashes,
         )
         .await;
     }
@@ -2338,7 +2356,8 @@ pub(crate) async fn handle_browse_by_tag(
     //   [`enumerate_generic_facet`].
     let rendered: Vec<serde_json::Value> = match facet_key {
         "album" => {
-            enumerate_albums_via_folder(conn, verb_name, &forgotten).await?
+            enumerate_albums_via_folder(conn, verb_name, &forgotten, hashes)
+                .await?
         }
         "artist" => {
             enumerate_artists_via_fanout(conn, tag, verb_name, post_process)
@@ -2675,6 +2694,7 @@ async fn enumerate_albums_via_folder(
     conn: &mut MpdConnection,
     verb_name: &'static str,
     forgotten: &std::collections::BTreeSet<String>,
+    hashes: &crate::artwork_hash::ArtworkHashIndex,
 ) -> Result<Vec<serde_json::Value>, VerbError> {
     let tiles = resolve_album_tiles(conn, verb_name).await?;
     let rendered = tiles
@@ -2691,13 +2711,18 @@ async fn enumerate_albums_via_folder(
                 &tile.representative_track_path,
                 Some("small"),
             );
-            Some(json!({
+            let mut row = json!({
                 "album":       tile.display_title,
                 "album_id":    tile.canonical_folder,
                 "artist":      tile.display_artist,
                 "cover_url":   cover_url,
                 "track_count": remaining,
-            }))
+            });
+            crate::artwork_hash::attach(
+                &mut row,
+                hashes.hash_for_folder(&tile.canonical_folder),
+            );
+            Some(row)
         })
         .collect();
     Ok(rendered)
@@ -2987,6 +3012,7 @@ async fn drill_by_tag(
     page: usize,
     page_size: usize,
     forgotten: &std::collections::BTreeSet<String>,
+    hashes: &crate::artwork_hash::ArtworkHashIndex,
 ) -> Result<serde_json::Value, VerbError> {
     let range_start = page.saturating_mul(page_size);
     let selector_value = selector.value.trim();
@@ -3188,7 +3214,7 @@ async fn drill_by_tag(
     // Render the tracks in the same file-entry shape
     // handle_search_library uses so any consumer of that
     // envelope reads the drill response identically.
-    let rendered: Vec<serde_json::Value> =
+    let rendered: Vec<serde_json::Value> = with_artwork_hashes(
         crate::forgotten_tracks::omit_forgotten(
             entries
                 .iter()
@@ -3200,7 +3226,9 @@ async fn drill_by_tag(
                 })
                 .collect(),
             forgotten,
-        );
+        ),
+        hashes,
+    );
 
     let (page_entries, next_page, truncated) =
         paginate(&rendered, range_start, page_size);
@@ -3611,6 +3639,26 @@ fn pick_directory_cover_url(
     )
 }
 
+/// Stamp `artwork_hash` on every file row that has a scan-time
+/// local hash. Directory rows are left alone: their tile art is
+/// chosen by `pick_directory_cover_url`, not by an album folder.
+fn with_artwork_hashes(
+    mut rows: Vec<serde_json::Value>,
+    hashes: &crate::artwork_hash::ArtworkHashIndex,
+) -> Vec<serde_json::Value> {
+    for row in &mut rows {
+        if row.get("kind").and_then(|k| k.as_str()) != Some("file") {
+            continue;
+        }
+        let hash = row
+            .get("uri")
+            .and_then(|u| u.as_str())
+            .and_then(|uri| hashes.hash_for_path(uri));
+        crate::artwork_hash::attach(row, hash);
+    }
+    rows
+}
+
 fn render_library_entry(
     entry: &MpdLibraryEntry,
     ctx: Option<RenderCtx<'_>>,
@@ -3907,6 +3955,10 @@ pub(crate) async fn handle_search_library(
                 }
             }
             let mut item = render_library_entry(&e, Some(render_ctx));
+            crate::artwork_hash::attach(
+                &mut item,
+                ctx.artwork_hashes.hash_for_path(path),
+            );
             item.as_object_mut().unwrap().insert(
                 "source_id".to_string(),
                 source_id
@@ -4088,7 +4140,61 @@ pub(crate) async fn rehydrate_from_mpd(
     // library.list_works / library.get_work_recordings verb
     // surfaces have a populated cache from the first publish.
     recompute_works_aggregate(ctx, conn).await;
+    refresh_artwork_hashes(ctx, conn).await;
     publish_subjects(ctx).await;
+}
+
+/// Start the scan-time artwork hash pass: list the library's
+/// albums now, then ask the local art tier about them on a task
+/// of its own. The listing is the only work on the scan event's
+/// clock; the asking is not.
+pub(crate) async fn refresh_artwork_hashes(
+    ctx: &LibraryContext,
+    conn: &mut crate::mpd::MpdConnection,
+) {
+    let Some(dispatcher) = ctx.shelf_dispatcher.clone() else {
+        return;
+    };
+    let index = ctx.artwork_hashes.clone();
+    if !index.begin_pass() {
+        return;
+    }
+    let tiles = match resolve_album_tiles(conn, "artwork_hash_pass").await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "artwork hash pass: could not list albums; skipped"
+            );
+            index.finish_pass();
+            return;
+        }
+    };
+    let albums: Vec<crate::artwork_hash::PassAlbum> = tiles
+        .iter()
+        .map(|t| crate::artwork_hash::PassAlbum {
+            folder: t.canonical_folder.clone(),
+            representative_path: t.representative_track_path.clone(),
+            track_count: t.tracks.len(),
+        })
+        .collect();
+    let ask_all = index.take_first_pass();
+    tokio::spawn(async move {
+        let report =
+            index.run_pass(&albums, dispatcher.as_ref(), ask_all).await;
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            albums = albums.len(),
+            asked = report.asked,
+            hashed = report.hashed,
+            no_local_art = report.no_art,
+            failed = report.failed,
+            abandoned = report.abandoned,
+            "artwork hash pass finished (local art tier only)"
+        );
+        index.finish_pass();
+    });
 }
 
 /// Walk MPD's full database via `listallinfo` and compute the
@@ -6474,6 +6580,28 @@ mod tests {
     // a file tree; portraits belong on the artist facet, which
     // keys on the tag. See `pick_directory_cover_url`'s docs.
     // -----------------------------------------------------------
+
+    /// File rows get the album's scan-time hash; directory rows
+    /// and rows of albums without one are left exactly as they were.
+    #[test]
+    fn file_rows_are_stamped_and_directory_rows_are_not() {
+        let idx = crate::artwork_hash::ArtworkHashIndex::default();
+        idx.seed("A/One", Some("h1"));
+        idx.seed("A/Bare", None);
+        let rows = with_artwork_hashes(
+            vec![
+                json!({"kind": "file", "uri": "A/One/01.flac"}),
+                json!({"kind": "file", "uri": "A/Bare/01.flac"}),
+                json!({"kind": "file", "uri": "A/Unknown/01.flac"}),
+                json!({"kind": "directory", "uri": "A/One"}),
+            ],
+            &idx,
+        );
+        assert_eq!(rows[0]["artwork_hash"], "h1");
+        assert!(rows[1].get("artwork_hash").is_none());
+        assert!(rows[2].get("artwork_hash").is_none());
+        assert!(rows[3].get("artwork_hash").is_none());
+    }
 
     #[test]
     fn tier1_self_cover_wins_when_direct_sidecar_present() {
