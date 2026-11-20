@@ -37,6 +37,7 @@ pub mod artwork_negative_cache;
 pub mod artwork_resolve_coalescer;
 pub mod artwork_resolve_endpoint;
 pub mod artwork_resolve_index;
+pub mod artwork_tier;
 pub mod captive_session_endpoint;
 pub mod track_detail_endpoint;
 
@@ -44,6 +45,9 @@ use std::sync::Arc;
 
 pub use artwork_cascade::{ArtworkCascade, ArtworkResolvedNotifier};
 pub use artwork_resolve_index::ArtworkResolveIndex;
+pub use artwork_tier::{
+    is_network_tier, CascadeMode, NETWORK_TIER_REQUEST_TYPES,
+};
 
 /// Everything [`mount`] needs. Assembled by the distribution from
 /// the context its HTTPS hookup receives.
