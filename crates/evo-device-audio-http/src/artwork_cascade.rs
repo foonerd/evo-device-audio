@@ -35,6 +35,9 @@ use evo_plugin_sdk::contract::AssetCache;
 use serde_json::{json, Value};
 
 use crate::artwork_admission::{Admission, AdmissionError};
+use crate::artwork_enrichment::{
+    EnrichKey, EnrichRequest, EnrichmentSink, PROVENANCE_BACKGROUND_ENRICHING,
+};
 use crate::artwork_negative_cache::NegativeCache;
 use crate::artwork_resolve_coalescer::{
     ArtworkResolveCoalescer, CoalesceError,
@@ -241,6 +244,11 @@ pub struct ArtworkCascade {
     /// Optional sink told when a resolve lands. See
     /// [`ArtworkResolvedNotifier`].
     resolved_notifier: Option<Arc<dyn ArtworkResolvedNotifier>>,
+    /// Where a paint miss asks for the network tier to be run
+    /// later. `None` leaves the paint answering "pending" with
+    /// nobody coming — only a test or a deployment that wants no
+    /// network art configures that.
+    enrichment: Option<Arc<dyn EnrichmentSink>>,
 }
 
 impl ArtworkCascade {
@@ -276,6 +284,25 @@ impl ArtworkCascade {
             resolve_index,
             asset_cache,
             resolved_notifier: None,
+            enrichment: None,
+        })
+    }
+
+    /// Wire the background enrichment queue. A paint that misses
+    /// the local tier requests enrichment here.
+    pub fn with_enrichment(
+        self: Arc<Self>,
+        queue: Arc<crate::artwork_enrichment::EnrichmentQueue>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            dispatcher: Arc::clone(&self.dispatcher),
+            coalescer: Arc::clone(&self.coalescer),
+            admission: Arc::clone(&self.admission),
+            negative_cache: Arc::clone(&self.negative_cache),
+            resolve_index: self.resolve_index.clone(),
+            asset_cache: self.asset_cache.clone(),
+            resolved_notifier: self.resolved_notifier.clone(),
+            enrichment: Some(queue as Arc<dyn EnrichmentSink>),
         })
     }
 
@@ -296,6 +323,7 @@ impl ArtworkCascade {
             resolve_index: self.resolve_index.clone(),
             asset_cache: self.asset_cache.clone(),
             resolved_notifier: Some(notifier),
+            enrichment: self.enrichment.clone(),
         })
     }
 
@@ -746,6 +774,87 @@ impl ArtworkCascade {
     /// — e.g., `tiny` → `small`). Returns [`CascadeOutcome`]
     /// with a fully classified terminal state.
     pub async fn resolve(
+        &self,
+        principal: &Principal,
+        scheme: &str,
+        value: &str,
+        size: &str,
+    ) -> CascadeOutcome {
+        let outcome = self.resolve_paint(principal, scheme, value, size).await;
+        self.request_enrichment_if_pending(
+            principal, scheme, value, size, outcome,
+        )
+    }
+
+    /// A paint that ended "local tier exhausted, network tier
+    /// pending" asks for the network tier to be run off the clock,
+    /// and says so in its provenance. Every other outcome passes
+    /// through untouched.
+    fn request_enrichment_if_pending(
+        &self,
+        principal: &Principal,
+        scheme: &str,
+        value: &str,
+        size: &str,
+        outcome: CascadeOutcome,
+    ) -> CascadeOutcome {
+        let CascadeOutcome::NotFound {
+            provider_id,
+            detail,
+        } = outcome
+        else {
+            return outcome;
+        };
+        let pending = provider_id.as_deref()
+            == Some(PROVENANCE_LOCAL_EXHAUSTED_PENDING_ENRICH)
+            || provider_id.as_deref() == Some(PROVENANCE_BACKGROUND_ENRICHING);
+        let Some(sink) = self.enrichment.as_ref().filter(|_| pending) else {
+            return CascadeOutcome::NotFound {
+                provider_id,
+                detail,
+            };
+        };
+        let key: EnrichKey =
+            (scheme.to_string(), value.to_string(), size.to_string());
+        let provider_id = match sink.request(principal, &key) {
+            EnrichRequest::Queued | EnrichRequest::Coalesced => {
+                Some(PROVENANCE_BACKGROUND_ENRICHING.to_string())
+            }
+            EnrichRequest::Full => {
+                tracing::warn!(
+                    scheme = %scheme, value = %value, size = %size,
+                    "artwork enrichment queue is full; target left to a \
+                     later paint"
+                );
+                Some(PROVENANCE_LOCAL_EXHAUSTED_PENDING_ENRICH.to_string())
+            }
+        };
+        CascadeOutcome::NotFound {
+            provider_id,
+            detail,
+        }
+    }
+
+    /// The enrichment path gave up on `(scheme, value, size)`
+    /// after its retry schedule. Memoise the transient so a
+    /// revisit inside the window does not restart the cycle.
+    pub(crate) fn memoise_enrichment_gave_up(
+        &self,
+        scheme: &str,
+        value: &str,
+        size: &str,
+        detail: &str,
+    ) {
+        self.negative_cache.put_with_ttl(
+            (scheme.to_string(), value.to_string(), size.to_string()),
+            "unavailable",
+            detail.to_string(),
+            None,
+            TRANSIENT_MEMO_TTL,
+        );
+    }
+
+    async fn resolve_paint(
         &self,
         principal: &Principal,
         scheme: &str,
