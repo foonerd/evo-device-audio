@@ -454,28 +454,35 @@ async fn write_queue_order(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    let plan = match mode {
-        crate::album_shuffle::ShuffleMode::Albums => {
-            crate::album_shuffle::album_shuffle_plan(&items, seed)
-        }
-        crate::album_shuffle::ShuffleMode::Similar => {
-            // The walk starts from what is playing, so what comes
-            // next is chosen against what the operator is hearing.
-            // A status we cannot read is nothing playing, not a
-            // refusal: the order is still chosen, from a drawn
-            // start.
-            let playing = match cmd_conn.status().await {
+    // What is playing is read once for both orders. MPD keeps the
+    // playing song through a reorder and plays on from it, so each
+    // order starts from it: similar walks on from the playing
+    // track, albums lead with the playing album. A status we
+    // cannot read is nothing playing, not a refusal: the order is
+    // still chosen, from a drawn start.
+    let playing = match mode {
+        crate::album_shuffle::ShuffleMode::Albums
+        | crate::album_shuffle::ShuffleMode::Similar => {
+            match cmd_conn.status().await {
                 Ok(s) => s.song_position,
                 Err(e) => {
                     tracing::debug!(
                         plugin = PLUGIN_NAME,
                         error = %e,
-                        "status unreadable; similar order starts from a \
-                         drawn track rather than the playing one"
+                        "status unreadable; the order starts from a \
+                         drawn start rather than the playing track"
                     );
                     None
                 }
-            };
+            }
+        }
+        _ => None,
+    };
+    let plan = match mode {
+        crate::album_shuffle::ShuffleMode::Albums => {
+            crate::album_shuffle::album_shuffle_plan_from(&items, playing, seed)
+        }
+        crate::album_shuffle::ShuffleMode::Similar => {
             crate::similar_shuffle::similar_shuffle_plan(&items, playing, seed)
         }
         _ => return,
@@ -1905,6 +1912,76 @@ mod tests {
         let mut all = ids.clone();
         all.sort_unstable();
         assert_eq!(all, vec![11, 12, 21, 22], "every track still queued");
+        handle.shutdown().await;
+    }
+
+    /// Album shuffle leads with the playing album. MPD plays on
+    /// from the playing song, so an album drawn ahead of it would
+    /// never be reached.
+    #[tokio::test]
+    async fn album_shuffle_leads_with_the_playing_album() {
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) = spawn_mock_mpd(vec![
+            ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![
+                    (11, "blue/1.flac".to_string()),
+                    (12, "blue/2.flac".to_string()),
+                    (21, "red/1.flac".to_string()),
+                    (22, "red/2.flac".to_string()),
+                    (31, "green/1.flac".to_string()),
+                    (32, "green/2.flac".to_string()),
+                ],
+                // Position 3 is playing: id 22, in Red.
+                playing: Some(3),
+            },
+            ConnBehaviour::HoldAfterWelcome,
+        ])
+        .await;
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let reporter_dyn: Arc<dyn CustodyStateReporter> = reporter.clone();
+        let handle = spawn(
+            endpoint,
+            short_timeouts(),
+            test_custody_handle(),
+            reporter_dyn,
+            SubjectEmitter::null(),
+            null_protocol_settings_rx(),
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        handle
+            .command(PlaybackCommand::SetShuffle(
+                crate::album_shuffle::ShuffleMode::Albums,
+            ))
+            .await
+            .expect("album shuffle");
+
+        let seen = commands.lock().unwrap().clone();
+        let mut ids = vec![11u32, 12, 21, 22, 31, 32];
+        for c in &seen {
+            let Some(rest) = c.strip_prefix("moveid ") else {
+                continue;
+            };
+            let mut parts = rest.split('"').filter(|s| !s.trim().is_empty());
+            let id: u32 = parts.next().unwrap().parse().unwrap();
+            let to: usize = parts.next().unwrap().trim().parse().unwrap();
+            let from = ids.iter().position(|i| *i == id).unwrap();
+            let id = ids.remove(from);
+            ids.insert(to.min(ids.len()), id);
+        }
+        assert_eq!(
+            &ids[..2],
+            &[21, 22],
+            "the playing album leads: {ids:?} from {seen:?}"
+        );
         handle.shutdown().await;
     }
 

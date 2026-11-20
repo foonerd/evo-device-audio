@@ -201,9 +201,32 @@ pub(crate) fn next_rand(state: &mut u64) -> u64 {
 
 /// Choose the album order and say how to realise it.
 ///
+/// Nothing is playing: see [`album_shuffle_plan_from`].
+///
+/// The device always knows what is playing, so only the pins that
+/// fix the plain plan call this.
+#[cfg(test)]
+pub(crate) fn album_shuffle_plan(
+    items: &[MpdQueueItem],
+    seed: u64,
+) -> Vec<QueueMove> {
+    album_shuffle_plan_from(items, None, seed)
+}
+
+/// Choose the album order from what is playing, and say how to
+/// realise it.
+///
 /// Albums are grouped by tag, in first-appearance order, then that
 /// list of groups is shuffled. Each group's tracks keep the order
 /// they already had.
+///
+/// MPD keeps the playing song through a reorder and plays on from
+/// it, so any album drawn ahead of the playing one would be left
+/// behind and never reached. When `playing` (a queue position)
+/// names a track, its album therefore leads and the others are
+/// shuffled after it: the operator hears the rest of the record
+/// they are on, then the albums chosen. A position that names no
+/// queued track is nothing playing.
 ///
 /// The returned moves are applied in sequence with `moveid`.
 /// Ascending target positions mean each move lands its song at a
@@ -214,8 +237,9 @@ pub(crate) fn next_rand(state: &mut u64) -> u64 {
 /// An empty plan means the queue is already in the chosen order.
 /// Fewer than two albums is always an empty plan: there is no
 /// album order to choose.
-pub(crate) fn album_shuffle_plan(
+pub(crate) fn album_shuffle_plan_from(
     items: &[MpdQueueItem],
+    playing: Option<u32>,
     seed: u64,
 ) -> Vec<QueueMove> {
     // Group, keeping first-appearance order and each album's own
@@ -232,12 +256,23 @@ pub(crate) fn album_shuffle_plan(
         return Vec::new();
     }
 
+    // The playing album is set aside to lead; only the rest is
+    // drawn. With nothing playing every album is drawn.
+    let lead = playing
+        .and_then(|pos| items.iter().find(|i| i.position == pos))
+        .map(album_key)
+        .and_then(|key| groups.iter().position(|(k, _)| *k == key))
+        .map(|at| groups.remove(at));
+
     // Fisher-Yates over the album groups. Only the order of
     // albums moves; nothing inside one does.
     let mut state = seed;
     for i in (1..groups.len()).rev() {
         let j = (next_rand(&mut state) % (i as u64 + 1)) as usize;
         groups.swap(i, j);
+    }
+    if let Some(group) = lead {
+        groups.insert(0, group);
     }
 
     let target: Vec<u32> =
@@ -354,6 +389,56 @@ mod tests {
             "across 64 seeds the second album must sometimes come first, \
              or nothing is being chosen"
         );
+    }
+
+    /// The playing album leads, whatever the seed. MPD plays on
+    /// from the playing song, so an album drawn ahead of it would
+    /// never be reached.
+    #[test]
+    fn the_playing_album_leads_the_order() {
+        let items = vec![
+            item(10, 0, Some("Blue"), "blue/1.flac"),
+            item(11, 1, Some("Blue"), "blue/2.flac"),
+            item(20, 2, Some("Red"), "red/1.flac"),
+            item(21, 3, Some("Red"), "red/2.flac"),
+            item(30, 4, Some("Green"), "green/1.flac"),
+            item(31, 5, Some("Green"), "green/2.flac"),
+        ];
+        let mut tails = std::collections::HashSet::new();
+        for seed in 0..64u64 {
+            // Red's second track (position 3) is playing.
+            let order =
+                apply(&items, &album_shuffle_plan_from(&items, Some(3), seed));
+            assert_eq!(order.len(), 6, "seed {seed}: nothing lost");
+            assert_eq!(
+                &order[..2],
+                &[20, 21],
+                "seed {seed}: the playing album leads in order: {order:?}"
+            );
+            tails.insert(order[2..].to_vec());
+        }
+        assert!(
+            tails.len() >= 2,
+            "the other albums are still drawn, not fixed: {tails:?}"
+        );
+    }
+
+    /// Nothing playing, or a position naming no track, is the
+    /// plain plan: the delegate must not drift from it.
+    #[test]
+    fn nothing_playing_is_the_plain_plan() {
+        let items = two_albums();
+        for seed in 0..16u64 {
+            assert_eq!(
+                album_shuffle_plan_from(&items, None, seed),
+                album_shuffle_plan(&items, seed)
+            );
+            assert_eq!(
+                album_shuffle_plan_from(&items, Some(99), seed),
+                album_shuffle_plan(&items, seed),
+                "seed {seed}: a position past the queue is nothing playing"
+            );
+        }
     }
 
     /// The same seed chooses the same order. A plan nobody can
