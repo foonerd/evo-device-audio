@@ -895,13 +895,41 @@ async fn handle_enqueue_selection_criteria(
             reason: e.to_string(),
         }
     })?;
+    // A `Folder` resolves to the directory itself, which is
+    // never an empty list: `add DIR` is handed to MPD and MPD
+    // walks it. A directory that holds no playable track
+    // (an unmounted share's mount point, an emptied folder)
+    // would therefore pass the guard below, and Replace would
+    // `clear` the queue and then fail at `play 0` on nothing.
+    // So the folder is asked what it holds first, here, before
+    // any mutation. The files it answers with are what `Next`
+    // places, so that mode does not ask twice.
+    let folder_files: Option<Vec<String>> = match &resolved {
+        crate::selection::ResolvedSelection::UriList(_)
+            if criteria.dimension
+                == crate::selection::SelectionDimension::Folder =>
+        {
+            Some(
+                materialise_to_uris(conn, &resolved, criteria.dimension)
+                    .await
+                    .map_err(|e| VerbError::Mpd {
+                        verb: "enqueue_selection".to_string(),
+                        reason: e.to_string(),
+                    })?,
+            )
+        }
+        _ => None,
+    };
     // Zero-match short-circuit — explicit empty, queue left
     // intact, no atomic clear. For `Filter` selections the
     // resolver's `is_empty` only catches the "no pairs"
     // shape; the actual match count requires an MPD `count`
     // roundtrip (cheap — MPD answers with one songs line).
     let is_empty = match &resolved {
-        crate::selection::ResolvedSelection::UriList(list) => list.is_empty(),
+        crate::selection::ResolvedSelection::UriList(list) => {
+            list.is_empty()
+                || folder_files.as_ref().is_some_and(|files| files.is_empty())
+        }
         crate::selection::ResolvedSelection::Filter { pairs, .. } => {
             let pairs_ref: Vec<(&str, &str)> = pairs
                 .iter()
@@ -932,12 +960,15 @@ async fn handle_enqueue_selection_criteria(
     // as-is via findadd/searchadd for a single roundtrip.
     let materialise_needed = matches!(mode, EnqueueSelectionMode::Next);
     let uris: Vec<String> = if materialise_needed {
-        materialise_to_uris(conn, &resolved, criteria.dimension)
-            .await
-            .map_err(|e| VerbError::Mpd {
-                verb: "enqueue_selection".to_string(),
-                reason: e.to_string(),
-            })?
+        match folder_files {
+            Some(files) => files,
+            None => materialise_to_uris(conn, &resolved, criteria.dimension)
+                .await
+                .map_err(|e| VerbError::Mpd {
+                    verb: "enqueue_selection".to_string(),
+                    reason: e.to_string(),
+                })?,
+        }
     } else {
         match &resolved {
             crate::selection::ResolvedSelection::UriList(list) => list.clone(),
@@ -4121,20 +4152,28 @@ mod tests {
     /// the queue is still standing afterwards.
     async fn zero_match_harness(
     ) -> (QueueContext, MpdConnection, Arc<RecordingAnn>, CommandLog) {
-        use crate::playback_supervisor::test_mock::{
-            short_timeouts, spawn_mock_mpd, ConnBehaviour,
-        };
+        use crate::playback_supervisor::test_mock::ConnBehaviour;
         let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (endpoint, _mock) =
-            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
-                commands: Arc::clone(&commands),
-                items: vec![
-                    (11, "INTERNAL/keep-one.flac".to_string()),
-                    (12, "INTERNAL/keep-two.flac".to_string()),
-                ],
-                playing: Some(0),
-            }])
-            .await;
+        let (ctx, conn, ann) = queue_harness(ConnBehaviour::LiveQueue {
+            commands: Arc::clone(&commands),
+            items: vec![
+                (11, "INTERNAL/keep-one.flac".to_string()),
+                (12, "INTERNAL/keep-two.flac".to_string()),
+            ],
+            playing: Some(0),
+        })
+        .await;
+        (ctx, conn, ann, commands)
+    }
+
+    /// A context and connection over any scripted MPD.
+    async fn queue_harness(
+        behaviour: crate::playback_supervisor::test_mock::ConnBehaviour,
+    ) -> (QueueContext, MpdConnection, Arc<RecordingAnn>) {
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd,
+        };
+        let (endpoint, _mock) = spawn_mock_mpd(vec![behaviour]).await;
         let conn =
             MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
                 .await
@@ -4157,7 +4196,7 @@ mod tests {
             crate::mute_cell::MuteCell::new(),
             crate::album_shuffle::ShuffleModeCell::new(),
         );
-        (ctx, conn, ann, commands)
+        (ctx, conn, ann)
     }
 
     /// Nothing that could mutate the queue may have been sent.
@@ -4242,6 +4281,117 @@ mod tests {
                 "{label}: the operator's queue is still standing",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn an_empty_folder_leaves_the_queue_in_every_mode() {
+        // The fourth door. A `Folder` resolves to the directory
+        // itself, so the UriList is never empty and the zero-
+        // match short-circuit above never fired: Replace sent
+        // `clear`, `add DIR` (which adds nothing) and `play 0`
+        // (which fails on an empty queue) — the operator's
+        // queue gone for a folder with nothing in it. The
+        // folder is asked what it holds before any mutation.
+        for mode in [
+            EnqueueSelectionMode::Replace,
+            EnqueueSelectionMode::Append,
+            EnqueueSelectionMode::Next,
+        ] {
+            let label = mode.as_str().to_string();
+            // The scripted MPD answers `listallinfo` with no
+            // files: a mount point with nothing under it.
+            let (ctx, mut conn, ann, commands) = zero_match_harness().await;
+
+            let body = handle_enqueue_selection_criteria(
+                &ctx,
+                &mut conn,
+                &FixedResolver(crate::selection::ResolvedSelection::UriList(
+                    vec!["NAS".to_string()],
+                )),
+                crate::selection::SelectionCriteria {
+                    dimension: crate::selection::SelectionDimension::Folder,
+                    value: "NAS".to_string(),
+                    parent: None,
+                },
+                mode,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("{label}: an empty folder is not an error: {e:?}")
+            });
+
+            assert_eq!(body["status"], "empty", "{label}: {body}");
+            assert_eq!(body["added_uris_count"], 0, "{label}: {body}");
+            assert!(
+                ann.subjects_touched().is_empty(),
+                "{label}: nothing moved, nothing published: {:?}",
+                ann.subjects_touched(),
+            );
+            let seen = commands.lock().unwrap().clone();
+            assert_queue_was_never_touched(&seen, &label);
+            assert_eq!(
+                conn.playlistinfo()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|i| i.file_path)
+                    .collect::<Vec<_>>(),
+                vec![
+                    "INTERNAL/keep-one.flac".to_string(),
+                    "INTERNAL/keep-two.flac".to_string(),
+                ],
+                "{label}: the operator's queue is still standing",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_folder_with_tracks_still_replaces_in_one_command_list() {
+        // The guard asks the folder what it holds; it must not
+        // change what happens when the answer is "tracks".
+        // Replace is still `clear`, one `add DIR`, `play 0`.
+        let log: CommandLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (ctx, mut conn, _ann) = queue_harness(
+            crate::playback_supervisor::test_mock::ConnBehaviour::RecordingLibrary {
+                commands: Arc::clone(&log),
+                files: vec![
+                    "USB/Audio/01.flac".to_string(),
+                    "USB/Audio/02.flac".to_string(),
+                ],
+            },
+        )
+        .await;
+
+        let body = handle_enqueue_selection_criteria(
+            &ctx,
+            &mut conn,
+            &FixedResolver(crate::selection::ResolvedSelection::UriList(vec![
+                "USB/Audio".to_string(),
+            ])),
+            crate::selection::SelectionCriteria {
+                dimension: crate::selection::SelectionDimension::Folder,
+                value: "USB/Audio".to_string(),
+                parent: None,
+            },
+            EnqueueSelectionMode::Replace,
+        )
+        .await
+        .expect("a folder with tracks replaces");
+
+        assert_eq!(body["status"], "ok", "{body}");
+        let seen = log.lock().unwrap().clone();
+        let adds: Vec<&String> =
+            seen.iter().filter(|c| c.contains("add")).collect();
+        assert!(
+            seen.iter().any(|c| c.contains("clear"))
+                && adds.iter().any(|c| c.contains("USB/Audio\"")
+                    || c.trim_end().ends_with("USB/Audio")),
+            "clear then add of the directory: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|c| !c.starts_with("addid")),
+            "the directory is added once, not file by file: {seen:?}"
+        );
     }
 
     #[tokio::test]

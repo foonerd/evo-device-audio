@@ -859,6 +859,24 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                     if !in_list {
                         let _ = w.write_all(b"OK\n").await;
                     }
+                } else if cmd.starts_with("listallinfo") {
+                    // As MPD answers it: a path that names a file
+                    // lists that file, and a directory with nothing
+                    // playable under it lists nothing. A file is told
+                    // from a directory by its extension, which is all
+                    // these fixtures' paths carry.
+                    let path =
+                        cmd.split('"').nth(1).unwrap_or_default().to_string();
+                    let is_file = path
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|leaf| leaf.contains('.'));
+                    let out = if is_file {
+                        format!("file: {path}\nOK\n")
+                    } else {
+                        "OK\n".to_string()
+                    };
+                    let _ = w.write_all(out.as_bytes()).await;
                 } else if cmd.starts_with("idle") {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     return;
