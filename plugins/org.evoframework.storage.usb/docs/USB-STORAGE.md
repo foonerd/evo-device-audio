@@ -270,7 +270,7 @@ resolves collision against existing mounts at
 | `storage.usb.list_drives` | `{}` | `{ drives: [DriveRecord] }` — see §5 | none | never fails |
 | `storage.usb.mount` | `{ stable_id }` | `{ mounted_at, class }` | operator | `system_disk_refused`, `unsupported_fs`, `mount_failed_dirty`, `mount_failed_oversized_vfat`, `subprocess_io` |
 | `storage.usb.safe_remove` | `{ stable_id, force?: bool }` | `{ removed: true }` | operator | `system_disk_refused`, `busy`, `subprocess_io` |
-| `storage.usb.repair_filesystem` | `{ stable_id, escalate?: bool }` | `{ repaired: true, before_class, after_class }` | operator + step-up | `system_disk_refused`, `unsupported_fs`, `repair_failed`, `subprocess_io` |
+| `storage.usb.repair_filesystem` | `{ stable_id, escalate?: bool }` | `{ repaired: true, before_class, after_class }` | operator | `system_disk_refused`, `unsupported_fs`, `repair_failed`, `subprocess_io` |
 | `storage.usb.rename` | `{ stable_id, alias }` — `alias` sanitised per §3 token rule (`^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$`), empty alias clears the operator alias and falls back to the next rule in the derivation ladder | `{ new_stable_id, class }` — new_stable_id may equal current stable_id when the alias resolves to the same sanitised token after enumeration | operator | `system_disk_refused`, `invalid_alias`, `alias_would_collide` (only when the operator's requested alias collides with a foreign physical volume and enumeration cannot resolve — rare), `subprocess_io` (from the required unmount + remount cycle) |
 
 **Rename semantics.** Alias write flows through a full

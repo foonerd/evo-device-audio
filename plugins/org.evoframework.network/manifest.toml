@@ -80,24 +80,24 @@ response_budget_ms = 15000
 # prior-art peer (NetworkManager's `nmcli device wifi list`,
 # iOS, Android, classic Volumio) lists networks without
 # elevation; only join / apply / change is privileged.
-# Write-class verbs — the paired-operator connect path.
-# `intent.set` (record profile), `intent.apply` (join the
-# network), `captive.start` / `captive.submit` /
+# Write-class verbs — every mutating verb gates at
+# `write:network_admin`: `intent.set` (record profile),
+# `intent.apply` (join the network), `wifi.disconnect`,
+# `wifi.forget`, `captive.start` / `captive.submit` /
 # `captive.complete` (walk the portal on a network already
-# being joined) all gate at `write:network_admin`. Connecting
-# to a Wi-Fi network is the most basic network operation on
-# every consumer device; no prior-art peer (iOS, Android,
-# macOS, classic Volumio) forces a fresh admin re-auth on
-# every join. A paired operator holds `write` continuously
-# from pairing; an unpaired / anonymous session lacks `write`
-# and is refused by this gate.
+# being joined), `captive.session.start`, `security.harden`
+# (rewrite secret-at-rest configuration), and `flight_mode.set`
+# / `radio.set` (radio kills). Connecting to a Wi-Fi network is
+# the most basic network operation on every consumer device; no
+# prior-art peer (iOS, Android, macOS, classic Volumio) forces a
+# fresh admin re-auth on every join. A pair or kiosk bearer holds
+# the scope, and so does a LAN caller without a bearer while the
+# household policy polices the LAN. A public-origin caller
+# without a bearer does not, and is refused by this gate.
 #
-# Step-up verbs — destructive posture changes that DO warrant
-# a fresh operator-presence proof: `flight_mode.set` (kills
-# every wireless family device-wide), `radio.set` (per-family
-# radio kill), `security.harden` (rewrites secret-at-rest
-# configuration). These pop the operator-password card by
-# design.
+# The household policy is the one door on top: while it protects
+# network_admin, each of these verbs needs the owner's step-up
+# session on the call.
 #
 # Read-only verbs — `status`, `intent.get`, `wifi_devices`,
 # `supervisor.status`, `refresh_connectivity`, `scan`,
@@ -127,6 +127,6 @@ response_budget_ms = 15000
 # upstream.fetch, so a separate plugin-side capability check
 # would only block the framework's own dispatcher.
 "network.nm.captive.session.start" = { kind = "write", scope = "network_admin" }
-"network.nm.security.harden" = { kind = "step_up", scope = "network_admin" }
-"network.nm.flight_mode.set" = { kind = "step_up", scope = "network_admin" }
-"network.nm.radio.set" = { kind = "step_up", scope = "network_admin" }
+"network.nm.security.harden" = { kind = "write", scope = "network_admin" }
+"network.nm.flight_mode.set" = { kind = "write", scope = "network_admin" }
+"network.nm.radio.set" = { kind = "write", scope = "network_admin" }

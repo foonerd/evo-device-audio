@@ -374,12 +374,14 @@ mod tests {
 
     #[test]
     fn safe_remove_rides_the_household_network_door() {
-        // Glass library Remove still has no password: it
-        // nests as plugin-system, which holds network_admin
-        // as StepUp. Direct safe_remove on LAN-trust or an
-        // unpaired peer is refused. Mount / repair / rename
-        // stay on the same door. storage_admin is not a
-        // granted scope.
+        // Every mutating USB verb rides the household network
+        // door at write rank, as the share verbs do: the
+        // household policy, not a per-call password, is what
+        // guards it. A step-up declaration would demand a
+        // step-up session on every call and put a password
+        // card on USB Remove at the open level. Glass library
+        // Remove nests as plugin-system, which holds
+        // network_admin. storage_admin is not a granted scope.
         use evo_plugin_sdk::manifest::VerbCapability;
         let m = manifest();
         let caps = &m
@@ -397,7 +399,7 @@ mod tests {
             assert!(
                 matches!(
                     caps.get(verb),
-                    Some(VerbCapability::StepUp { scope }) if scope == "network_admin"
+                    Some(VerbCapability::Write { scope }) if scope == "network_admin"
                 ),
                 "{verb} must stay household-gated: {:?}",
                 caps.get(verb)

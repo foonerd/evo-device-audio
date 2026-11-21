@@ -57,7 +57,10 @@ response_budget_ms = 10000
 [capabilities.respondent.verb_capabilities]
 # Read verb anonymous (widget seed).
 "network.smb_server.get_state" = { kind = "none" }
-# Mutating verbs step-up-gated against network_admin.
-"network.smb_server.apply" = { kind = "step_up", scope = "network_admin" }
-"network.smb_server.user_add" = { kind = "step_up", scope = "network_admin" }
-"network.smb_server.user_revoke" = { kind = "step_up", scope = "network_admin" }
+# Mutating verbs gate at write:network_admin, the household
+# network door. While the household policy protects
+# network_admin, each needs the owner's step-up session on the
+# call.
+"network.smb_server.apply" = { kind = "write", scope = "network_admin" }
+"network.smb_server.user_add" = { kind = "write", scope = "network_admin" }
+"network.smb_server.user_revoke" = { kind = "write", scope = "network_admin" }

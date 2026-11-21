@@ -79,10 +79,13 @@ response_budget_ms = 180000
 "network.discovery.list" = { kind = "none" }
 "network.share.get_state" = { kind = "none" }
 "network.share.list_events" = { kind = "none" }
-# Mutating + probing verbs step-up-gated against network_admin.
-"network.share.add" = { kind = "step_up", scope = "network_admin" }
-"network.share.edit" = { kind = "step_up", scope = "network_admin" }
-"network.share.remove" = { kind = "step_up", scope = "network_admin" }
-"network.share.mount" = { kind = "step_up", scope = "network_admin" }
-"network.share.unmount" = { kind = "step_up", scope = "network_admin" }
-"network.discovery.refresh" = { kind = "step_up", scope = "network_admin" }
+# Mutating + probing verbs gate at write:network_admin, the
+# household network door. While the household policy protects
+# network_admin, each needs the owner's step-up session on the
+# call.
+"network.share.add" = { kind = "write", scope = "network_admin" }
+"network.share.edit" = { kind = "write", scope = "network_admin" }
+"network.share.remove" = { kind = "write", scope = "network_admin" }
+"network.share.mount" = { kind = "write", scope = "network_admin" }
+"network.share.unmount" = { kind = "write", scope = "network_admin" }
+"network.discovery.refresh" = { kind = "write", scope = "network_admin" }
