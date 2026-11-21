@@ -5453,7 +5453,7 @@ mod tests {
         );
     }
 
-    // ----- R-064: the household door -----
+    // ----- the household door -----
 
     /// Answers `household.require` open or locked, and records every
     /// dispatch it is given.
@@ -5576,7 +5576,7 @@ mod tests {
         }
     }
 
-    /// R-064 Done-means. At a locked household a share cannot be
+    /// At a locked household a share cannot be
     /// removed by a caller without a sitting, and the refusal
     /// changes nothing: the row stays, the queue stays, MPD is not
     /// told to update, USB is not reached. RED if the gate goes.
@@ -5781,7 +5781,7 @@ mod tests {
         }
     }
 
-    /// R-066, the operator-visible contract: a consumer cannot
+    /// The operator-visible contract: a consumer cannot
     /// register an arbitrary path as a USB source, at any household
     /// level. Nothing is registered, and nothing is probed.
     #[tokio::test]

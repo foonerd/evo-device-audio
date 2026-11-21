@@ -180,7 +180,7 @@ impl ArtworkHashIndex {
     /// first attempt uses `first`, listed by the caller on the scan
     /// event's own connection.
     ///
-    /// This exists because the first pass of a plugin load runs
+    /// This exists because the initial pass of a plugin load runs
     /// while MPD's database and the art plugin may still be coming
     /// up; without a retry a fresh install keeps an empty table
     /// until the next scan.
@@ -490,7 +490,7 @@ mod tests {
     }
 
     /// An unchanged album is not asked again; a changed one is;
-    /// the first pass of a load asks all.
+    /// the initial pass of a load asks all.
     #[tokio::test]
     async fn only_changed_albums_are_asked_again() {
         let art = Art::new(|_| hit(H1));
