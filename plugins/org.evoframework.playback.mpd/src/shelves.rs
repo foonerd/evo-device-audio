@@ -1300,7 +1300,7 @@ impl ShelfBundle {
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: library::AddSourcePayload = parse_json(req)?;
-        let res = library::handle_add_source(&self.library, payload)
+        let res = library::add_source_for_consumer(&self.library, payload)
             .await
             .map_err(library_verb_to_plugin_error)?;
         encode_json_response(req, &res)
@@ -1312,7 +1312,7 @@ impl ShelfBundle {
     ) -> Result<Response, PluginError> {
         let payload: library::RemoveSourcePayload = parse_json(req)?;
         let mut conn = self.open_conn().await?;
-        library::handle_remove_source(
+        library::remove_source_for_consumer(
             &self.library,
             &self.queue,
             &mut conn,

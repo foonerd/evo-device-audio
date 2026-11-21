@@ -116,6 +116,7 @@ mod envelope_subscriber;
 mod favourites;
 mod forgotten_tracks;
 mod gone_curation;
+mod household_door;
 mod idle_observer;
 mod last_queue;
 mod library;

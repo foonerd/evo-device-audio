@@ -1036,6 +1036,90 @@ pub(crate) async fn handle_list_sources(
     })
 }
 
+/// Ask the household door whether the consumer being served may
+/// change sources now. Fails closed: a door that cannot be asked
+/// is not an open one.
+async fn require_household_door(
+    ctx: &LibraryContext,
+    verb: &'static str,
+) -> Result<(), VerbError> {
+    let Some(dispatcher) = ctx.shelf_dispatcher.as_ref() else {
+        return Err(VerbError::Mpd {
+            verb: verb.to_string(),
+            reason: "the household door cannot be asked: no peer dispatcher \
+                     at admission"
+                .to_string(),
+        });
+    };
+    let body = serde_json::to_vec(&json!({
+        "scope": crate::household_door::SOURCES_SCOPE,
+    }))
+    .map_err(|e| VerbError::Mpd {
+        verb: verb.to_string(),
+        reason: e.to_string(),
+    })?;
+    dispatcher
+        .dispatch(
+            crate::household_door::HOUSEHOLD_SHELF,
+            crate::household_door::HOUSEHOLD_REQUIRE,
+            body,
+            None,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| match e {
+            ShelfDispatchError::Refused { subclass, detail } => {
+                VerbError::Refused {
+                    verb: verb.to_string(),
+                    subclass,
+                    reason: detail,
+                }
+            }
+            other => VerbError::Mpd {
+                verb: verb.to_string(),
+                reason: format!(
+                    "the household door could not be asked: {other}"
+                ),
+            },
+        })
+}
+
+/// `library.add_source` as a consumer reaches it. A source that is
+/// not a USB volume is a share (or a media server), and adding one
+/// is protected by the household door. USB sources arrive from
+/// `storage.usb` and stay as they were.
+pub(crate) async fn add_source_for_consumer(
+    ctx: &LibraryContext,
+    payload: AddSourcePayload,
+) -> Result<AddSourceResponse, VerbError> {
+    if !matches!(payload.kind, SourceKind::LocalUsb { .. }) {
+        require_household_door(ctx, "add_source").await?;
+    }
+    handle_add_source(ctx, payload).await
+}
+
+/// `library.remove_source` as a consumer reaches it. Gated for every
+/// source that is not a USB volume, whatever flags the payload
+/// carries: `consumer_stop` still drops the registry row, so it is
+/// not a way round the door. A USB source keeps its own gate, the
+/// nested `storage.usb.safe_remove`. An unknown id is not gated;
+/// it changes nothing and answers `UnknownSource` as before.
+pub(crate) async fn remove_source_for_consumer(
+    ctx: &LibraryContext,
+    queue: &crate::queue::QueueContext,
+    conn: &mut MpdConnection,
+    payload: RemoveSourcePayload,
+) -> Result<(), VerbError> {
+    let protected = match ctx.registry.get(&payload.source_id).await {
+        Some(record) => !matches!(record.kind, SourceKind::LocalUsb { .. }),
+        None => false,
+    };
+    if protected {
+        require_household_door(ctx, "remove_source").await?;
+    }
+    handle_remove_source(ctx, queue, conn, payload).await
+}
+
 pub(crate) async fn handle_add_source(
     ctx: &LibraryContext,
     payload: AddSourcePayload,
@@ -5337,6 +5421,374 @@ mod tests {
             ctx.registry.get("usb-audio").await.is_none(),
             "the row is dropped so MPD lets go of the tree",
         );
+    }
+
+    // ----- R-064: the household door -----
+
+    /// Answers `household.require` open or locked, and records every
+    /// dispatch it is given.
+    struct Door {
+        locked: bool,
+        seen: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl Door {
+        fn new(locked: bool) -> Arc<Self> {
+            Arc::new(Self {
+                locked,
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn asked(&self) -> usize {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, v)| v == "household.require")
+                .count()
+        }
+        fn other(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, v)| v != "household.require")
+                .map(|(_, v)| v.clone())
+                .collect()
+        }
+    }
+
+    impl ShelfRequestDispatcher for Door {
+        fn dispatch<'a>(
+            &'a self,
+            shelf: &'a str,
+            request_type: &'a str,
+            payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<u8>,
+                            evo_plugin_sdk::contract::ShelfDispatchError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((shelf.to_string(), request_type.to_string()));
+            let reply = if request_type == "household.require" {
+                let asked: serde_json::Value =
+                    serde_json::from_slice(&payload).unwrap();
+                assert_eq!(asked["scope"], "network_admin");
+                assert_eq!(shelf, "evo.household");
+                if self.locked {
+                    Err(evo_plugin_sdk::contract::ShelfDispatchError::Refused {
+                        subclass: "household_policy_locked".to_string(),
+                        detail: "the household policy protects this group"
+                            .to_string(),
+                    })
+                } else {
+                    Ok(br#"{"household_door":"open"}"#.to_vec())
+                }
+            } else {
+                Ok(Vec::new())
+            };
+            Box::pin(async move { reply })
+        }
+    }
+
+    fn door_ctx(d: &Arc<Door>) -> LibraryContext {
+        LibraryContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            SourceRegistry::new(),
+            Arc::new(NullAnn),
+            Some(Arc::clone(d) as Arc<dyn ShelfRequestDispatcher>),
+        )
+    }
+
+    fn nas_record(id: &str) -> SourceRecord {
+        let mut nas = usb_record(id, "unused");
+        nas.kind = SourceKind::NetworkNasSmb {
+            server: "192.0.2.10".to_string(),
+            share: "Music".to_string(),
+            username: "operator".to_string(),
+        };
+        nas.mount_path = PathBuf::from("/var/lib/evo/music/NAS/Music");
+        nas
+    }
+
+    fn add_nas_payload() -> AddSourcePayload {
+        AddSourcePayload {
+            v: LIBRARY_PAYLOAD_VERSION,
+            display_name: "Music".to_string(),
+            kind: SourceKind::NetworkNasSmb {
+                server: "192.0.2.10".to_string(),
+                share: "Music".to_string(),
+                username: "operator".to_string(),
+            },
+            mount_path: PathBuf::from("/var/lib/evo/music/NAS/Music"),
+            scan_policy: None,
+            probe_cadence_ms: None,
+            cloud_eager_scan_acknowledged: None,
+        }
+    }
+
+    fn assert_locked(err: &VerbError) {
+        match err {
+            VerbError::Refused { subclass, .. } => {
+                assert_eq!(subclass, "household_policy_locked")
+            }
+            other => panic!("expected the household refusal, got {other:?}"),
+        }
+    }
+
+    /// R-064 Done-means. At a locked household a share cannot be
+    /// removed by a caller without a sitting, and the refusal
+    /// changes nothing: the row stays, the queue stays, MPD is not
+    /// told to update, USB is not reached. RED if the gate goes.
+    #[tokio::test]
+    async fn a_locked_door_refuses_a_share_remove_and_changes_nothing() {
+        let (mut conn, log) = live_queue_conn(
+            vec![
+                (11, "NAS/Music/a.flac".to_string()),
+                (12, "INTERNAL/keep.flac".to_string()),
+            ],
+            Some(0),
+        )
+        .await;
+        let d = Door::new(true);
+        let ctx = door_ctx(&d);
+        ctx.registry
+            .register(nas_record("nas-music"))
+            .await
+            .unwrap();
+
+        let err = remove_source_for_consumer(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("nas-music", false),
+        )
+        .await
+        .unwrap_err();
+
+        assert_locked(&err);
+        assert!(ctx.registry.get("nas-music").await.is_some(), "row kept");
+        assert_eq!(
+            remaining_queue(&mut conn).await,
+            vec![
+                "NAS/Music/a.flac".to_string(),
+                "INTERNAL/keep.flac".to_string()
+            ],
+            "queue untouched"
+        );
+        let seen = log.lock().unwrap().clone();
+        for forbidden in ["update", "rescan", "deleteid", "clear"] {
+            assert!(
+                seen.iter().all(|c| !c.starts_with(forbidden)),
+                "{forbidden} sent on a refused remove: {seen:?}"
+            );
+        }
+        assert_eq!(d.asked(), 1);
+        assert!(
+            d.other().is_empty(),
+            "no other verb reached: {:?}",
+            d.other()
+        );
+    }
+
+    /// `consumer_stop` still drops the registry row, so it is not an
+    /// exemption: a caller cannot name its way round the door.
+    #[tokio::test]
+    async fn consumer_stop_is_not_a_way_round_the_door() {
+        let d = Door::new(true);
+        let ctx = door_ctx(&d);
+        ctx.registry
+            .register(nas_record("nas-music"))
+            .await
+            .unwrap();
+        let mut conn = mock_conn().await;
+
+        let err = remove_source_for_consumer(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("nas-music", true),
+        )
+        .await
+        .unwrap_err();
+
+        assert_locked(&err);
+        assert!(ctx.registry.get("nas-music").await.is_some());
+    }
+
+    /// An open door changes nothing about what Remove does.
+    #[tokio::test]
+    async fn an_open_door_lets_a_share_remove_proceed() {
+        let d = Door::new(false);
+        let ctx = door_ctx(&d);
+        ctx.registry
+            .register(nas_record("nas-music"))
+            .await
+            .unwrap();
+        let mut conn = mock_conn().await;
+
+        remove_source_for_consumer(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("nas-music", false),
+        )
+        .await
+        .unwrap();
+
+        assert!(ctx.registry.get("nas-music").await.is_none());
+        assert_eq!(d.asked(), 1);
+        assert!(d.other().is_empty(), "a share never reaches storage.usb");
+    }
+
+    /// Adding a share is protected the same way, and refused adds
+    /// register nothing.
+    #[tokio::test]
+    async fn a_locked_door_refuses_a_share_add_and_registers_nothing() {
+        let d = Door::new(true);
+        let ctx = door_ctx(&d);
+
+        let err = add_source_for_consumer(&ctx, add_nas_payload())
+            .await
+            .unwrap_err();
+
+        assert_locked(&err);
+        assert!(
+            ctx.registry.snapshot().await.is_empty(),
+            "nothing registered"
+        );
+        assert_eq!(d.asked(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_open_door_lets_a_share_add_proceed() {
+        let d = Door::new(false);
+        let ctx = door_ctx(&d);
+
+        let res = add_source_for_consumer(&ctx, add_nas_payload()).await;
+
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(ctx.registry.snapshot().await.len(), 1);
+        assert_eq!(d.asked(), 1);
+    }
+
+    /// USB is untouched: its Remove and Add never ask the door here.
+    /// Remove's own gate is the nested `storage.usb.safe_remove`.
+    #[tokio::test]
+    async fn usb_is_not_gated_by_this_door() {
+        let d = Door::new(true);
+        let ctx = door_ctx(&d);
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+        let mut conn = mock_conn().await;
+
+        // rename/repair path: consumer_stop drops the row without
+        // the handover, so the dispatcher sees nothing at all.
+        remove_source_for_consumer(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("usb-audio", true),
+        )
+        .await
+        .unwrap();
+        assert!(ctx.registry.get("usb-audio").await.is_none());
+
+        let usb_add = AddSourcePayload {
+            v: LIBRARY_PAYLOAD_VERSION,
+            display_name: "Stick".to_string(),
+            kind: usb_record("x", "y").kind,
+            mount_path: PathBuf::from("/var/lib/evo/music/USB/stick"),
+            scan_policy: None,
+            probe_cadence_ms: None,
+            cloud_eager_scan_acknowledged: None,
+        };
+        add_source_for_consumer(&ctx, usb_add).await.unwrap();
+
+        assert_eq!(d.asked(), 0, "USB never asks the household door here");
+    }
+
+    /// The background handler is not the consumer entry. A share
+    /// retired by the shares sync is removed at a locked household,
+    /// because no consumer asked for it.
+    #[tokio::test]
+    async fn the_background_handler_is_not_gated() {
+        let d = Door::new(true);
+        let ctx = door_ctx(&d);
+        ctx.registry
+            .register(nas_record("nas-music"))
+            .await
+            .unwrap();
+        let mut conn = mock_conn().await;
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("nas-music", false),
+        )
+        .await
+        .unwrap();
+
+        assert!(ctx.registry.get("nas-music").await.is_none());
+        assert_eq!(d.asked(), 0);
+    }
+
+    /// No dispatcher at admission: the door cannot be asked, so a
+    /// protected change is refused, as a USB remove without a
+    /// dispatcher already is.
+    #[tokio::test]
+    async fn a_door_that_cannot_be_asked_is_not_an_open_one() {
+        let ctx = LibraryContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            SourceRegistry::new(),
+            Arc::new(NullAnn),
+            None,
+        );
+        ctx.registry
+            .register(nas_record("nas-music"))
+            .await
+            .unwrap();
+        let mut conn = mock_conn().await;
+
+        let err = remove_source_for_consumer(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("nas-music", false),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, VerbError::Mpd { .. }), "{err:?}");
+        assert!(ctx.registry.get("nas-music").await.is_some());
+    }
+
+    /// The consumer's verb entry is the gated one, and the shares
+    /// sync is not. A call site that swapped back would reopen
+    /// the hole with every other pin green.
+    #[test]
+    fn the_verb_entry_is_gated_and_the_sync_is_not() {
+        let shelves = include_str!("shelves.rs");
+        assert!(shelves.contains("library::add_source_for_consumer("));
+        assert!(shelves.contains("library::remove_source_for_consumer("));
+        assert!(!shelves.contains("library::handle_add_source("));
+        assert!(!shelves.contains("library::handle_remove_source("));
+        let sync = include_str!("network_shares_sync.rs");
+        assert!(sync.contains("handle_remove_source("));
+        assert!(!sync.contains("_for_consumer"));
     }
 
     #[tokio::test]
