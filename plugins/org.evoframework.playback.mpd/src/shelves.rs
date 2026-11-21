@@ -1657,6 +1657,7 @@ fn library_verb_to_plugin_error(e: library::VerbError) -> PluginError {
         | VerbError::SourceOffline { .. }
         | VerbError::Register { .. }
         | VerbError::SourceOutsideMusicDirectory { .. }
+        | VerbError::UsbClaimInvalid { .. }
         | VerbError::UnknownWork { .. }
         | VerbError::RewritePrefixInvalid
         | VerbError::RewritePrefixUnchanged

@@ -614,6 +614,9 @@ pub(crate) enum VerbError {
     Mpd { verb: String, reason: String },
     #[error("library.add_source: source registration failed: {reason}")]
     Register { reason: String },
+    /// A `local_usb` source whose claim the host does not bear out.
+    #[error("{reason}")]
+    UsbClaimInvalid { reason: String },
     #[error(
         "library.browse_library: source {source_id:?} mount_path {mount_path:?} \
          is not under MPD's music_directory {music_directory:?}; \
@@ -1086,14 +1089,41 @@ async fn require_household_door(
 
 /// `library.add_source` as a consumer reaches it. A source that is
 /// not a USB volume is a share (or a media server), and adding one
-/// is protected by the household door. USB sources arrive from
-/// `storage.usb` and stay as they were.
+/// is protected by the household door.
+///
+/// A USB source is not door-gated: `storage.usb` registers every
+/// stick through this verb as it is plugged in, at any household
+/// level. The request names no caller, so a stick is not trusted on
+/// its say-so either. The claim is checked against the host: a
+/// mount path that is not a mounted block device under the USB
+/// root is refused and nothing is registered
+/// ([`crate::usb_claim`]).
 pub(crate) async fn add_source_for_consumer(
     ctx: &LibraryContext,
     payload: AddSourcePayload,
 ) -> Result<AddSourceResponse, VerbError> {
-    if !matches!(payload.kind, SourceKind::LocalUsb { .. }) {
-        require_household_door(ctx, "add_source").await?;
+    add_source_checked(ctx, payload, &crate::usb_claim::SystemMounts).await
+}
+
+/// [`add_source_for_consumer`] against a given host.
+pub(crate) async fn add_source_checked(
+    ctx: &LibraryContext,
+    payload: AddSourcePayload,
+    host: &dyn crate::usb_claim::HostMounts,
+) -> Result<AddSourceResponse, VerbError> {
+    match &payload.kind {
+        SourceKind::LocalUsb { device_node, .. } => {
+            crate::usb_claim::verify_usb_claim(
+                &ctx.music_directory,
+                &payload.mount_path,
+                device_node,
+                host,
+            )
+            .map_err(|e| VerbError::UsbClaimInvalid {
+                reason: e.to_string(),
+            })?;
+        }
+        _ => require_household_door(ctx, "add_source").await?,
     }
     handle_add_source(ctx, payload).await
 }
@@ -5715,9 +5745,106 @@ mod tests {
             probe_cadence_ms: None,
             cloud_eager_scan_acknowledged: None,
         };
-        add_source_for_consumer(&ctx, usb_add).await.unwrap();
+        add_source_checked(&ctx, usb_add, &StickHost).await.unwrap();
 
         assert_eq!(d.asked(), 0, "USB never asks the household door here");
+    }
+
+    /// A host with one stick mounted where `storage.usb` puts it.
+    struct StickHost;
+
+    impl crate::usb_claim::HostMounts for StickHost {
+        fn mountinfo(&self) -> std::io::Result<String> {
+            Ok("36 25 8:1 / /var/lib/evo/music/USB/stick rw - vfat /dev/sda1 rw\n\
+                40 25 0:40 / /var/lib/evo/music/USB/share rw - cifs //nas/x rw\n"
+                .to_string())
+        }
+        fn canonical(&self, path: &str) -> Option<PathBuf> {
+            match path {
+                "/dev/disk/by-uuid/test" | "/dev/sda1" => {
+                    Some(PathBuf::from("/dev/sda1"))
+                }
+                _ => None,
+            }
+        }
+    }
+
+    fn usb_add_at(path: &str) -> AddSourcePayload {
+        AddSourcePayload {
+            v: LIBRARY_PAYLOAD_VERSION,
+            display_name: "Stick".to_string(),
+            kind: usb_record("x", "y").kind,
+            mount_path: PathBuf::from(path),
+            scan_policy: None,
+            probe_cadence_ms: None,
+            cloud_eager_scan_acknowledged: None,
+        }
+    }
+
+    /// R-066, the operator-visible contract: a consumer cannot
+    /// register an arbitrary path as a USB source, at any household
+    /// level. Nothing is registered, and nothing is probed.
+    #[tokio::test]
+    async fn an_arbitrary_path_is_never_registered_as_usb() {
+        for open_door in [false, true] {
+            let d = Door::new(!open_door);
+            let ctx = door_ctx(&d);
+            for path in [
+                "/etc",
+                "/var/lib/evo/music/INTERNAL",
+                "/var/lib/evo/music/NAS/Music",
+                "/var/lib/evo/music/USB/ghost",
+                "/var/lib/evo/music/USB/share",
+                "/var/lib/evo/music/USB/../NAS/Music",
+            ] {
+                let err =
+                    add_source_checked(&ctx, usb_add_at(path), &StickHost)
+                        .await
+                        .unwrap_err();
+                assert!(
+                    matches!(err, VerbError::UsbClaimInvalid { .. }),
+                    "{path}: {err:?}"
+                );
+            }
+            assert!(
+                ctx.registry.snapshot().await.is_empty(),
+                "nothing registered (door open: {open_door})"
+            );
+        }
+    }
+
+    /// Hotplug must not invert: a stick that is really mounted is
+    /// registered at a locked household, with no door question.
+    #[tokio::test]
+    async fn a_genuine_stick_registers_even_at_a_locked_door() {
+        let d = Door::new(true);
+        let ctx = door_ctx(&d);
+        let res = add_source_checked(
+            &ctx,
+            usb_add_at("/var/lib/evo/music/USB/stick"),
+            &StickHost,
+        )
+        .await;
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(ctx.registry.snapshot().await.len(), 1);
+        assert_eq!(d.asked(), 0);
+    }
+
+    /// The verb entry a consumer reaches checks against the real
+    /// host. In a test there is no such mount, so the claim fails.
+    /// RED if the entry stops checking.
+    #[tokio::test]
+    async fn the_consumer_entry_checks_the_claim_against_the_host() {
+        let d = Door::new(false);
+        let ctx = door_ctx(&d);
+        let err = add_source_for_consumer(
+            &ctx,
+            usb_add_at("/var/lib/evo/music/USB/stick"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, VerbError::UsbClaimInvalid { .. }), "{err:?}");
+        assert!(ctx.registry.snapshot().await.is_empty());
     }
 
     /// The background handler is not the consumer entry. A share

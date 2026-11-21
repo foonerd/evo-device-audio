@@ -144,6 +144,7 @@ mod source_probe;
 mod source_registry;
 mod sticker_reconciler;
 mod suggest;
+mod usb_claim;
 mod works;
 
 #[cfg(test)]
