@@ -510,6 +510,29 @@ fn verb_error_to_plugin_error(e: VerbDispatchError) -> PluginError {
                 ),
             }
         }
+        // Busy: the unmount was refused because something still
+        // holds the mount. Retrying can succeed once the holder
+        // lets go, so the class stays Transient, but the subclass
+        // lets a surface say "in use" instead of a generic
+        // failure, and the message names the holders when the
+        // kernel could. The record is kept (see Remove), so the
+        // operator can retry or use Force.
+        VerbDispatchError::Mount(MountError::Busy { holders, .. }) => {
+            let held = if holders.is_empty() {
+                String::new()
+            } else {
+                format!(" It is held by {}.", holders.join(", "))
+            };
+            PluginError::WithSubclass {
+                class: ErrorClass::Transient,
+                subclass: "share_busy".into(),
+                message: format!(
+                    "network.share unmount refused: the share is in \
+                     use and was not unmounted.{held} Stop what is \
+                     using it and try again, or use Force."
+                ),
+            }
+        }
         VerbDispatchError::Mount(_) => PluginError::Transient(e.to_string()),
         VerbDispatchError::ResponseSerialise { .. } => {
             PluginError::Permanent(e.to_string())
@@ -636,6 +659,46 @@ mod tests {
                     resp.verb_capabilities.get(verb)
                 );
             }
+        }
+    }
+
+    /// A busy unmount is a refusal the operator can act on, not a
+    /// bare transient: it carries its own subclass so a surface can
+    /// say "in use" instead of a generic failure, and the message
+    /// names whatever held the mount.
+    #[test]
+    fn a_busy_unmount_carries_the_share_busy_subclass() {
+        use crate::runtime::{MountError, ShareId};
+        use evo_plugin_sdk::error_taxonomy::ErrorClass;
+        let busy = MountError::Busy {
+            id: ShareId("s1".to_string()),
+            holders: vec!["47479:plugin.bin".to_string()],
+        };
+        match verb_error_to_plugin_error(VerbDispatchError::Mount(busy)) {
+            PluginError::WithSubclass {
+                class,
+                subclass,
+                message,
+            } => {
+                assert_eq!(class, ErrorClass::Transient);
+                assert_eq!(subclass, "share_busy");
+                assert!(message.contains("47479:plugin.bin"), "{message}");
+                assert!(message.contains("in use"), "{message}");
+            }
+            other => panic!("expected WithSubclass, got {other:?}"),
+        }
+        let blind = MountError::Busy {
+            id: ShareId("s1".to_string()),
+            holders: Vec::new(),
+        };
+        match verb_error_to_plugin_error(VerbDispatchError::Mount(blind)) {
+            PluginError::WithSubclass {
+                subclass, message, ..
+            } => {
+                assert_eq!(subclass, "share_busy");
+                assert!(!message.contains("held by"), "{message}");
+            }
+            other => panic!("expected WithSubclass, got {other:?}"),
         }
     }
 }
