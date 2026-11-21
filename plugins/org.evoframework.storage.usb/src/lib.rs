@@ -382,28 +382,32 @@ mod tests {
         // card on USB Remove at the open level. Glass library
         // Remove nests as plugin-system, which holds
         // network_admin. storage_admin is not a granted scope.
+        // Both manifests: the bundle ships manifest.oop.toml.
         use evo_plugin_sdk::manifest::VerbCapability;
-        let m = manifest();
-        let caps = &m
-            .capabilities
-            .respondent
-            .as_ref()
-            .expect("respondent")
-            .verb_capabilities;
-        for verb in [
-            "storage.usb.safe_remove",
-            "storage.usb.mount",
-            "storage.usb.repair_filesystem",
-            "storage.usb.rename",
-        ] {
-            assert!(
-                matches!(
-                    caps.get(verb),
-                    Some(VerbCapability::Write { scope }) if scope == "network_admin"
-                ),
-                "{verb} must stay household-gated: {:?}",
-                caps.get(verb)
-            );
+        let oop = Manifest::from_toml(include_str!("../manifest.oop.toml"))
+            .expect("manifest.oop.toml parses");
+        for m in [manifest(), oop] {
+            let caps = &m
+                .capabilities
+                .respondent
+                .as_ref()
+                .expect("respondent")
+                .verb_capabilities;
+            for verb in [
+                "storage.usb.safe_remove",
+                "storage.usb.mount",
+                "storage.usb.repair_filesystem",
+                "storage.usb.rename",
+            ] {
+                assert!(
+                    matches!(
+                        caps.get(verb),
+                        Some(VerbCapability::Write { scope }) if scope == "network_admin"
+                    ),
+                    "{verb} must stay household-gated: {:?}",
+                    caps.get(verb)
+                );
+            }
         }
     }
 }

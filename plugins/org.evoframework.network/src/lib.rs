@@ -17422,4 +17422,40 @@ exit 0\n",
             "/api/v1/network/captive/session/sid/guest/s/default/"
         );
     }
+
+    #[test]
+    fn the_mutating_verbs_gate_at_write_network_admin_in_both_manifests() {
+        // A step-up declaration would demand a step-up session on
+        // every call and put a password card on these writes at the
+        // open household level. Both manifests: the bundle ships
+        // manifest.oop.toml.
+        use evo_plugin_sdk::manifest::VerbCapability;
+        let oop = Manifest::from_toml(include_str!("../manifest.oop.toml"))
+            .expect("manifest.oop.toml parses");
+        for m in [manifest(), oop] {
+            let resp = m.capabilities.respondent.expect("respondent");
+            for verb in [
+                "network.nm.intent.set",
+                "network.nm.intent.apply",
+                "network.nm.wifi.disconnect",
+                "network.nm.wifi.forget",
+                "network.nm.captive.start",
+                "network.nm.captive.submit",
+                "network.nm.captive.complete",
+                "network.nm.captive.session.start",
+                "network.nm.security.harden",
+                "network.nm.flight_mode.set",
+                "network.nm.radio.set",
+            ] {
+                assert!(
+                    matches!(
+                        resp.verb_capabilities.get(verb),
+                        Some(VerbCapability::Write { scope }) if scope == "network_admin"
+                    ),
+                    "{verb}: {:?}",
+                    resp.verb_capabilities.get(verb)
+                );
+            }
+        }
+    }
 }
