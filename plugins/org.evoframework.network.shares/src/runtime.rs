@@ -3051,6 +3051,16 @@ fn is_busy_stderr(stderr: &str) -> bool {
         || s.contains("device or resource busy")
 }
 
+/// Whether this umount stderr is systemd's opaque job failure.
+///
+/// `systemd-umount` reports the kernel's EBUSY as
+/// `Job failed. See "journalctl -xe" for details.` with no mention
+/// of the cause. On its own that wording proves nothing; callers
+/// pair it with the mount still being present.
+fn is_opaque_job_failure(stderr: &str) -> bool {
+    stderr.to_ascii_lowercase().contains("job failed")
+}
+
 /// Best-effort `fuser -m` enumeration of what holds the mount,
 /// as `"<pid>:<comm>"`.
 ///
@@ -4702,7 +4712,14 @@ impl NetworkSharesRuntime {
             Ok(())
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            if !force && is_busy_stderr(&stderr) {
+            // systemd-umount renders the kernel's EBUSY as an opaque
+            // job failure, so the wording alone cannot say busy. A
+            // job failure with the mount still in place is busy; the
+            // same failure with the mount gone is not.
+            let busy = is_busy_stderr(&stderr)
+                || (is_opaque_job_failure(&stderr)
+                    && (self.mount_point_check)(&record.mount_root));
+            if !force && busy {
                 let probe = Arc::clone(&self.holder_probe);
                 let root = record.mount_root.clone();
                 let holders = tokio::task::spawn_blocking(move || probe(&root))
@@ -7995,6 +8012,65 @@ mount error(13): Permission denied",
             entry.failure_class, None,
             "a share that is still mounted carries no failure class"
         );
+    }
+
+    /// The exact stderr `systemd-umount` returned on .24 for a share a
+    /// reader still held (event `unmount_failed`, 2026-11-21). The
+    /// kernel said EBUSY; systemd rendered it as an opaque job failure.
+    const FIELD_JOB_FAILED: &str =
+        "Job failed. See \"journalctl -xe\" for details.\n";
+
+    #[tokio::test]
+    async fn an_opaque_job_failure_over_a_live_mount_is_busy() {
+        let dir = tempdir();
+        let executor =
+            ScriptedExecutor::new(vec![failure_output(FIELD_JOB_FAILED)]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_200_000))
+            .with_mount_point_check(Arc::new(|_: &Path| true))
+            .build();
+        let record = built_record("job_failed_live", "192.0.2.81");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+        let err = rt.unmount_share(&id).await.unwrap_err();
+        assert!(
+            matches!(err, MountError::Busy { .. }),
+            "systemd's opaque EBUSY over a mount that is still there \
+             is a busy share: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_opaque_job_failure_with_the_mount_gone_is_not_busy() {
+        let dir = tempdir();
+        let executor =
+            ScriptedExecutor::new(vec![failure_output(FIELD_JOB_FAILED)]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_300_000))
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            .build();
+        let record = built_record("job_failed_gone", "192.0.2.82");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+        let err = rt.unmount_share(&id).await.unwrap_err();
+        assert!(
+            matches!(err, MountError::MountFailed { .. }),
+            "nothing is holding a mount that is not there: {err:?}"
+        );
+    }
+
+    #[test]
+    fn is_opaque_job_failure_matches_only_the_systemd_wording() {
+        assert!(is_opaque_job_failure(FIELD_JOB_FAILED));
+        assert!(is_opaque_job_failure("Job failed."));
+        assert!(!is_opaque_job_failure("umount: /mnt: not mounted"));
+        assert!(!is_opaque_job_failure(""));
     }
 
     /// End to end over the argv, not just the decision helper:
