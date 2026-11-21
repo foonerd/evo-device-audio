@@ -52,6 +52,13 @@ pub(crate) const HASH_SIZE: &str = "small";
 const PASS_PAUSE: Duration = Duration::from_millis(20);
 /// Consecutive dispatch failures after which a pass is abandoned.
 const ABORT_AFTER_FAILURES: usize = 5;
+/// Waits before each retry of a pass that did not settle: the
+/// art tier or MPD may simply not be up yet at plugin load.
+pub(crate) const RETRY_SCHEDULE: [Duration; 3] = [
+    Duration::from_secs(15),
+    Duration::from_secs(60),
+    Duration::from_secs(180),
+];
 
 /// One album as the pass sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +168,74 @@ impl ArtworkHashIndex {
     /// per plugin load.
     pub(crate) fn take_first_pass(&self) -> bool {
         !self.verified_this_load.swap(true, Ordering::AcqRel)
+    }
+
+    /// Run a pass and, while it has not settled, run it again.
+    ///
+    /// A pass settles when the album list is non-empty, the art
+    /// tier answered every ask, and the pass was not abandoned.
+    /// Anything else — no list yet, an empty list, an abandoned or
+    /// partly failed pass — is retried after each wait in
+    /// `schedule`, listing the albums afresh through `relist`. The
+    /// first attempt uses `first`, listed by the caller on the scan
+    /// event's own connection.
+    ///
+    /// This exists because the first pass of a plugin load runs
+    /// while MPD's database and the art plugin may still be coming
+    /// up; without a retry a fresh install keeps an empty table
+    /// until the next scan.
+    pub(crate) async fn run_with_retry<L, Fut>(
+        &self,
+        first: Option<Vec<PassAlbum>>,
+        mut relist: L,
+        dispatcher: &dyn ShelfRequestDispatcher,
+        mut ask_all: bool,
+        schedule: &[Duration],
+    ) -> PassReport
+    where
+        L: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Option<Vec<PassAlbum>>>,
+    {
+        let mut albums = first;
+        let mut report = PassReport::default();
+        for attempt in 0..=schedule.len() {
+            if attempt > 0 {
+                tokio::time::sleep(schedule[attempt - 1]).await;
+                albums = relist().await;
+            }
+            match albums.as_deref() {
+                Some(list) if !list.is_empty() => {
+                    report = self.run_pass(list, dispatcher, ask_all).await;
+                    ask_all = false;
+                    if report.abandoned {
+                        tracing::warn!(
+                            attempt,
+                            failed = report.failed,
+                            "artwork hash pass abandoned: the local art tier \
+                             did not answer; will retry"
+                        );
+                    }
+                    if !report.abandoned && report.failed == 0 {
+                        return report;
+                    }
+                }
+                Some(_) => report = PassReport::default(),
+                None => {
+                    tracing::warn!(
+                        attempt,
+                        "artwork hash pass: could not list albums; will retry"
+                    );
+                    report = PassReport::default();
+                }
+            }
+        }
+        if report.abandoned || report.failed > 0 || albums.is_none() {
+            tracing::warn!(
+                "artwork hash pass gave up after its retries; rows without a \
+                 hash fall back to artwork_url until the next scan"
+            );
+        }
+        report
     }
 
     /// Ask the local art tier about every album that needs it.
@@ -505,6 +580,122 @@ mod tests {
             .await;
         let reopened = ArtworkHashIndex::open(path);
         assert_eq!(reopened.hash_for_folder("A/One").as_deref(), Some(H1));
+    }
+
+    const FAST: [Duration; 3] = [
+        Duration::from_millis(5),
+        Duration::from_millis(5),
+        Duration::from_millis(5),
+    ];
+
+    fn nine() -> Vec<PassAlbum> {
+        (0..9).map(|i| album(&format!("A/{i}"), 1)).collect()
+    }
+
+    /// The row's residual. A pass abandoned because the art tier is
+    /// not up yet recovers on its own: no manual scan. RED if the
+    /// retry is removed (the table stays empty).
+    #[tokio::test]
+    async fn an_abandoned_pass_recovers_without_a_scan() {
+        let asks = Arc::new(Mutex::new(0usize));
+        let a2 = Arc::clone(&asks);
+        let art = Art::new(move |_| {
+            let mut n = lock(&a2);
+            *n += 1;
+            if *n <= ABORT_AFTER_FAILURES {
+                down()
+            } else {
+                hit(H1)
+            }
+        });
+        let idx = ArtworkHashIndex::default();
+        let r = idx
+            .run_with_retry(
+                Some(nine()),
+                || async { Some(nine()) },
+                art.as_ref(),
+                true,
+                &FAST,
+            )
+            .await;
+        assert!(!r.abandoned, "the retry settled: {r:?}");
+        for i in 0..9 {
+            assert_eq!(
+                idx.hash_for_folder(&format!("A/{i}")).as_deref(),
+                Some(H1),
+                "album {i} filled"
+            );
+        }
+    }
+
+    /// No album list yet (MPD not ready) is retried and then filled.
+    #[tokio::test]
+    async fn an_empty_first_listing_is_filled_by_a_retry() {
+        let art = Art::new(|_| hit(H1));
+        let idx = ArtworkHashIndex::default();
+        let calls = Arc::new(Mutex::new(0usize));
+        let c2 = Arc::clone(&calls);
+        let r = idx
+            .run_with_retry(
+                Some(Vec::new()),
+                move || {
+                    let c = Arc::clone(&c2);
+                    async move {
+                        *lock(&c) += 1;
+                        Some(nine())
+                    }
+                },
+                art.as_ref(),
+                true,
+                &FAST,
+            )
+            .await;
+        assert_eq!(r.hashed, 9);
+        assert_eq!(*lock(&calls), 1, "one re-listing was enough");
+    }
+
+    /// A pass that settles is not retried.
+    #[tokio::test]
+    async fn a_settled_pass_does_not_retry() {
+        let art = Art::new(|_| hit(H1));
+        let idx = ArtworkHashIndex::default();
+        let relisted = Arc::new(AtomicBool::new(false));
+        let r2 = Arc::clone(&relisted);
+        idx.run_with_retry(
+            Some(nine()),
+            move || {
+                r2.store(true, Ordering::SeqCst);
+                async { Some(nine()) }
+            },
+            art.as_ref(),
+            true,
+            &FAST,
+        )
+        .await;
+        assert!(!relisted.load(Ordering::SeqCst));
+    }
+
+    /// A tier that never answers ends: bounded asks, then give up.
+    #[tokio::test]
+    async fn a_tier_that_never_answers_is_given_up_on() {
+        let art = Art::new(|_| down());
+        let idx = ArtworkHashIndex::default();
+        let r = idx
+            .run_with_retry(
+                Some(nine()),
+                || async { Some(nine()) },
+                art.as_ref(),
+                true,
+                &FAST,
+            )
+            .await;
+        assert!(r.abandoned);
+        assert_eq!(
+            art.count(),
+            ABORT_AFTER_FAILURES * (FAST.len() + 1),
+            "five asks per attempt, four attempts"
+        );
+        assert_eq!(idx.hash_for_folder("A/0"), None);
     }
 
     /// One pass at a time.

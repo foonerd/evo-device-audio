@@ -4171,21 +4171,38 @@ pub(crate) async fn refresh_artwork_hashes(
             return;
         }
     };
-    let albums: Vec<crate::artwork_hash::PassAlbum> = tiles
-        .iter()
-        .map(|t| crate::artwork_hash::PassAlbum {
-            folder: t.canonical_folder.clone(),
-            representative_path: t.representative_track_path.clone(),
-            track_count: t.tracks.len(),
-        })
-        .collect();
+    let albums = pass_albums(&tiles);
     let ask_all = index.take_first_pass();
+    let gate = ctx.scan_gate.clone();
     tokio::spawn(async move {
-        let report =
-            index.run_pass(&albums, dispatcher.as_ref(), ask_all).await;
+        let listed = albums.len();
+        let report = index
+            .run_with_retry(
+                Some(albums),
+                || {
+                    let gate = gate.clone();
+                    async move {
+                        let (endpoint, timeouts) = gate.mpd()?;
+                        let mut conn =
+                            crate::mpd::MpdConnection::connect_with_timeouts(
+                                endpoint, timeouts,
+                            )
+                            .await
+                            .ok()?;
+                        resolve_album_tiles(&mut conn, "artwork_hash_pass")
+                            .await
+                            .ok()
+                            .map(|t| pass_albums(&t))
+                    }
+                },
+                dispatcher.as_ref(),
+                ask_all,
+                &crate::artwork_hash::RETRY_SCHEDULE,
+            )
+            .await;
         tracing::info!(
             plugin = PLUGIN_NAME,
-            albums = albums.len(),
+            albums = listed,
             asked = report.asked,
             hashed = report.hashed,
             no_local_art = report.no_art,
@@ -4195,6 +4212,18 @@ pub(crate) async fn refresh_artwork_hashes(
         );
         index.finish_pass();
     });
+}
+
+/// The albums a hash pass asks about, from the facet tiles.
+fn pass_albums(tiles: &[AlbumTile]) -> Vec<crate::artwork_hash::PassAlbum> {
+    tiles
+        .iter()
+        .map(|t| crate::artwork_hash::PassAlbum {
+            folder: t.canonical_folder.clone(),
+            representative_path: t.representative_track_path.clone(),
+            track_count: t.tracks.len(),
+        })
+        .collect()
 }
 
 /// Walk MPD's full database via `listallinfo` and compute the
