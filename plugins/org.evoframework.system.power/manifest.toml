@@ -49,10 +49,12 @@ request_types = ["reboot_device", "power_off_device"]
 response_budget_ms = 5000
 
 [capabilities.respondent.verb_capabilities]
-# Both verbs are step-up gated against the system_admin scope. The framework
-# dispatcher consults this map BEFORE forwarding the request to the plugin's
-# handle_request; a principal without the scope or without an active step-up
-# session refuses at the dispatch boundary with `permission_denied` and the
-# plugin never sees the call.
-reboot_device = { kind = "step_up", scope = "system_admin" }
-power_off_device = { kind = "step_up", scope = "system_admin" }
+# Both verbs gate at write:system_admin. The framework dispatcher consults
+# this map BEFORE forwarding the request to the plugin's handle_request; a
+# principal without the scope refuses at the dispatch boundary with
+# `permission_denied` and the plugin never sees the call. A pair or kiosk
+# bearer holds the scope, and so does a LAN caller without a bearer while the
+# household policy polices the LAN. While the household policy protects
+# system_admin, each verb needs the owner's step-up session on the call.
+reboot_device = { kind = "write", scope = "system_admin" }
+power_off_device = { kind = "write", scope = "system_admin" }

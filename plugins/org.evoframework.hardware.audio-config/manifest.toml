@@ -85,16 +85,16 @@ response_budget_ms = 3000
 # `dsp.list_controls`, `dsp.get_control`, `modder.list_overlays`)
 # remain unmapped and default to anonymous-OK per the framework's
 # backwards-compatible default. The mutating verbs all gate on
-# `step_up:audio_admin` — the operator must hold an active step-up
-# auth session on the audio_admin scope before any DAC selection,
-# overlay register, or DSP mutation reaches the plugin. The OS-
+# `write:audio_admin` — the principal must hold the audio_admin
+# scope before any DAC selection, overlay register, or DSP
+# mutation reaches the plugin. The OS-
 # layer enforcement (the sudoers Cmnd_Aliases `EVO_HARDWARE_AUDIO_*`
 # + the `hardware-audio-privileges.conf` systemd drop-in widening
 # `ReadWritePaths`) continues to be the LAST line of defence; the
 # framework's per-verb capability gate is the FIRST.
 [capabilities.respondent.verb_capabilities]
-"hardware.audio.select_dac" = { kind = "step_up", scope = "audio_admin" }
-"hardware.audio.clear_dac" = { kind = "step_up", scope = "audio_admin" }
-"hardware.audio.dsp.set_control" = { kind = "step_up", scope = "audio_admin" }
-"hardware.audio.modder.register_overlay" = { kind = "step_up", scope = "audio_admin" }
-"hardware.audio.modder.remove_overlay" = { kind = "step_up", scope = "audio_admin" }
+"hardware.audio.select_dac" = { kind = "write", scope = "audio_admin" }
+"hardware.audio.clear_dac" = { kind = "write", scope = "audio_admin" }
+"hardware.audio.dsp.set_control" = { kind = "write", scope = "audio_admin" }
+"hardware.audio.modder.register_overlay" = { kind = "write", scope = "audio_admin" }
+"hardware.audio.modder.remove_overlay" = { kind = "write", scope = "audio_admin" }

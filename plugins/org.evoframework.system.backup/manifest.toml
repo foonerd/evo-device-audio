@@ -46,7 +46,9 @@ request_types = ["export_backup", "import_backup"]
 response_budget_ms = 180000
 
 [capabilities.respondent.verb_capabilities]
-# Step-up gated like system.power's reboot_device: a backup carries
-# the device's configuration, and an import rewrites it.
-export_backup = { kind = "step_up", scope = "system_admin" }
-import_backup = { kind = "step_up", scope = "system_admin" }
+# Gated like system.power's reboot_device, at write:system_admin: a
+# backup carries the device's configuration, and an import rewrites
+# it. While the household policy protects system_admin, each verb
+# needs the owner's step-up session on the call.
+export_backup = { kind = "write", scope = "system_admin" }
+import_backup = { kind = "write", scope = "system_admin" }

@@ -40,5 +40,5 @@ request_types = ["reboot_device", "power_off_device"]
 response_budget_ms = 5000
 
 [capabilities.respondent.verb_capabilities]
-reboot_device = { kind = "step_up", scope = "system_admin" }
-power_off_device = { kind = "step_up", scope = "system_admin" }
+reboot_device = { kind = "write", scope = "system_admin" }
+power_off_device = { kind = "write", scope = "system_admin" }

@@ -3,7 +3,7 @@
 //! # org-evoframework-system-backup
 //!
 //! Stocks the `system.backup` shelf with two operator gestures,
-//! both step-up gated at `system_admin`.
+//! both gated at `write:system_admin`.
 //!
 //! - `export_backup { v: 1 }` answers `{ v: 1, backup: { v: 1,
 //!   config, playlists, settings } }`:

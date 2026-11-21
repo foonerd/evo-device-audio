@@ -386,7 +386,7 @@ const READS: &[&str] = &[
 // ----- manifest / surface -----
 
 #[test]
-fn both_manifests_stock_system_backup_with_two_step_up_verbs() {
+fn both_manifests_stock_system_backup_with_two_system_admin_writes() {
     let oop = Manifest::from_toml(include_str!("../manifest.oop.toml"))
         .expect("manifest.oop.toml parses");
     for m in [manifest(), oop] {
@@ -397,13 +397,13 @@ fn both_manifests_stock_system_backup_with_two_step_up_verbs() {
         assert_eq!(resp.request_types, vec![VERB_EXPORT, VERB_IMPORT]);
         for verb in [VERB_EXPORT, VERB_IMPORT] {
             match resp.verb_capabilities.get(verb) {
-                Some(evo_plugin_sdk::manifest::VerbCapability::StepUp {
+                Some(evo_plugin_sdk::manifest::VerbCapability::Write {
                     scope,
                 }) => {
                     assert_eq!(scope, "system_admin")
                 }
                 other => {
-                    panic!("{verb} must be step_up/system_admin, got {other:?}")
+                    panic!("{verb} must be write/system_admin, got {other:?}")
                 }
             }
         }

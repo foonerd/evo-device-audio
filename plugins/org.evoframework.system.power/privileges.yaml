@@ -7,7 +7,7 @@ has_os_dependencies: true
 # Framework-reserved power management plugin. Stocks the
 # `system.power` shelf with two operator-gestured verbs
 # (reboot_device + power_off_device) both gated by the framework
-# dispatcher's per-verb capability gate (step_up:system_admin).
+# dispatcher's per-verb capability gate (write:system_admin).
 # The runtime invokes `systemctl reboot` / `systemctl poweroff`
 # via a narrow NOPASSWD sudoers drop-in
 # (`dist/sudoers.d/evo-system-power`). systemctl is a client that
@@ -27,7 +27,7 @@ has_os_dependencies: true
 
 capability_intent:
   - id: systemctl_reboot_invocation
-    need: invoke `sudo /usr/bin/systemctl reboot` to request an orderly host reboot from systemd PID 1. The verb is operator-gestured; the framework dispatcher's per-verb capability gate verifies the principal holds step_up:system_admin before the request reaches the plugin. The plugin's invocation is structurally narrow — exactly the one binary, exactly that one argument — surfaced as the `EVO_SYSTEM_POWER_REBOOT` sudoers Cmnd_Alias in `dist/sudoers.d/evo-system-power`.
+    need: invoke `sudo /usr/bin/systemctl reboot` to request an orderly host reboot from systemd PID 1. The verb is operator-gestured; the framework dispatcher's per-verb capability gate verifies the principal holds write:system_admin before the request reaches the plugin. The plugin's invocation is structurally narrow — exactly the one binary, exactly that one argument — surfaced as the `EVO_SYSTEM_POWER_REBOOT` sudoers Cmnd_Alias in `dist/sudoers.d/evo-system-power`.
     access_path: sudoers/command
     failure_mode: every reboot_device call responds with PluginError::Transient carrying the underlying sudo / systemctl stderr; the steward keeps running; the operator sees the structured error.
   - id: systemctl_poweroff_invocation

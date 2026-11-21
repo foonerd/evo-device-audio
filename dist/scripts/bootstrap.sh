@@ -579,7 +579,7 @@ fi
 # ----------------------------------------------------------
 # Path-scoped grant for the org.evoframework.system.power plugin's
 # `reboot_device` + `power_off_device` verbs. The framework
-# dispatcher's per-verb capability gate (step_up:system_admin)
+# dispatcher's per-verb capability gate (write:system_admin)
 # is the FIRST line of defence — the sudoers grant is the LAST.
 # Both Cmnd_Aliases are exact-match (one binary, one argv element
 # each); there is no broad sudo grant on this surface.

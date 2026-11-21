@@ -40,5 +40,5 @@ request_types = ["export_backup", "import_backup"]
 response_budget_ms = 180000
 
 [capabilities.respondent.verb_capabilities]
-export_backup = { kind = "step_up", scope = "system_admin" }
-import_backup = { kind = "step_up", scope = "system_admin" }
+export_backup = { kind = "write", scope = "system_admin" }
+import_backup = { kind = "write", scope = "system_admin" }

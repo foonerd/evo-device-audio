@@ -54,5 +54,5 @@ response_budget_ms = 5000
 "system.notifications.list_active" = { kind = "none" }
 "system.notifications.send" = { kind = "none" }
 "system.notifications.cancel" = { kind = "none" }
-"system.notifications.set_base_mode" = { kind = "step_up", scope = "system_admin" }
-"system.notifications.set_quiet_hours" = { kind = "step_up", scope = "system_admin" }
+"system.notifications.set_base_mode" = { kind = "write", scope = "system_admin" }
+"system.notifications.set_quiet_hours" = { kind = "write", scope = "system_admin" }

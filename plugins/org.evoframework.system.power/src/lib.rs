@@ -11,10 +11,10 @@
 //!   `sudo /usr/bin/systemctl poweroff`.
 //!
 //! Both verbs are gated at the framework dispatcher's per-verb
-//! capability gate (step_up:system_admin) — the principal must
-//! hold the system_admin write scope AND an active step-up auth
-//! session before the request reaches this plugin's
-//! `handle_request`. A request that does not satisfy the gate
+//! capability gate (write:system_admin) — the principal must
+//! hold the system_admin scope, and, while the household policy
+//! protects it, the owner's step-up session on the call, before
+//! the request reaches this plugin's `handle_request`. A request that does not satisfy the gate
 //! refuses with `permission_denied` at the dispatcher boundary
 //! and this plugin never sees the call. The plugin does NOT
 //! re-check the principal; the framework's gate is the
@@ -312,32 +312,41 @@ mod tests {
 
     #[test]
     fn manifest_declares_verb_capabilities_for_both_verbs() {
-        let m = manifest();
-        let resp = m
-            .capabilities
-            .respondent
-            .as_ref()
-            .expect("respondent capabilities present");
-        assert_eq!(resp.request_types.len(), 2);
-        assert!(resp.request_types.iter().any(|s| s == VERB_REBOOT_DEVICE));
-        assert!(resp
-            .request_types
-            .iter()
-            .any(|s| s == VERB_POWER_OFF_DEVICE));
-        // Both verbs MUST declare step_up:system_admin so the
-        // framework dispatcher gates them before the request
-        // reaches the plugin.
-        for verb in [VERB_REBOOT_DEVICE, VERB_POWER_OFF_DEVICE] {
-            let cap = resp.verb_capabilities.get(verb).unwrap_or_else(|| {
-                panic!("manifest must declare verb_capabilities[{verb:?}]")
-            });
-            match cap {
-                evo_plugin_sdk::manifest::VerbCapability::StepUp { scope } => {
-                    assert_eq!(scope, "system_admin");
+        // Both manifests: the bundle ships manifest.oop.toml.
+        let oop = Manifest::from_toml(include_str!("../manifest.oop.toml"))
+            .expect("manifest.oop.toml parses");
+        for m in [manifest(), oop] {
+            let resp = m
+                .capabilities
+                .respondent
+                .as_ref()
+                .expect("respondent capabilities present");
+            assert_eq!(resp.request_types.len(), 2);
+            assert!(resp.request_types.iter().any(|s| s == VERB_REBOOT_DEVICE));
+            assert!(resp
+                .request_types
+                .iter()
+                .any(|s| s == VERB_POWER_OFF_DEVICE));
+            // Both verbs MUST declare write:system_admin so the
+            // framework dispatcher gates them before the request
+            // reaches the plugin. A step-up declaration would demand
+            // a step-up session on every call and put a password card
+            // on Reboot at the open household level.
+            for verb in [VERB_REBOOT_DEVICE, VERB_POWER_OFF_DEVICE] {
+                let cap =
+                    resp.verb_capabilities.get(verb).unwrap_or_else(|| {
+                        panic!(
+                            "manifest must declare verb_capabilities[{verb:?}]"
+                        )
+                    });
+                match cap {
+                    evo_plugin_sdk::manifest::VerbCapability::Write { scope } => {
+                        assert_eq!(scope, "system_admin");
+                    }
+                    other => panic!(
+                        "verb_capabilities[{verb:?}] must be Write; got {other:?}"
+                    ),
                 }
-                other => panic!(
-                    "verb_capabilities[{verb:?}] must be StepUp; got {other:?}"
-                ),
             }
         }
     }
