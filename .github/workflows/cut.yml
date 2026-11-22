@@ -1,12 +1,18 @@
-# cut(V) — public pieces → wait → bake → channel promote.
+# cut(V) — sibling GitHub Releases → pieces → wait → bake →
+# channel promote.
 #
-# Through-and-through = pieces + bake + channel pointers on
-# artefacts. Bake alone is not a cut (2026-11-22 FAIL).
+# Through-and-through (2026-11-22 FAIL list — all required):
+#   1. GitHub Release vV on every public sibling (audio, ui,
+#      kiosk, core, schemas) — tag alone is not a release
+#   2. piece slots minted
+#   3. artefacts distribution Release baked
+#   4. channel pointers (__cut__) on artefacts
+# Bake / tag-only / artefacts-only is not a cut.
 # Latest stays untouched unless mark_latest=true (owner accept).
 #
-# Mints use EVO_RELEASE_TOKEN (Actions: write on evo-device-audio +
-# evo-ui). Artefacts push stays on ARTEFACTS_PUSH_TOKEN. Same-repo
-# bake uses github.token. No workstation mint path.
+# Mints + sibling releases use EVO_RELEASE_TOKEN (Actions write +
+# Contents write on those repos). Artefacts push stays on
+# ARTEFACTS_PUSH_TOKEN. Same-repo bake uses github.token.
 name: cut
 
 "on":
@@ -72,7 +78,7 @@ jobs:
             echo "::error::EVO_RELEASE_TOKEN is empty"
             exit 1
           fi
-          for repo in foonerd/evo-device-audio foonerd/evo-ui foonerd/evo-kiosk foonerd/evo-core; do
+          for repo in foonerd/evo-device-audio foonerd/evo-ui foonerd/evo-kiosk foonerd/evo-core foonerd/evo-catalogue-schemas; do
             if ! gh api "repos/${repo}/git/refs/tags/${TAG}" >/dev/null 2>&1; then
               echo "::error::public ${repo} has no tag ${TAG}; promote first"
               exit 1
@@ -80,8 +86,36 @@ jobs:
             echo "OK public ${repo} tag ${TAG}"
           done
 
-  mint-pieces:
+  sibling-releases:
     needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish GitHub Release on every public sibling
+        env:
+          GH_TOKEN: ${{ secrets.EVO_RELEASE_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::EVO_RELEASE_TOKEN is empty — cannot create sibling Releases"
+            exit 1
+          fi
+          # Tag alone is not a cut. Teams look at /releases.
+          for repo in foonerd/evo-device-audio foonerd/evo-ui foonerd/evo-kiosk foonerd/evo-core foonerd/evo-catalogue-schemas; do
+            if gh release view "${TAG}" --repo "${repo}" >/dev/null 2>&1; then
+              echo "OK ${repo} Release ${TAG} exists"
+              continue
+            fi
+            gh release create "${TAG}" \
+              --repo "${repo}" \
+              --title "${TAG}" \
+              --notes "Public cut ${TAG}." \
+              --latest=false
+            echo "CREATED ${repo} Release ${TAG}"
+          done
+
+  mint-pieces:
+    needs: [validate, sibling-releases]
     runs-on: ubuntu-latest
     steps:
       - name: Mint audio + kiosk + evo-ui pieces
@@ -279,17 +313,23 @@ jobs:
           echo "Latest -> ${TAG}"
 
   cut-complete:
-    needs: [validate, bake, promote-channel, mark-latest]
-    if: ${{ always() && needs.bake.result == 'success' && needs.promote-channel.result == 'success' && (needs.mark-latest.result == 'success' || needs.mark-latest.result == 'skipped') }}
+    needs: [validate, sibling-releases, bake, promote-channel, mark-latest]
+    if: ${{ always() && needs.sibling-releases.result == 'success' && needs.bake.result == 'success' && needs.promote-channel.result == 'success' && (needs.mark-latest.result == 'success' || needs.mark-latest.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - name: Through-and-through
         env:
+          GH_TOKEN: ${{ secrets.EVO_RELEASE_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
           CUT_V: ${{ needs.validate.outputs.cut_v }}
           CHANNEL: ${{ inputs.channel }}
           MARK: ${{ inputs.mark_latest }}
         run: |
           set -euo pipefail
+          for repo in foonerd/evo-device-audio foonerd/evo-ui foonerd/evo-kiosk foonerd/evo-core foonerd/evo-catalogue-schemas; do
+            url="$(gh release view "${TAG}" --repo "${repo}" --json url --jq .url)"
+            echo "OK ${url}"
+          done
           echo "cut(${CUT_V}) through-and-through PASS"
           echo "channel=${CHANNEL}"
           echo "mark_latest=${MARK}"
