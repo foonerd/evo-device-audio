@@ -7,16 +7,30 @@
 This document covers two distinct kinds of credential material:
 
 1. **Commons signing key.** Ed25519 keypair. The **public half** is committed in this repo at [`keys/commons-plugin-signing-public.pem`](keys/commons-plugin-signing-public.pem) and is read by every consumer that verifies plugins published from this commons. The **private half** lives only in the GitHub Actions repository secret `PLUGIN_SIGNING_KEY_PEM` and never leaves the runner.
-2. **Artefacts-push token.** Fine-grained GitHub Personal Access Token. Stored as the repository secret `ARTEFACTS_PUSH_TOKEN`. Used by `publish-pieces.yml`, `publish-distribution-bundle.yml`, and `promote.yml` to push signed bytes and create GitHub Releases on [evo-device-audio-artefacts](https://github.com/foonerd/evo-device-audio-artefacts). The first-boot tarball is a Release asset (git cannot hold files over 100 MB); piece slots stay under that limit and remain git blobs.
+2. **Artefacts-push token.** Fine-grained GitHub Personal Access Token. Stored as the repository secret `ARTEFACTS_PUSH_TOKEN`. Used by `publish-pieces.yml`, `publish-distribution-bundle.yml`, and `promote.yml` to push signed bytes and create GitHub Releases on [evo-device-audio-artefacts](https://github.com/foonerd/evo-device-audio-artefacts), and to checkout [evo-kiosk-eng](https://github.com/foonerd/evo-kiosk-eng) for the kiosk mint (public `evo-kiosk` scrub drops `cross-build.sh`). The first-boot tarball is a Release asset (git cannot hold files over 100 MB); piece slots stay under that limit and remain git blobs.
 
-Both secrets are kept distinct (compromising one does not compromise the other; defence in depth) and rotated independently.
+Three secrets are kept distinct (compromising one does not compromise the others; defence in depth) and rotated independently.
 
 ## Inventory
 
 | Secret name | Type | Purpose | Used by | Rotation cadence |
 |-------------|------|---------|---------|------------------|
 | `PLUGIN_SIGNING_KEY_PEM` | Ed25519 PKCS#8 PEM (private key) | Signs the audio steward, plugin bundles, channel-pointer files, and the distribution-bundle pointer under the `org.evoframework.*` namespace | `secret-smoke.yml`, `publish-pieces.yml`, `publish-distribution-bundle.yml`, `promote.yml` | 12 months, or on suspected compromise |
-| `ARTEFACTS_PUSH_TOKEN` | Fine-grained GitHub PAT | Cross-repo write to `evo-device-audio-artefacts` (git push of piece slots and distribution pointers; `gh release create` for the first-boot tarball) | `publish-pieces.yml`, `publish-distribution-bundle.yml`, `promote.yml` | 90 days (one calendar quarter) |
+| `ARTEFACTS_PUSH_TOKEN` | Fine-grained GitHub PAT | Write `evo-device-audio-artefacts` + read/checkout **`foonerd/evo-kiosk-eng`** (kiosk mint). Stock the same secret on audio, ui, kiosk, device-volumio, device-boot. | `publish-pieces.yml` (incl. scope=kiosk), `publish-distribution-bundle.yml`, `promote.yml` | 90 days (one calendar quarter) |
+| `EVO_RELEASE_TOKEN` | Fine-grained GitHub PAT | `workflow_dispatch` of piece mints from `cut.yml` (audio + evo-ui) and sibling tag checks | `cut.yml` mint + validate | 90 days (one calendar quarter) |
+
+### `EVO_RELEASE_TOKEN` permissions (required)
+
+Repos: `foonerd/evo-device-audio`, `foonerd/evo-ui`, `foonerd/evo-kiosk`, `foonerd/evo-core`, `foonerd/evo-catalogue-schemas`.
+
+| Permission | Access | Why |
+|------------|--------|-----|
+| **Actions** | **Read and write** | `gh workflow run` / workflow_dispatch. **Not** the Workflows permission — Workflows only edits YAML. |
+| **Contents** | **Read and write** | Resolve tags **and** `gh release create` on every sibling. Read-only leaves tag-only cuts (2026-11-22 FAIL). |
+| **Metadata** | Read-only | Automatic dependency. |
+| **Workflows** | No access | Not required for dispatch. |
+
+Do **not** widen `ARTEFACTS_PUSH_TOKEN` for this.
 
 Public key fingerprint for the current commons signing key (SHA256 of the DER-encoded SubjectPublicKeyInfo): `9cd7d7381ee7c2b3bfa490b39077afdc925192299dda661ef94dddba71e574da`.
 
@@ -116,12 +130,12 @@ If the private key has leaked or is suspected to have leaked:
    - **Description**: `Cross-repo write from evo-device-audio CI to evo-device-audio-artefacts. Used by promote.yml, publish-pieces.yml, and publish-distribution-bundle.yml (git pointers + GitHub Release assets for the first-boot tarball). Stored as repo secret ARTEFACTS_PUSH_TOKEN. Rotated quarterly per project policy.`
    - **Expiration**: 90 days.
    - **Resource owner**: `foonerd`.
-   - **Repository access**: **Only select repositories** → `foonerd/evo-device-audio-artefacts`. **Do not select any other repository.**
+   - **Repository access**: **Only select repositories** → `foonerd/evo-device-audio-artefacts` **and** `foonerd/evo-kiosk-eng`. Omitting kiosk-eng makes scope=kiosk checkout 403.
 4. Scroll to **Permissions**. Three groups will be visible:
 
 | Group | Action |
 |-------|--------|
-| **Repository permissions** (the only group we touch) | Set **Contents = Read and write**. That covers git push *and* `gh release create` / `gh release upload` (the first-boot tarball). **Metadata = Read-only** is automatically enforced as a dependency once any Repository permission is set. Every other entry in this group (Actions, Administration, Code scanning alerts, Commit statuses, Custom properties, Dependabot ..., Deployments, Discussions, Environments, Issues, Merge queues, Pages, Pull requests, Secret scanning, Secrets, Variables, Webhooks, Workflows, etc.) stays at **No access**. |
+| **Repository permissions** (the only group we touch) | Set **Contents = Read and write**. That covers artefacts git push + `gh release create` / upload, and checkout of `evo-kiosk-eng` for the kiosk mint. **Metadata = Read-only** is automatic. Every other entry in this group stays at **No access**. |
 | **Account permissions** | Every entry stays at **No access**. |
 | **Organization permissions** (only shown if the resource owner is an organisation; not shown for personal accounts) | If shown: every entry stays at **No access**. |
 
