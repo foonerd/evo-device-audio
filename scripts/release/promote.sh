@@ -108,6 +108,9 @@ ALLOW_RETAG=0
 ALLOW_STALE_ENG_TAG=0
 PUBLIC_TAG_EXISTS=0
 
+# Staging cargo gates use the public CI MSRV, not the host default.
+TOOLCHAIN="${CARGO_TOOLCHAIN:-1.85}"
+
 print_usage() {
     sed -n '2,/^# Refuses/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
@@ -567,22 +570,22 @@ log_step "Step 4/8: Running leak-grep on staging tree"
 # 5. fmt + clippy + test on staging tree
 # -------------------------------------------------------------
 
-log_step "Step 5/8: Running cargo fmt --check on staging tree"
+log_step "Step 5/8: Running cargo +${TOOLCHAIN} fmt --check on staging tree"
 (
     cd "${STAGE_DIR}"
-    cargo fmt --all -- --check
+    cargo "+${TOOLCHAIN}" fmt --all -- --check
 )
 
-log_step "Step 6/8: Running cargo clippy on staging tree"
+log_step "Step 6/8: Running cargo +${TOOLCHAIN} clippy on staging tree"
 (
     cd "${STAGE_DIR}"
-    cargo clippy --workspace --all-targets --locked -- -D warnings
+    cargo "+${TOOLCHAIN}" clippy --workspace --all-targets --locked -- -D warnings
 )
 
-log_step "Step 7/8: Running cargo test --workspace --lib on staging tree"
+log_step "Step 7/8: Running cargo +${TOOLCHAIN} test --workspace --lib on staging tree"
 (
     cd "${STAGE_DIR}"
-    cargo test --workspace --lib --locked
+    cargo "+${TOOLCHAIN}" test --workspace --lib --locked
 )
 
 # -------------------------------------------------------------
