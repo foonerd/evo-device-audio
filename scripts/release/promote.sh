@@ -426,7 +426,8 @@ log_step "Staging tempdir: ${STAGE_DIR}"
 
 log_step "Step 1/8: Extracting ${TAG} into staging via git archive"
 
-git archive --format=tar "${TAG}" | tar -xf - -C "${STAGE_DIR}"
+# Prefer refs/tags/ when branch and tag share the cut name.
+git archive --format=tar "refs/tags/${TAG}" | tar -xf - -C "${STAGE_DIR}"
 
 if [[ ! -f "${STAGE_DIR}/Cargo.toml" ]]; then
     log_error "staging tree missing Cargo.toml — archive extraction failed"
