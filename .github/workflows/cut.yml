@@ -117,7 +117,7 @@ jobs:
             --json databaseId --jq '.[0].databaseId // empty')"
           gh workflow run publish-pieces.yml \
             --repo foonerd/evo-device-audio --ref "${tag_ref}" \
-            -f scope=kiosk -f "kiosk_ref=${TAG}"
+            -f scope=kiosk -f "kiosk_ref=${tag_ref}"
           watch_new_run foonerd/evo-device-audio publish-pieces.yml \
             "audio pieces kiosk" "${before}"
 

@@ -409,14 +409,29 @@ jobs:
       - name: Check out audio
         uses: actions/checkout@v5
 
-      - name: Check out public evo-kiosk
+      # Public evo-kiosk scrub drops scripts/release/cross-build.sh;
+      # mint-kiosk-piece.sh needs it. Build from eng with the same
+      # ARTEFACTS_PUSH_TOKEN that already reads kiosk-eng (slot key
+      # stays CUT_VERSION from audio).
+      - name: Require ARTEFACTS_PUSH_TOKEN
+        env:
+          TOKEN: ${{ secrets.ARTEFACTS_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TOKEN" ]; then
+            echo "::error::ARTEFACTS_PUSH_TOKEN is empty — scope=kiosk reads foonerd/evo-kiosk-eng"
+            exit 1
+          fi
+
+      - name: Check out evo-kiosk-eng
         uses: actions/checkout@v5
         with:
-          repository: foonerd/evo-kiosk
-          # cut(V): mint from this cut's public tag. cut.yml passes
-          # kiosk_ref; hand dispatch falls back to the workflow ref.
+          repository: foonerd/evo-kiosk-eng
+          # Prefer refs/tags/ when cut.yml passes the cut tag — a
+          # same-named branch must not win.
           ref: ${{ inputs.kiosk_ref != '' && inputs.kiosk_ref || github.ref_name }}
-          path: evo-kiosk
+          token: ${{ secrets.ARTEFACTS_PUSH_TOKEN }}
+          path: evo-kiosk-eng
 
       - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
         uses: dtolnay/rust-toolchain@master
@@ -454,7 +469,7 @@ jobs:
           esac
           mkdir -p "/tmp/stage/bundles/evo-kiosk/${VERSION}"
           bash scripts/release/mint-kiosk-piece.sh \
-            --kiosk-src "${GITHUB_WORKSPACE}/evo-kiosk" \
+            --kiosk-src "${GITHUB_WORKSPACE}/evo-kiosk-eng" \
             --out-dir "/tmp/stage/bundles/evo-kiosk/${VERSION}" \
             --version "$VERSION"
           shred -u /tmp/key.pem
