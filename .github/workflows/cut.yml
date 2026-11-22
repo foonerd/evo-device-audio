@@ -1,17 +1,30 @@
-# cut(V) — public pieces → wait → bake.
+# cut(V) — public pieces → wait → bake → channel promote.
 #
-# Dispatched with tag only. Mints use EVO_RELEASE_TOKEN (Actions: write
-# on evo-device-audio + evo-ui). Artefacts push stays on ARTEFACTS_PUSH_TOKEN.
-# Same-repo bake uses github.token. No workstation mint path.
+# Through-and-through = pieces + bake + channel pointers on
+# artefacts. Bake alone is not a cut (2026-11-22 FAIL).
+# Latest stays untouched unless mark_latest=true (owner accept).
+#
+# Mints use EVO_RELEASE_TOKEN (Actions: write on evo-device-audio +
+# evo-ui). Artefacts push stays on ARTEFACTS_PUSH_TOKEN. Same-repo
+# bake uses github.token. No workstation mint path.
 name: cut
 
 "on":
   workflow_dispatch:
     inputs:
       tag:
-        description: "Public cut tag (vMAJOR.MINOR.PATCH.CUT). Only input."
+        description: "Public cut tag (vMAJOR.MINOR.PATCH.CUT)"
         type: string
         required: true
+      channel:
+        description: "Channel that must point at this cut when cut.yml finishes"
+        type: choice
+        options: [dev, test, prod]
+        default: test
+      mark_latest:
+        description: "Mark artefacts Release as GitHub Latest (installer default). Owner accept only."
+        type: boolean
+        default: false
 
 concurrency:
   group: cut-${{ inputs.tag }}
@@ -197,4 +210,87 @@ jobs:
           fi
           echo "watching bake run ${run_id}"
           gh run watch "${run_id}" --repo foonerd/evo-device-audio --exit-status
-          echo "cut(${{ needs.validate.outputs.cut_v }}) bake PASS — Latest untouched"
+          echo "cut(${{ needs.validate.outputs.cut_v }}) bake PASS"
+
+  promote-channel:
+    needs: [validate, bake]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Point channel at this cut (steward + all OOP plugins)
+        env:
+          GH_TOKEN: ${{ secrets.EVO_RELEASE_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          CUT_V: ${{ needs.validate.outputs.cut_v }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::EVO_RELEASE_TOKEN is empty — cannot promote channel"
+            exit 1
+          fi
+          before="$(gh run list --repo foonerd/evo-device-audio \
+            --workflow=promote.yml --limit 1 \
+            --json databaseId --jq '.[0].databaseId // empty')"
+          # Workflow YAML lives on main. The cut tag is product
+          # bytes, not the promote definition.
+          gh workflow run promote.yml \
+            --repo foonerd/evo-device-audio \
+            --ref main \
+            -f piece=__cut__ \
+            -f "version=${CUT_V}" \
+            -f "channel=${CHANNEL}"
+          run_id=""
+          for _ in $(seq 1 45); do
+            sleep 4
+            cand="$(gh run list --repo foonerd/evo-device-audio \
+              --workflow=promote.yml --limit 1 \
+              --json databaseId --jq '.[0].databaseId')"
+            if [ -n "${cand}" ] && [ "${cand}" != "${before}" ]; then
+              run_id="${cand}"
+              break
+            fi
+          done
+          if [ -z "${run_id}" ]; then
+            echo "::error::no promote run for channel ${CHANNEL}"
+            exit 1
+          fi
+          echo "watching promote run ${run_id}"
+          gh run watch "${run_id}" --repo foonerd/evo-device-audio --exit-status
+          echo "cut(${CUT_V}) channel ${CHANNEL} PASS"
+
+  mark-latest:
+    needs: [validate, bake, promote-channel]
+    if: ${{ inputs.mark_latest }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark artefacts Release Latest
+        env:
+          GH_TOKEN: ${{ secrets.ARTEFACTS_PUSH_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::ARTEFACTS_PUSH_TOKEN is empty"
+            exit 1
+          fi
+          gh release edit "${TAG}" \
+            --repo foonerd/evo-device-audio-artefacts \
+            --latest
+          echo "Latest -> ${TAG}"
+
+  cut-complete:
+    needs: [validate, bake, promote-channel, mark-latest]
+    if: ${{ always() && needs.bake.result == 'success' && needs.promote-channel.result == 'success' && (needs.mark-latest.result == 'success' || needs.mark-latest.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Through-and-through
+        env:
+          CUT_V: ${{ needs.validate.outputs.cut_v }}
+          CHANNEL: ${{ inputs.channel }}
+          MARK: ${{ inputs.mark_latest }}
+        run: |
+          set -euo pipefail
+          echo "cut(${CUT_V}) through-and-through PASS"
+          echo "channel=${CHANNEL}"
+          echo "mark_latest=${MARK}"
+

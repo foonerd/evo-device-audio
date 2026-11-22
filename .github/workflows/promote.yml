@@ -8,16 +8,22 @@
 #     -> binaries/evo-device-audio/<version>/ must exist
 #   org.evoframework.<plugin>
 #     -> bundles/<plugin>/<target>/<plugin>-<version>-<target>.tar.gz
+#   __cut__
+#     -> steward + every plugin in dist/scripts/lib/oop-plugins.sh
+#        at <version>, one commit (no push races)
 #
 # Manifest-only stubs under pieces/ do not count. Rollback is
 # the same pointer move, back to a version that is still on disk.
+#
+# Concurrency is per channel so two promotes cannot reject each
+# other on artefacts main (2026-11-22 FAIL).
 name: promote
 
 "on":
   workflow_dispatch:
     inputs:
       piece:
-        description: "Piece name (evo-device-audio, evo-ui-shell, evo-ui-runtime, evo-kiosk, evo-device-boot, evo-device-audio-dist, or a plugin)"
+        description: "Piece name, or __cut__ for steward+all OOP plugins at version"
         type: string
         required: true
       version:
@@ -29,6 +35,10 @@ name: promote
         type: choice
         options: [dev, test, prod]
         required: true
+
+concurrency:
+  group: promote-${{ inputs.channel }}
+  cancel-in-progress: false
 
 env:
   ARTEFACTS_REPO: foonerd/evo-device-audio-artefacts
@@ -74,26 +84,50 @@ jobs:
           git clone "https://x-access-token:${GH_TOKEN}@github.com/${ARTEFACTS_REPO}.git" "$ART"
           cd "$ART"
 
-          if [ -d "binaries/${PIECE}/${VERSION}" ]; then
-            echo "found binaries/${PIECE}/${VERSION}"
-          elif [ -d "bundles/${PIECE}/${VERSION}" ]; then
-            echo "found bundles/${PIECE}/${VERSION}"
-          else
+          require_slot() {
+            local piece="$1" version="$2"
+            if [ -d "binaries/${piece}/${version}" ]; then
+              echo "found binaries/${piece}/${version}"
+              return 0
+            fi
+            if [ -d "bundles/${piece}/${version}" ]; then
+              echo "found bundles/${piece}/${version}"
+              return 0
+            fi
             shopt -s nullglob
-            found=(bundles/"${PIECE}"/*/"${PIECE}-${VERSION}"-*.tar.gz)
-            trees=(bundles/"${PIECE}"/"${VERSION}"/tree.tar.gz)
+            local found=(bundles/"${piece}"/*/"${piece}-${version}"-*.tar.gz)
+            local trees=(bundles/"${piece}"/"${version}"/tree.tar.gz)
             if [ ${#found[@]} -eq 0 ] && [ ${#trees[@]} -eq 0 ]; then
-              echo "::error::no published slot for ${PIECE} ${VERSION} (binaries/ or bundles/); mint the piece first"
+              echo "::error::no published slot for ${piece} ${version} (binaries/ or bundles/); mint the piece first"
               exit 1
             fi
+            echo "found plugin bundle ${piece} ${version}"
+          }
+
+          PIECES=()
+          if [ "$PIECE" = "__cut__" ]; then
+            # shellcheck source=/dev/null
+            source "$GITHUB_WORKSPACE/dist/scripts/lib/oop-plugins.sh"
+            PIECES=("${STEWARD_PIECE}")
+            for entry in "${OOP_PLUGINS[@]}"; do
+              PIECES+=("${entry%%:*}")
+            done
+          else
+            PIECES=("$PIECE")
           fi
+
+          for p in "${PIECES[@]}"; do
+            require_slot "$p" "$VERSION"
+          done
 
           mkdir -p channels
           CFILE="channels/${CHANNEL}.toml"
           UPDATED_AT=$(date -u +%FT%TZ)
 
-          python3 "$GITHUB_WORKSPACE/.github/workflows/promote_channel_pointer.py" \
-              "$CFILE" "$PIECE" "$VERSION" "$CHANNEL" "$UPDATED_AT"
+          for p in "${PIECES[@]}"; do
+            python3 "$GITHUB_WORKSPACE/.github/workflows/promote_channel_pointer.py" \
+                "$CFILE" "$p" "$VERSION" "$CHANNEL" "$UPDATED_AT"
+          done
 
           openssl pkeyutl -sign \
               -inkey /tmp/key.pem -rawin \
@@ -103,7 +137,27 @@ jobs:
           shred -u /tmp/key.pem
 
           git add channels/
-          MSG="promote: ${PIECE} ${VERSION} -> ${CHANNEL}"
+          if [ "$PIECE" = "__cut__" ]; then
+            MSG="promote: cut ${VERSION} -> ${CHANNEL} (steward + OOP plugins)"
+          else
+            MSG="promote: ${PIECE} ${VERSION} -> ${CHANNEL}"
+          fi
           git commit -m "$MSG"
-          git push origin main
+
+          # Rebase+retry: parallel promotes used to reject on main
+          # (2026-11-22 run 45056280643).
+          pushed=0
+          for attempt in 1 2 3 4 5 6 7 8; do
+            if git push origin main; then
+              pushed=1
+              break
+            fi
+            echo "push rejected (attempt ${attempt}); rebase and retry"
+            git pull --rebase origin main
+            sleep $((attempt * 2))
+          done
+          if [ "$pushed" -ne 1 ]; then
+            echo "::error::failed to push channel pointer after retries"
+            exit 1
+          fi
           echo "Promoted: $MSG"
