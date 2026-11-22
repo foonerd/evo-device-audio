@@ -104,6 +104,9 @@ PUBLIC_REPO=""
 PREV_TAG=""
 DRY_RUN=0
 NO_PUSH=0
+ALLOW_RETAG=0
+ALLOW_STALE_ENG_TAG=0
+PUBLIC_TAG_EXISTS=0
 
 print_usage() {
     sed -n '2,/^# Refuses/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -129,6 +132,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-push)
             NO_PUSH=1
+            shift
+            ;;
+        --allow-retag)
+            ALLOW_RETAG=1
+            shift
+            ;;
+        --allow-stale-eng-tag)
+            ALLOW_STALE_ENG_TAG=1
             shift
             ;;
         -h|--help)
@@ -214,6 +225,33 @@ log_warn() {
 log_error() {
     printf '[promote.sh][ERROR] %s\n' "$*" >&2
 }
+
+write_promote_report() {
+    local status="$1"
+    local report_dir="${ENG_REPO_ROOT}/dist/release/promote-reports"
+    mkdir -p "${report_dir}"
+    local stamp
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    local report="${report_dir}/${TAG}-${stamp}.txt"
+    {
+        echo "tag=${TAG}"
+        echo "status=${status}"
+        echo "utc=${stamp}"
+        echo "eng_root=${ENG_REPO_ROOT}"
+        echo "eng_head=$(git -C "${ENG_REPO_ROOT}" rev-parse HEAD 2>/dev/null || true)"
+        echo "eng_tag=$(git -C "${ENG_REPO_ROOT}" rev-parse "refs/tags/${TAG}^{}" 2>/dev/null || true)"
+        echo "public_repo=${PUBLIC_REPO}"
+        echo "prev_tag=${PREV_TAG}"
+        echo "dry_run=${DRY_RUN}"
+        echo "no_push=${NO_PUSH}"
+        echo "allow_retag=${ALLOW_RETAG}"
+        echo "allow_stale_eng_tag=${ALLOW_STALE_ENG_TAG}"
+        echo "public_tag_exists=${PUBLIC_TAG_EXISTS}"
+        echo "public_head=$(git -C "${PUBLIC_REPO}" rev-parse HEAD 2>/dev/null || true)"
+    } >"${report}"
+    log_step "Promote report: ${report}"
+}
+
 
 # File-level promote plan. Workflows are a keep-list, not an
 # add/delete, because the mutate path restores public workflows
@@ -320,6 +358,52 @@ log_step "  no-push:        $([[ ${NO_PUSH} -eq 1 ]] && echo yes || echo no)"
 
 # -------------------------------------------------------------
 # Stage tempdir + cleanup trap
+
+# -------------------------------------------------------------
+# Cut-stability guards (Cut A 2026-11-22 — close past remint loops)
+# -------------------------------------------------------------
+
+cd "${ENG_REPO_ROOT}"
+ENG_HEAD="$(git rev-parse HEAD)"
+ENG_TAG_COMMIT="$(git rev-parse "refs/tags/${TAG}^{}")"
+if [[ "${ENG_HEAD}" != "${ENG_TAG_COMMIT}" ]]; then
+    if [[ ${ALLOW_STALE_ENG_TAG} -eq 0 ]]; then
+        log_error "eng tag ${TAG} does not point at HEAD"
+        log_error "  HEAD: ${ENG_HEAD}"
+        log_error "  tag:  ${ENG_TAG_COMMIT}"
+        log_error "Remint the eng tag at tip, or pass --allow-stale-eng-tag (rarely)."
+        exit 3
+    fi
+    log_warn "eng tag ${TAG} is stale vs HEAD; --allow-stale-eng-tag set; continuing"
+fi
+
+cd "${PUBLIC_REPO}"
+if git rev-parse --verify --quiet "refs/tags/${TAG}" >/dev/null; then
+    if [[ ${ALLOW_RETAG} -eq 0 ]]; then
+        log_error "public tag ${TAG} already exists at $(git rev-parse --short "refs/tags/${TAG}^{}")"
+        log_error "Reminting requires --allow-retag (moves the tag with git tag -f)."
+        log_error "Without it, git tag dies AFTER the staging workout — the past retry loop."
+        exit 3
+    fi
+    log_warn "public tag ${TAG} exists; --allow-retag set; will git tag -f"
+    PUBLIC_TAG_EXISTS=1
+else
+    PUBLIC_TAG_EXISTS=0
+fi
+
+# Auto-derived prev-tag that sorts AFTER the target tag is the
+# premature-shell trap (core had v0.1.13.2 while Cut A is v0.1.13.1).
+if [[ -n "${PREV_TAG}" && "${PREV_TAG}" != "${TAG}" ]]; then
+    newer="$(printf '%s\n%s\n' "${TAG}" "${PREV_TAG}" | sort -V | tail -1)"
+    if [[ "${newer}" == "${PREV_TAG}" ]]; then
+        log_error "prev-tag ${PREV_TAG} sorts after target ${TAG}"
+        log_error "Refuse. Pass an explicit older --prev-tag (Cut A: v0.1.13.0)."
+        exit 3
+    fi
+fi
+
+cd "${ENG_REPO_ROOT}"
+
 # -------------------------------------------------------------
 
 STAGE_DIR="$(mktemp -d -t evo-promote-XXXXXX)"
@@ -470,6 +554,12 @@ log_step "Step 4/8: Running leak-grep on staging tree"
         log_error "staging tree missing leak-grep script"
         exit 4
     fi
+    if [[ -x "scripts/preflight/check-public-leaks-positive.sh" ]]; then
+        log_step "Step 4b/8: Running leak positive-control on staging tree"
+        bash scripts/preflight/check-public-leaks-positive.sh
+    else
+        log_warn "staging tree has no check-public-leaks-positive.sh; skipping positive control"
+    fi
 )
 
 # -------------------------------------------------------------
@@ -506,12 +596,17 @@ if [[ ${DRY_RUN} -eq 1 ]]; then
     log_dry "would: preserve public .github/workflows/ verbatim across the wipe"
     log_dry "would: replace working tree with staging contents (workflows stripped from staging)"
     log_dry "would: git add -A && git commit -m 'release ${TAG}'"
-    log_dry "would: git tag ${TAG}"
+    if [[ ${ALLOW_RETAG} -eq 1 ]]; then
+        log_dry "would: git tag -f ${TAG}  (--allow-retag)"
+    else
+        log_dry "would: git tag ${TAG}"
+    fi
     if [[ ${NO_PUSH} -eq 0 ]]; then
         log_dry "would: git push --force-with-lease origin main"
         log_dry "would: git push --force origin ${TAG}"
     fi
     log_step "Dry-run complete; staging tree validated against public-leak / fmt / clippy / test"
+    write_promote_report dry-run-ok
     exit 0
 fi
 
@@ -567,7 +662,11 @@ log_step "Step 8/8: Applying staging to public main"
 
     git add -A
     git commit -m "release ${TAG}"
-    git tag "${TAG}"
+    if [[ ${ALLOW_RETAG} -eq 1 ]]; then
+        git tag -f "${TAG}"
+    else
+        git tag "${TAG}"
+    fi
 )
 
 log_step "Public main updated; tag ${TAG} created locally"
@@ -577,6 +676,7 @@ log_step "Public main updated; tag ${TAG} created locally"
 # -------------------------------------------------------------
 
 if [[ ${NO_PUSH} -eq 1 ]]; then
+    write_promote_report no-push-local
     log_step "--no-push set; review the public repo state and push manually"
     log_step "  cd ${PUBLIC_REPO}"
     log_step "  git push --force-with-lease origin main"
@@ -591,4 +691,5 @@ log_step "Pushing public main + tag ${TAG}"
     git push --force "origin" "refs/tags/${TAG}"
 )
 
+write_promote_report promote-ok
 log_step "Promote complete: ${TAG} published to ${PUBLIC_REPO}"
