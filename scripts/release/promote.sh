@@ -315,7 +315,8 @@ if ! git rev-parse --verify --quiet "refs/tags/${TAG}" >/dev/null; then
     exit 3
 fi
 
-if [[ ! -d "${PUBLIC_REPO}/.git" ]]; then
+# Accept a normal repo (.git dir) or a linked worktree (.git file).
+if [[ ! -e "${PUBLIC_REPO}/.git" ]] || ! git -C "${PUBLIC_REPO}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     log_error "public-repo path is not a git repo: ${PUBLIC_REPO}"
     exit 3
 fi
