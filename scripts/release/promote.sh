@@ -694,5 +694,28 @@ log_step "Pushing public main + tag ${TAG}"
     git push --force "origin" "refs/tags/${TAG}"
 )
 
+# Tag alone is not a cut. Every promote publishes a GitHub Release.
+ensure_github_release() {
+    local repo_dir="$1" tag="$2"
+    command -v gh >/dev/null 2>&1 || {
+        log_error "gh CLI required to create GitHub Release ${tag} (tag alone is refused)"
+        exit 1
+    }
+    local slug
+    slug="$(git -C "${repo_dir}" remote get-url origin \
+        | sed -E 's#.*[:/]([^/]+/[^/.]+)(\.git)?$#\1#')"
+    if gh release view "${tag}" --repo "${slug}" >/dev/null 2>&1; then
+        log_step "GitHub Release ${tag} already on ${slug}"
+    else
+        gh release create "${tag}" \
+            --repo "${slug}" \
+            --title "${tag}" \
+            --notes "Public cut ${tag}." \
+            --latest=false
+        log_step "Created GitHub Release ${tag} on ${slug}"
+    fi
+}
+ensure_github_release "${PUBLIC_REPO}" "${TAG}"
+
 write_promote_report promote-ok
-log_step "Promote complete: ${TAG} published to ${PUBLIC_REPO}"
+log_step "Promote complete: ${TAG} published to ${PUBLIC_REPO} (tag + GitHub Release)"
