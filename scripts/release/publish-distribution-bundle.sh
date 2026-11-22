@@ -39,7 +39,7 @@ TRIPLES=(
 
 PUBLIC_TAG_REPOS=(
     foonerd/evo-core
-    foonerd/evo-device-audio-ui
+    foonerd/evo-ui
     foonerd/evo-kiosk
 )
 
