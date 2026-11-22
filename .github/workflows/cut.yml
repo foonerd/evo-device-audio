@@ -1,16 +1,8 @@
-# cut(V) — public half. Operator input is the tag only.
+# cut(V) — public wait + bake half.
 #
-# Workstation cut-release.sh writes V, promotes eng→public, tags
-# public repos, then dispatches this workflow with that same tag.
-#
-# Order (pieces first, then bake — never the reverse):
-#   1. mint audio steward + plugins + dist (publish-pieces scope=all)
-#   2. mint kiosk program (publish-pieces scope=kiosk at this tag)
-#   3. mint evo-ui shell + runtime (foonerd/evo-ui publish-pieces)
-#   4. wait until every pin + plugin slot for this cut exists
-#   5. bake publish-distribution-bundle for this tag
-#
-# Does not move GitHub Release Latest. Acceptance is a later gate.
+# Piece mints are dispatched by workstation cut-release.sh with the
+# operator's gh token (ARTEFACTS_PUSH_TOKEN cannot workflow_dispatch).
+# This workflow only gates slots then bakes. Input is the tag only.
 name: cut
 
 "on":
@@ -28,9 +20,6 @@ concurrency:
 env:
   COMMIT_USER: evo-device-audio CI
   COMMIT_EMAIL: ci@evoframework.org
-  RUST_TOOLCHAIN: "1.85"
-  AUDIO_REPO: foonerd/evo-device-audio
-  UI_REPO: foonerd/evo-ui
   ARTEFACTS_REPO: foonerd/evo-device-audio-artefacts
 
 jobs:
@@ -74,110 +63,8 @@ jobs:
             echo "OK public ${repo} tag ${TAG}"
           done
 
-  mint-audio:
-    needs: validate
-    runs-on: ubuntu-latest
-    permissions:
-      actions: write
-      contents: read
-    steps:
-      - name: Dispatch publish-pieces scope=all at the cut tag
-        env:
-          GH_TOKEN: ${{ secrets.ARTEFACTS_PUSH_TOKEN }}
-          TAG: ${{ needs.validate.outputs.tag }}
-        run: |
-          set -euo pipefail
-          before="$(gh run list --repo "${AUDIO_REPO}" --workflow=publish-pieces.yml \
-            --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
-          gh workflow run publish-pieces.yml \
-            --repo "${AUDIO_REPO}" \
-            --ref "${TAG}" \
-            -f scope=all
-          run_id=""
-          for _ in $(seq 1 30); do
-            sleep 4
-            cand="$(gh run list --repo "${AUDIO_REPO}" --workflow=publish-pieces.yml \
-              --limit 1 --json databaseId --jq '.[0].databaseId')"
-            if [[ -n "${cand}" && "${cand}" != "${before}" ]]; then
-              run_id="${cand}"
-              break
-            fi
-          done
-          [[ -n "${run_id}" ]] || { echo "::error::no publish-pieces run for all"; exit 1; }
-          echo "watching publish-pieces all run ${run_id}"
-          gh run watch "${run_id}" --repo "${AUDIO_REPO}" --exit-status
-
-  # After audio `all` — same concurrency group; do not race two
-  # publish-pieces dispatches.
-  mint-kiosk:
-    needs: [validate, mint-audio]
-    runs-on: ubuntu-latest
-    permissions:
-      actions: write
-      contents: read
-    steps:
-      - name: Dispatch publish-pieces scope=kiosk at the cut tag
-        env:
-          GH_TOKEN: ${{ secrets.ARTEFACTS_PUSH_TOKEN }}
-          TAG: ${{ needs.validate.outputs.tag }}
-        run: |
-          set -euo pipefail
-          before="$(gh run list --repo "${AUDIO_REPO}" --workflow=publish-pieces.yml \
-            --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
-          gh workflow run publish-pieces.yml \
-            --repo "${AUDIO_REPO}" \
-            --ref "${TAG}" \
-            -f scope=kiosk \
-            -f "kiosk_ref=${TAG}"
-          run_id=""
-          for _ in $(seq 1 30); do
-            sleep 4
-            cand="$(gh run list --repo "${AUDIO_REPO}" --workflow=publish-pieces.yml \
-              --limit 1 --json databaseId --jq '.[0].databaseId')"
-            if [[ -n "${cand}" && "${cand}" != "${before}" ]]; then
-              run_id="${cand}"
-              break
-            fi
-          done
-          [[ -n "${run_id}" ]] || { echo "::error::no publish-pieces run for kiosk"; exit 1; }
-          echo "watching publish-pieces kiosk run ${run_id}"
-          gh run watch "${run_id}" --repo "${AUDIO_REPO}" --exit-status
-
-  mint-ui:
-    needs: validate
-    runs-on: ubuntu-latest
-    permissions:
-      actions: write
-      contents: read
-    steps:
-      - name: Dispatch evo-ui publish-pieces at the cut tag
-        env:
-          GH_TOKEN: ${{ secrets.ARTEFACTS_PUSH_TOKEN }}
-          TAG: ${{ needs.validate.outputs.tag }}
-        run: |
-          set -euo pipefail
-          before="$(gh run list --repo "${UI_REPO}" --workflow=publish-pieces.yml \
-            --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
-          gh workflow run publish-pieces.yml \
-            --repo "${UI_REPO}" \
-            --ref "${TAG}" \
-            -f scope=all
-          run_id=""
-          for _ in $(seq 1 30); do
-            sleep 4
-            cand="$(gh run list --repo "${UI_REPO}" --workflow=publish-pieces.yml \
-              --limit 1 --json databaseId --jq '.[0].databaseId')"
-            if [[ -n "${cand}" && "${cand}" != "${before}" ]]; then
-              run_id="${cand}"
-              break
-            fi
-          done
-          [[ -n "${run_id}" ]] || { echo "::error::no evo-ui publish-pieces run"; exit 1; }
-          echo "watching evo-ui publish-pieces run ${run_id}"
-          gh run watch "${run_id}" --repo "${UI_REPO}" --exit-status
-
   wait-slots:
-    needs: [validate, mint-audio, mint-kiosk, mint-ui]
+    needs: validate
     runs-on: ubuntu-latest
     steps:
       - name: Check out audio at the cut tag
@@ -202,8 +89,8 @@ jobs:
           chmod +x evo-device-audio/scripts/release/wait-for-piece-slots.sh
           bash evo-device-audio/scripts/release/wait-for-piece-slots.sh \
             --artefacts-repo "${GITHUB_WORKSPACE}/evo-device-audio-artefacts" \
-            --timeout-sec 900 \
-            --poll-sec 20
+            --timeout-sec 7200 \
+            --poll-sec 30
 
   bake:
     needs: [validate, wait-slots]
@@ -214,21 +101,21 @@ jobs:
     steps:
       - name: Dispatch bake for the cut tag
         env:
-          GH_TOKEN: ${{ secrets.ARTEFACTS_PUSH_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.validate.outputs.tag }}
         run: |
           set -euo pipefail
-          before="$(gh run list --repo "${AUDIO_REPO}" \
+          before="$(gh run list --repo foonerd/evo-device-audio \
             --workflow=publish-distribution-bundle.yml \
             --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
           gh workflow run publish-distribution-bundle.yml \
-            --repo "${AUDIO_REPO}" \
+            --repo foonerd/evo-device-audio \
             --ref "${TAG}" \
             -f "tag=${TAG}"
           run_id=""
           for _ in $(seq 1 30); do
             sleep 4
-            cand="$(gh run list --repo "${AUDIO_REPO}" \
+            cand="$(gh run list --repo foonerd/evo-device-audio \
               --workflow=publish-distribution-bundle.yml \
               --limit 1 --json databaseId --jq '.[0].databaseId')"
             if [[ -n "${cand}" && "${cand}" != "${before}" ]]; then
@@ -238,5 +125,5 @@ jobs:
           done
           [[ -n "${run_id}" ]] || { echo "::error::no bake run"; exit 1; }
           echo "watching bake run ${run_id}"
-          gh run watch "${run_id}" --repo "${AUDIO_REPO}" --exit-status
+          gh run watch "${run_id}" --repo foonerd/evo-device-audio --exit-status
           echo "cut(${{ needs.validate.outputs.cut_v }}) bake PASS — Latest untouched"
