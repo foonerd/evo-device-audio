@@ -360,7 +360,7 @@ log_step "  no-push:        $([[ ${NO_PUSH} -eq 1 ]] && echo yes || echo no)"
 # Stage tempdir + cleanup trap
 
 # -------------------------------------------------------------
-# Cut-stability guards (Cut A 2026-11-22 — close past remint loops)
+# Cut-stability guards — close past remint loops
 # -------------------------------------------------------------
 
 cd "${ENG_REPO_ROOT}"
@@ -392,12 +392,12 @@ else
 fi
 
 # Auto-derived prev-tag that sorts AFTER the target tag is the
-# premature-shell trap (core had v0.1.13.2 while Cut A is v0.1.13.1).
+# premature-shell trap: auto prev-tag newer than the target.
 if [[ -n "${PREV_TAG}" && "${PREV_TAG}" != "${TAG}" ]]; then
     newer="$(printf '%s\n%s\n' "${TAG}" "${PREV_TAG}" | sort -V | tail -1)"
     if [[ "${newer}" == "${PREV_TAG}" ]]; then
         log_error "prev-tag ${PREV_TAG} sorts after target ${TAG}"
-        log_error "Refuse. Pass an explicit older --prev-tag (Cut A: v0.1.13.0)."
+        log_error "Refuse. Pass an explicit older --prev-tag (last honest closed cut)."
         exit 3
     fi
 fi
