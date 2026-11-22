@@ -191,6 +191,16 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
 fi
 
 if [[ "${PUBLISH_ONLY}" -eq 0 && ${#COMPOSE_TRIPLES[@]} -gt 0 ]]; then
+    # Pieces first. A naked tag must not compose an empty or
+    # previous-cut tarball while mint jobs are still running.
+    WAIT_SCRIPT="${SCRIPT_DIR}/wait-for-piece-slots.sh"
+    if [[ -x "${WAIT_SCRIPT}" ]]; then
+        log_step "Wait for piece slots (pins + plugins for this cut)"
+        bash "${WAIT_SCRIPT}" --artefacts-repo "${ARTEFACTS_REPO}" \
+            || die "piece slots for this cut are not published; refuse bake"
+    else
+        die "missing executable ${WAIT_SCRIPT}; refuse bake without a slot gate"
+    fi
     log_step "Compose tarballs from published pieces"
     export EVO_BUNDLE_OUT_DIR="${BUNDLE_DIR}"
     for triple in "${COMPOSE_TRIPLES[@]}"; do

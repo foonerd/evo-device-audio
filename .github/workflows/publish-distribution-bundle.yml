@@ -22,9 +22,8 @@
 name: publish-distribution-bundle
 
 "on":
-  push:
-    tags:
-      - "v*.*.*"
+  # Naked tag push must not bake. cut.yml dispatches this after
+  # piece slots exist (pieces first). Hand workflow_dispatch stays.
   workflow_dispatch:
     inputs:
       tag:
@@ -108,6 +107,7 @@ jobs:
           # does not; that was exit 126 on compose.
           git -C evo-device-audio checkout "${{ github.sha }}" -- \
             scripts/release/publish-distribution-bundle.sh \
+            scripts/release/wait-for-piece-slots.sh \
             scripts/release/write-distribution-pointer.sh \
             scripts/release/compose-distribution-from-pieces.sh \
             scripts/release/piece-pins.toml \
@@ -115,6 +115,7 @@ jobs:
             scripts/release/stage-audio-dist-tree.sh
           for f in \
             scripts/release/publish-distribution-bundle.sh \
+            scripts/release/wait-for-piece-slots.sh \
             scripts/release/write-distribution-pointer.sh \
             scripts/release/compose-distribution-from-pieces.sh \
             scripts/release/pack-signed-tree.sh \
