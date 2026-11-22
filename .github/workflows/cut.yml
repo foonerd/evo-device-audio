@@ -102,11 +102,13 @@ jobs:
             gh run watch "${run_id}" --repo "${repo}" --exit-status
           }
 
+          # refs/tags/ — same-named branch must not win
+          tag_ref="refs/tags/${TAG}"
           before="$(gh run list --repo foonerd/evo-device-audio \
             --workflow=publish-pieces.yml --limit 1 \
             --json databaseId --jq '.[0].databaseId // empty')"
           gh workflow run publish-pieces.yml \
-            --repo foonerd/evo-device-audio --ref "${TAG}" -f scope=all
+            --repo foonerd/evo-device-audio --ref "${tag_ref}" -f scope=all
           watch_new_run foonerd/evo-device-audio publish-pieces.yml \
             "audio pieces all" "${before}"
 
@@ -114,7 +116,7 @@ jobs:
             --workflow=publish-pieces.yml --limit 1 \
             --json databaseId --jq '.[0].databaseId // empty')"
           gh workflow run publish-pieces.yml \
-            --repo foonerd/evo-device-audio --ref "${TAG}" \
+            --repo foonerd/evo-device-audio --ref "${tag_ref}" \
             -f scope=kiosk -f "kiosk_ref=${TAG}"
           watch_new_run foonerd/evo-device-audio publish-pieces.yml \
             "audio pieces kiosk" "${before}"
@@ -123,7 +125,7 @@ jobs:
             --workflow=publish-pieces.yml --limit 1 \
             --json databaseId --jq '.[0].databaseId // empty')"
           gh workflow run publish-pieces.yml \
-            --repo foonerd/evo-ui --ref "${TAG}" -f scope=all
+            --repo foonerd/evo-ui --ref "${tag_ref}" -f scope=all
           watch_new_run foonerd/evo-ui publish-pieces.yml \
             "evo-ui pieces" "${before}"
 
@@ -134,7 +136,9 @@ jobs:
       - name: Check out audio at the cut tag
         uses: actions/checkout@v5
         with:
-          ref: ${{ needs.validate.outputs.tag }}
+          # Prefer refs/tags/ — a same-named branch shadows the tag
+          # and may lack wait-for-piece-slots.sh (v0.1.13.1 FAIL).
+          ref: refs/tags/${{ needs.validate.outputs.tag }}
           fetch-depth: 0
           path: evo-device-audio
 
@@ -174,7 +178,7 @@ jobs:
             --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
           gh workflow run publish-distribution-bundle.yml \
             --repo foonerd/evo-device-audio \
-            --ref "${TAG}" \
+            --ref "refs/tags/${TAG}" \
             -f "tag=${TAG}"
           run_id=""
           for _ in $(seq 1 30); do
