@@ -1,8 +1,8 @@
-# cut(V) — public wait + bake half.
+# cut(V) — public pieces → wait → bake.
 #
-# Piece mints are dispatched by workstation cut-release.sh with the
-# operator's gh token (ARTEFACTS_PUSH_TOKEN cannot workflow_dispatch).
-# This workflow only gates slots then bakes. Input is the tag only.
+# Dispatched with tag only. Mints use EVO_RELEASE_TOKEN (Actions: write
+# on evo-device-audio + evo-ui). Artefacts push stays on ARTEFACTS_PUSH_TOKEN.
+# Same-repo bake uses github.token. No workstation mint path.
 name: cut
 
 "on":
@@ -52,9 +52,13 @@ jobs:
       - name: Require public sibling tags
         env:
           TAG: ${{ steps.cut.outputs.tag }}
-          GH_TOKEN: ${{ secrets.ARTEFACTS_PUSH_TOKEN }}
+          GH_TOKEN: ${{ secrets.EVO_RELEASE_TOKEN }}
         run: |
           set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::EVO_RELEASE_TOKEN is empty"
+            exit 1
+          fi
           for repo in foonerd/evo-device-audio foonerd/evo-ui foonerd/evo-kiosk foonerd/evo-core; do
             if ! gh api "repos/${repo}/git/refs/tags/${TAG}" >/dev/null 2>&1; then
               echo "::error::public ${repo} has no tag ${TAG}; promote first"
@@ -63,8 +67,68 @@ jobs:
             echo "OK public ${repo} tag ${TAG}"
           done
 
-  wait-slots:
+  mint-pieces:
     needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint audio + kiosk + evo-ui pieces
+        env:
+          GH_TOKEN: ${{ secrets.EVO_RELEASE_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::EVO_RELEASE_TOKEN is empty — cannot workflow_dispatch"
+            exit 1
+          fi
+
+          watch_new_run() {
+            local repo="$1" workflow="$2" label="$3" before="$4"
+            local run_id="" cand
+            for _ in $(seq 1 45); do
+              sleep 4
+              cand="$(gh run list --repo "${repo}" --workflow="${workflow}" \
+                --limit 1 --json databaseId --jq '.[0].databaseId')"
+              if [ -n "${cand}" ] && [ "${cand}" != "${before}" ]; then
+                run_id="${cand}"
+                break
+              fi
+            done
+            if [ -z "${run_id}" ]; then
+              echo "::error::no ${label} run appeared"
+              exit 1
+            fi
+            echo "watching ${label} run ${run_id}"
+            gh run watch "${run_id}" --repo "${repo}" --exit-status
+          }
+
+          before="$(gh run list --repo foonerd/evo-device-audio \
+            --workflow=publish-pieces.yml --limit 1 \
+            --json databaseId --jq '.[0].databaseId // empty')"
+          gh workflow run publish-pieces.yml \
+            --repo foonerd/evo-device-audio --ref "${TAG}" -f scope=all
+          watch_new_run foonerd/evo-device-audio publish-pieces.yml \
+            "audio pieces all" "${before}"
+
+          before="$(gh run list --repo foonerd/evo-device-audio \
+            --workflow=publish-pieces.yml --limit 1 \
+            --json databaseId --jq '.[0].databaseId // empty')"
+          gh workflow run publish-pieces.yml \
+            --repo foonerd/evo-device-audio --ref "${TAG}" \
+            -f scope=kiosk -f "kiosk_ref=${TAG}"
+          watch_new_run foonerd/evo-device-audio publish-pieces.yml \
+            "audio pieces kiosk" "${before}"
+
+          before="$(gh run list --repo foonerd/evo-ui \
+            --workflow=publish-pieces.yml --limit 1 \
+            --json databaseId --jq '.[0].databaseId // empty')"
+          gh workflow run publish-pieces.yml \
+            --repo foonerd/evo-ui --ref "${TAG}" -f scope=all
+          watch_new_run foonerd/evo-ui publish-pieces.yml \
+            "evo-ui pieces" "${before}"
+
+  wait-slots:
+    needs: [validate, mint-pieces]
     runs-on: ubuntu-latest
     steps:
       - name: Check out audio at the cut tag
@@ -118,12 +182,15 @@ jobs:
             cand="$(gh run list --repo foonerd/evo-device-audio \
               --workflow=publish-distribution-bundle.yml \
               --limit 1 --json databaseId --jq '.[0].databaseId')"
-            if [[ -n "${cand}" && "${cand}" != "${before}" ]]; then
+            if [ -n "${cand}" ] && [ "${cand}" != "${before}" ]; then
               run_id="${cand}"
               break
             fi
           done
-          [[ -n "${run_id}" ]] || { echo "::error::no bake run"; exit 1; }
+          if [ -z "${run_id}" ]; then
+            echo "::error::no bake run"
+            exit 1
+          fi
           echo "watching bake run ${run_id}"
           gh run watch "${run_id}" --repo foonerd/evo-device-audio --exit-status
           echo "cut(${{ needs.validate.outputs.cut_v }}) bake PASS — Latest untouched"
