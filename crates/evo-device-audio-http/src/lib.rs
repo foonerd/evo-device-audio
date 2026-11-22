@@ -33,10 +33,12 @@
 pub mod artwork_admission;
 pub mod artwork_cascade;
 pub mod artwork_endpoint;
+pub mod artwork_enrichment;
 pub mod artwork_negative_cache;
 pub mod artwork_resolve_coalescer;
 pub mod artwork_resolve_endpoint;
 pub mod artwork_resolve_index;
+pub mod artwork_tier;
 pub mod captive_session_endpoint;
 pub mod track_detail_endpoint;
 
@@ -44,6 +46,9 @@ use std::sync::Arc;
 
 pub use artwork_cascade::{ArtworkCascade, ArtworkResolvedNotifier};
 pub use artwork_resolve_index::ArtworkResolveIndex;
+pub use artwork_tier::{
+    is_network_tier, CascadeMode, NETWORK_TIER_REQUEST_TYPES,
+};
 
 /// Everything [`mount`] needs. Assembled by the distribution from
 /// the context its HTTPS hookup receives.
@@ -72,6 +77,8 @@ pub struct MountConfig {
     /// can repaint. The distribution supplies one that announces
     /// on the happenings bus under its own claimant name.
     pub resolved_notifier: Option<Arc<dyn ArtworkResolvedNotifier>>,
+    /// Bounds and backoff for background artwork enrichment.
+    pub enrichment: artwork_enrichment::EnrichmentTunables,
 }
 
 /// Mount the distribution's audio HTTP surfaces onto the router
@@ -96,6 +103,25 @@ pub fn mount(
         Some(notifier) => cascade.with_resolved_notifier(notifier),
         None => cascade,
     };
+
+    // Background enrichment: a paint that misses the local tier
+    // asks for the network tier here instead of waiting on it.
+    // Runs on the runtime the HTTPS hookup is already inside.
+    let (queue, runner) = artwork_enrichment::channel(cfg.enrichment.clone());
+    let cascade = cascade.with_enrichment(queue);
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => {
+            runner.spawn(Arc::downgrade(&cascade));
+        }
+        Err(e) => {
+            return Err(
+                evo_runtime_http::RuntimeHttpError::EndpointAttachRefused {
+                    endpoint: "artwork enrichment".to_string(),
+                    reason: format!("needs a tokio runtime: {e}"),
+                },
+            );
+        }
+    }
 
     let mut router = router;
 

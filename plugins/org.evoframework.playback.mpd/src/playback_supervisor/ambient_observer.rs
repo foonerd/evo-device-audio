@@ -60,7 +60,8 @@ use tokio::task::JoinHandle;
 use crate::mpd::{
     ConnectTimeouts, IdleSubsystem, MpdConnection, MpdEndpoint, MpdSong,
 };
-use crate::playback_supervisor::report::PlaybackStateReport;
+use crate::play_history::PlayHistory;
+use crate::playback_supervisor::report::{IntentCells, PlaybackStateReport};
 use crate::playback_supervisor::subject_emitter::SubjectEmitter;
 
 const PLUGIN_NAME: &str = "org.evoframework.playback.mpd";
@@ -72,24 +73,62 @@ const PLUGIN_NAME: &str = "org.evoframework.playback.mpd";
 /// within one cycle.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 
-/// Handle to the ambient observer task. Dropping the handle (or
-/// notifying via the cloned shutdown) terminates the task at the
-/// next reconnect-or-shutdown branch.
+/// A stop that stays stopped.
+///
+/// A `Notify` permit is consumed by whichever wait sees it first.
+/// The idle loop's select saw it, returned, and the outer loop
+/// then asked a fresh `notified()` that had nothing to give — so
+/// the observer reconnected and `stop` never returned. The flag
+/// is what every later check reads: once set, the idle loop
+/// leaves, the outer loop finds the same stop and leaves, and a
+/// backoff sleep cut short by the stop does not go round again.
+#[derive(Default)]
+struct Shutdown {
+    stopped: std::sync::atomic::AtomicBool,
+    notify: Notify,
+}
+
+impl Shutdown {
+    fn stop(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Wake a parked waiter, and leave a permit for one that
+        // is between its flag check and its wait.
+        self.notify.notify_waiters();
+        self.notify.notify_one();
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Resolves once stopped, now or later. Checks the flag
+    /// before every wait, so a stop that landed first is seen.
+    async fn cancelled(&self) {
+        loop {
+            if self.is_stopped() {
+                return;
+            }
+            self.notify.notified().await;
+        }
+    }
+}
+
+/// Handle to the ambient observer task. `stop` asks the task to
+/// leave wherever it is — the idle wait, a backoff sleep, a
+/// connect — and awaits its exit.
 pub(crate) struct AmbientObserverHandle {
     task: JoinHandle<()>,
-    shutdown: Arc<Notify>,
+    shutdown: Arc<Shutdown>,
 }
 
 impl AmbientObserverHandle {
-    /// Notify the task to shut down and await its exit. Idempotent
-    /// — calling twice is safe; the second call's await returns
-    /// immediately on the already-completed task.
-    ///
-    /// See the note on [`super::startup_volume`]: `notify_one`
-    /// is race-safe against a `stop()` fired before the task
-    /// parks at `.notified().await`; `notify_waiters` is not.
+    /// Stop the task and await its exit. Returns while the
+    /// observer is in its idle loop: the stop stays set, so the
+    /// loop leaves and the task does not reconnect. Idempotent —
+    /// a second call's await returns on the completed task.
     pub(crate) async fn stop(self) {
-        self.shutdown.notify_one();
+        self.shutdown.stop();
         let _ = self.task.await;
     }
 }
@@ -109,35 +148,50 @@ pub(crate) fn spawn(
     endpoint: MpdEndpoint,
     timeouts: ConnectTimeouts,
     subject_emitter: SubjectEmitter,
-    music_directory: Option<std::path::PathBuf>,
-    mute: crate::mute_cell::MuteCell,
+    inputs: AmbientInputs,
 ) -> AmbientObserverHandle {
-    let shutdown = Arc::new(Notify::new());
+    let shutdown = Arc::new(Shutdown::default());
     let task_shutdown = Arc::clone(&shutdown);
 
     let task = tokio::spawn(async move {
-        run(
-            endpoint,
-            timeouts,
-            subject_emitter,
-            music_directory,
-            mute,
-            task_shutdown,
-        )
-        .await;
+        run(endpoint, timeouts, subject_emitter, inputs, task_shutdown).await;
     });
 
     AmbientObserverHandle { task, shutdown }
+}
+
+/// What the observer is handed at spawn besides its connection:
+/// where the music is, the two cells the publisher reads, and the
+/// play history every wake feeds.
+pub(crate) struct AmbientInputs {
+    pub(crate) music_directory: Option<std::path::PathBuf>,
+    pub(crate) mute: crate::mute_cell::MuteCell,
+    pub(crate) shuffle: crate::album_shuffle::ShuffleModeCell,
+    pub(crate) history: PlayHistory,
+}
+
+/// What one wake reads and writes besides the subjects: the
+/// intent cells for the report, and the play history for the
+/// track that was playing.
+#[derive(Clone, Copy)]
+struct Watch<'a> {
+    cells: IntentCells<'a>,
+    history: &'a PlayHistory,
 }
 
 async fn run(
     endpoint: MpdEndpoint,
     timeouts: ConnectTimeouts,
     subject_emitter: SubjectEmitter,
-    music_directory: Option<std::path::PathBuf>,
-    mute: crate::mute_cell::MuteCell,
-    shutdown: Arc<Notify>,
+    inputs: AmbientInputs,
+    shutdown: Arc<Shutdown>,
 ) {
+    let AmbientInputs {
+        music_directory,
+        mute,
+        shuffle,
+        history,
+    } = inputs;
     tracing::info!(
         plugin = PLUGIN_NAME,
         endpoint = %endpoint,
@@ -152,7 +206,7 @@ async fn run(
     // Outer reconnect loop: connect, run the inner loop until it
     // errors out, sleep + retry.
     loop {
-        if shutdown_requested(&shutdown).await {
+        if shutdown.is_stopped() {
             tracing::info!(
                 plugin = PLUGIN_NAME,
                 "ambient observer: shutdown received; exiting"
@@ -176,12 +230,19 @@ async fn run(
         // immediately rather than waiting for the next
         // transition.
         let mut cmd_conn = cmd_conn;
+        let watch = Watch {
+            cells: IntentCells {
+                mute: &mute,
+                shuffle: &shuffle,
+            },
+            history: &history,
+        };
         emit_now_playing(
             &mut cmd_conn,
             &subject_emitter,
             music_directory.as_deref(),
             &mut last_probed_file,
-            &mute,
+            watch,
         )
         .await;
 
@@ -195,7 +256,7 @@ async fn run(
             &subject_emitter,
             music_directory.as_deref(),
             &mut last_probed_file,
-            &mute,
+            watch,
             &shutdown,
         )
         .await;
@@ -251,8 +312,8 @@ async fn run_inner(
     subject_emitter: &SubjectEmitter,
     music_directory: Option<&std::path::Path>,
     last_probed_file: &mut Option<String>,
-    mute: &crate::mute_cell::MuteCell,
-    shutdown: &Arc<Notify>,
+    watch: Watch<'_>,
+    shutdown: &Arc<Shutdown>,
 ) {
     // The supervisor uses the same idle subsystems + a 24-hour
     // budget; mirror the choice so both observers wake on the
@@ -269,7 +330,7 @@ async fn run_inner(
 
     loop {
         tokio::select! {
-            _ = shutdown.notified() => {
+            _ = shutdown.cancelled() => {
                 tracing::info!(
                     plugin = PLUGIN_NAME,
                     "ambient observer: shutdown received from idle loop; exiting"
@@ -290,7 +351,7 @@ async fn run_inner(
                             subject_emitter,
                             music_directory,
                             last_probed_file,
-                            mute,
+                            watch,
                         )
                         .await;
                     }
@@ -333,7 +394,7 @@ async fn emit_now_playing(
     subject_emitter: &SubjectEmitter,
     music_directory: Option<&std::path::Path>,
     last_probed_file: &mut Option<String>,
-    mute: &crate::mute_cell::MuteCell,
+    watch: Watch<'_>,
 ) {
     let status = match cmd_conn.status().await {
         Ok(s) => s,
@@ -357,6 +418,16 @@ async fn emit_now_playing(
             return;
         }
     };
+    // What this wake saw goes to the play history first: if the
+    // track that was playing at the last wake has reached its
+    // end and the player moved on, that is a finished play, and
+    // this is the one place every transition passes through
+    // whether or not a custody is live.
+    watch
+        .history
+        .observe(std::time::Instant::now(), &status, song.as_ref())
+        .await;
+
     // Publish the source codec name BEFORE now_playing. The
     // source_codec is derived from the file extension on the
     // currentsong file: path; `None` covers both "no current
@@ -384,7 +455,8 @@ async fn emit_now_playing(
     )
     .await;
 
-    let report = PlaybackStateReport::from_mpd(status, song, mute.is_muted());
+    let report =
+        PlaybackStateReport::from_mpd(status, song, watch.cells.read());
     subject_emitter.update_now_playing(&report).await;
 }
 
@@ -465,19 +537,10 @@ pub(super) async fn maybe_probe_source_format(
     }
 }
 
-async fn shutdown_requested(shutdown: &Arc<Notify>) -> bool {
-    // Non-blocking check via tokio's select with a fired notify.
-    // Used at the top of the outer loop to avoid a sleep+reconnect
-    // cycle when shutdown fires before connect.
+/// Back off before a reconnect, unless stopped first.
+async fn sleep_or_shutdown(shutdown: &Arc<Shutdown>, dur: Duration) {
     tokio::select! {
-        _ = shutdown.notified() => true,
-        _ = std::future::ready(()) => false,
-    }
-}
-
-async fn sleep_or_shutdown(shutdown: &Arc<Notify>, dur: Duration) {
-    tokio::select! {
-        _ = shutdown.notified() => {}
+        _ = shutdown.cancelled() => {}
         _ = tokio::time::sleep(dur) => {}
     }
 }
@@ -614,6 +677,113 @@ mod tests {
             new_source.is_null() || new_source["kind"] != "dsd",
             "post-transition source must NOT carry stale DSD shape; \
              got {new_source}"
+        );
+    }
+
+    /// The observer feeds the play history: a track seen near
+    /// its end, then the player on the next song after an idle
+    /// wake, is one recorded play — the whole observer, brought
+    /// up the way load brings it up, against a mock MPD.
+    #[tokio::test]
+    async fn a_finished_track_is_recorded_by_the_observer() {
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        // Command connection: song A at 179.5 of 180 on the
+        // first read, song B from the second. Idle connection:
+        // one `changed: player`, then hold.
+        let (endpoint, _mock) = spawn_mock_mpd(vec![
+            ConnBehaviour::FinishesThenAdvances {
+                first: "INTERNAL/a.flac".to_string(),
+                second: "INTERNAL/b.flac".to_string(),
+            },
+            ConnBehaviour::IdleOnceThenHold,
+        ])
+        .await;
+        let history = PlayHistory::disabled();
+        let handle = spawn(
+            endpoint,
+            short_timeouts(),
+            SubjectEmitter::null(),
+            AmbientInputs {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                history: history.clone(),
+            },
+        );
+        let mut recent = Vec::new();
+        for _ in 0..60 {
+            recent = history.recently_played(10).await;
+            if !recent.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        handle.stop().await;
+        assert_eq!(recent.len(), 1, "one finish, recorded once: {recent:?}");
+        assert_eq!(
+            recent[0].uri, "INTERNAL/a.flac",
+            "the track that finished, not the one playing"
+        );
+        let most = history.most_played(10).await;
+        assert_eq!(most.len(), 1);
+        assert_eq!(
+            (most[0].uri.as_str(), most[0].count),
+            ("INTERNAL/a.flac", 1)
+        );
+    }
+
+    /// `stop` returns while the observer waits in its idle loop,
+    /// and the task does not reconnect afterwards.
+    ///
+    /// The command connection answers; the idle connection never
+    /// wakes, so after its first snapshot the observer is parked
+    /// in the idle select. A stop fired there used to be consumed
+    /// by that select alone, and the outer loop reconnected for
+    /// ever — unload then burned its whole budget here and never
+    /// reached the shelves' shutdown.
+    #[tokio::test]
+    async fn stop_returns_from_the_idle_loop() {
+        use crate::playback_supervisor::test_mock::{
+            capturing_emitter, short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let (endpoint, _mock) = spawn_mock_mpd(vec![
+            ConnBehaviour::Standard,
+            ConnBehaviour::HoldAfterWelcome,
+        ])
+        .await;
+        let (subjects, _relations, emitter) = capturing_emitter();
+        let handle = spawn(
+            endpoint,
+            short_timeouts(),
+            emitter,
+            AmbientInputs {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                history: PlayHistory::disabled(),
+            },
+        );
+        // The first snapshot is published just before the idle
+        // loop is entered; wait for it, then a beat.
+        for _ in 0..60 {
+            if subjects.state_update_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            subjects.state_update_count() > 0,
+            "the observer never came up"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let stopped =
+            tokio::time::timeout(Duration::from_secs(5), handle.stop()).await;
+        assert!(
+            stopped.is_ok(),
+            "stop must return while the observer waits in its idle loop"
         );
     }
 

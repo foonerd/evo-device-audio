@@ -106,14 +106,19 @@
 // every `impl Plugin` / `impl Warden` method.
 #![allow(clippy::manual_async_fn)]
 
+mod album_shuffle;
+mod artwork_hash;
 mod asound_watcher;
 mod availability;
 mod config;
 mod disposition_emitter;
 mod envelope_subscriber;
 mod favourites;
+mod forgotten_tracks;
 mod gone_curation;
+mod household_door;
 mod idle_observer;
+mod last_queue;
 mod library;
 mod library_triage;
 mod mpd;
@@ -121,16 +126,25 @@ mod mpd_fragment;
 mod mpd_restart;
 mod mute_cell;
 mod network_shares_sync;
+mod play_history;
 mod playback_supervisor;
 mod playlist;
+mod playlist_duplicate;
+mod playlist_export;
+mod playlist_import;
+mod protocol_settings_applier;
 mod queue;
+mod scan_door;
 mod scan_progress;
 mod selection;
 mod shelves;
+mod similar_shuffle;
 mod skip_traversal;
 mod source_probe;
 mod source_registry;
 mod sticker_reconciler;
+mod suggest;
+mod usb_claim;
 mod works;
 
 #[cfg(test)]
@@ -180,6 +194,14 @@ pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 /// shared between the manifest and [`Plugin::describe`]; the
 /// `identity_name_matches_manifest` test enforces parity.
 pub const PLUGIN_NAME: &str = "org.evoframework.playback.mpd";
+
+/// MPD `replay_gain_mode` arguments this distribution uses.
+/// MPD also accepts `auto`; it is deliberately absent, because
+/// "whichever tag happens to be present" is not a choice an
+/// operator can reason about.
+const REPLAY_GAIN_OFF: &str = "off";
+const REPLAY_GAIN_TRACK: &str = "track";
+const REPLAY_GAIN_ALBUM: &str = "album";
 
 /// Default MPD host for a locally-running daemon.
 const DEFAULT_MPD_HOST: &str = "127.0.0.1";
@@ -244,6 +266,7 @@ const SOURCE_REQUEST_TYPES: &[&str] = &[
     "queue.remove_queue_item",
     "queue.move_queue_item",
     "queue.clear_queue",
+    "queue.restore_last_queue",
     "queue.load_playlist_to_queue",
     "queue.append_playlist_to_queue",
     "queue.save_queue_as_playlist",
@@ -260,6 +283,9 @@ const SOURCE_REQUEST_TYPES: &[&str] = &[
     "playlist.remove_from_playlist",
     "playlist.move_in_playlist",
     "playlist.save_selection",
+    "playlist.import_file",
+    "playlist.export_file",
+    "playlist.duplicate",
     // audio.favourites.v1 shelf verbs
     "favourites.list_favourites",
     "favourites.is_favourite",
@@ -287,6 +313,11 @@ const SOURCE_REQUEST_TYPES: &[&str] = &[
     "library.browse_by_year",
     "library.get_triage",
     "library.reconcile_triage",
+    "library.recently_played",
+    "library.most_played",
+    "library.forget_track",
+    "library.forget_album",
+    "library.suggest",
 ];
 
 /// Wire-protocol payload version every source-verb request
@@ -470,6 +501,9 @@ pub struct MpdPlaybackPlugin {
     /// observer, and the queue shelf so a skip or a tap
     /// cannot paint the hero surface unmuted.
     mute: crate::mute_cell::MuteCell,
+    /// The shuffle mode the operator asked for. MPD has no
+    /// album mode, so the now-playing publishers read it here.
+    shuffle: crate::album_shuffle::ShuffleModeCell,
     /// Cumulative count of course corrections dispatched to the
     /// supervisor since construction. Counts attempts, not
     /// successes: a dispatched command that the supervisor then
@@ -512,21 +546,18 @@ pub struct MpdPlaybackPlugin {
     /// re-rendering the mpd_fragment on either change.
     mixer_config_tx: watch::Sender<MixerConfig>,
     /// Watch channel carrying the operator's currently-selected
-    /// MPD-protocol settings (`crossfade_seconds` + `gapless`).
-    /// Seeded with the audiophile-grade defaults at construction
-    /// (no crossfade, gapless on); updated by the
-    /// `playback.options` settings subscriber on every relevant
-    /// subject change. Each spawned supervisor subscribes via
-    /// [`watch::Sender::subscribe`] and the task body's
-    /// `tokio::select!` arm dispatches `SetCrossfade` +
-    /// `SetSingle` whenever the value changes, so MPD's
-    /// protocol-level crossfade + single-mode follow the
-    /// operator's settings without a separate apply gesture.
-    /// Each new supervisor session also reads the channel's
-    /// current value on connect to apply the operator's choice
-    /// from the start (single canonical apply path, no
-    /// session-init / settings-update fork).
-    audio_protocol_settings_tx: watch::Sender<AudioProtocolSettings>,
+    /// The operator's MPD-protocol settings (ReplayGain mode,
+    /// crossfade, gapless). `None` until the `playback.options`
+    /// settings subscriber has delivered them; every delivery
+    /// after that replaces the value, whether or not anything is
+    /// subscribed at the time.
+    ///
+    /// The protocol-settings applier subscribes at load and
+    /// applies the value to every MPD session and on every
+    /// change. Each spawned supervisor subscribes too and applies
+    /// the current value once, as its custody starts; with no
+    /// value yet it applies the audiophile-grade defaults.
+    audio_protocol_settings_tx: watch::Sender<Option<AudioProtocolSettings>>,
     /// Watch channel carrying the operator's declared
     /// startup-volume settings (startup + max). Seeded with
     /// `None` at construction; the options-settings subscriber
@@ -545,6 +576,12 @@ pub struct MpdPlaybackPlugin {
     /// stop it cleanly if it is still waiting.
     startup_volume_applier:
         Option<playback_supervisor::StartupVolumeApplierHandle>,
+    /// Protocol-settings applier task handle. Spawned at
+    /// `Plugin::load`; keeps the operator's ReplayGain mode,
+    /// crossfade and single mode on every MPD session for the
+    /// load's lifetime. Stopped in `Plugin::unload`.
+    protocol_settings_applier:
+        Option<protocol_settings_applier::ProtocolSettingsApplierHandle>,
     /// Concrete handle on the auto-restarter composite so a
     /// future capabilities-watch reactor can call `re_resolve`
     /// on it without going through the `Arc<dyn MpdRestarter>`
@@ -582,10 +619,11 @@ pub struct MpdPlaybackPlugin {
 /// Operator-selected MPD-protocol settings carried on the
 /// plugin's `audio_protocol_settings_tx` watch channel. The
 /// subject subscriber extracts these from the
-/// `audio.options.settings` subject; each spawned supervisor
-/// subscribes to the channel and applies the values via MPD's
-/// protocol-layer verbs (`crossfade <n>` + `single <0|1>`) on
-/// session-init and on every change while a session is live.
+/// `audio.options.settings` subject. The protocol-settings
+/// applier sends them to MPD (`crossfade`, `single`,
+/// `replay_gain_mode`) at every MPD session and on every change;
+/// each spawned supervisor also sends them once, as its custody
+/// starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AudioProtocolSettings {
     /// Between-track crossfade duration in seconds (0..=30,
@@ -596,6 +634,15 @@ pub(crate) struct AudioProtocolSettings {
     /// engages MPD `single 0` — continue through the queue;
     /// `false` engages MPD `single 1` — stop after each track.
     pub(crate) gapless: bool,
+    /// What ReplayGain does to playback, as the MPD
+    /// `replay_gain_mode` argument: `off`, `track` or `album`.
+    ///
+    /// Carried as the wire token rather than a local enum so
+    /// there is one spelling between the operator's settings,
+    /// this channel and the MPD command. Default `off` — the
+    /// file plays as mastered unless the operator asks
+    /// otherwise.
+    pub(crate) replay_gain_mode: &'static str,
 }
 
 impl AudioProtocolSettings {
@@ -606,6 +653,7 @@ impl AudioProtocolSettings {
         Self {
             crossfade_seconds: 0,
             gapless: true,
+            replay_gain_mode: REPLAY_GAIN_OFF,
         }
     }
 }
@@ -687,8 +735,7 @@ impl MpdPlaybackPlugin {
         timeouts: ConnectTimeouts,
     ) -> Self {
         let (mixer_config_tx, _) = watch::channel(MixerConfig::Software);
-        let (audio_protocol_settings_tx, _) =
-            watch::channel(AudioProtocolSettings::audiophile_default());
+        let (audio_protocol_settings_tx, _) = watch::channel(None);
         let (startup_volume_tx, _) = watch::channel(None);
         Self {
             loaded: false,
@@ -707,6 +754,7 @@ impl MpdPlaybackPlugin {
                 false,
             )),
             mute: crate::mute_cell::MuteCell::new(),
+            shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             corrections_dispatched: 0,
             requests_handled: std::sync::atomic::AtomicU64::new(0),
             fragment_path: PathBuf::from(config::DEFAULT_FRAGMENT_PATH),
@@ -717,6 +765,7 @@ impl MpdPlaybackPlugin {
             audio_protocol_settings_tx,
             startup_volume_tx,
             startup_volume_applier: None,
+            protocol_settings_applier: None,
             auto_restarter: None,
             capabilities_watcher: None,
             shelves: None,
@@ -1086,10 +1135,9 @@ impl MpdPlaybackPlugin {
                 if let Some(cfg) =
                     parse_mixer_config_from_settings_state(&state)
                 {
-                    let _ = mixer_tx.send(cfg);
+                    publish_mixer_config_if_changed(&mixer_tx, cfg);
                 }
-                let protocol = parse_audio_protocol_settings_from_state(&state);
-                let _ = protocol_tx.send(protocol);
+                publish_audio_protocol_settings(&protocol_tx, &state);
                 if let Some(sv) =
                     parse_startup_volume_from_settings_state(&state)
                 {
@@ -1104,17 +1152,12 @@ impl MpdPlaybackPlugin {
                             if let Some(cfg) =
                                 parse_mixer_config_from_settings_state(state)
                             {
-                                let _ = mixer_tx.send(cfg);
+                                publish_mixer_config_if_changed(&mixer_tx, cfg);
                             }
-                            let protocol =
-                                parse_audio_protocol_settings_from_state(state);
-                            // send() returns Err only when every
-                            // subscriber has dropped — no live
-                            // supervisor yet. Updating the channel
-                            // value is fine; the next supervisor
-                            // session reads the latest value on
-                            // subscribe.
-                            let _ = protocol_tx.send_replace(protocol);
+                            publish_audio_protocol_settings(
+                                &protocol_tx,
+                                state,
+                            );
                             // Publish updated startup volume too.
                             // The applier consumes only the FIRST
                             // Some(...); subsequent updates flow
@@ -1371,6 +1414,22 @@ fn parse_startup_volume_from_settings_state(
     })
 }
 
+/// Store the operator's MPD-protocol settings carried by an
+/// `audio.options.settings` subject state, for the
+/// protocol-settings applier and for every supervisor that
+/// starts after this.
+///
+/// The value is kept whether or not anything is subscribed. At
+/// load nothing usually is: no custody is live when the settings
+/// first arrive, and a value sent to a channel with no receiver
+/// is dropped.
+fn publish_audio_protocol_settings(
+    tx: &watch::Sender<Option<AudioProtocolSettings>>,
+    state: &serde_json::Value,
+) {
+    tx.send_replace(Some(parse_audio_protocol_settings_from_state(state)));
+}
+
 /// Extract the operator's MPD-protocol settings (crossfade +
 /// gapless) from an `audio.options.settings` subject-state
 /// payload. Missing fields fall through to the audiophile-grade
@@ -1388,9 +1447,44 @@ fn parse_audio_protocol_settings_from_state(
         .get("gapless")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    let replay_gain_mode = state
+        .get("volume_normalization")
+        .and_then(replay_gain_mode_from_setting)
+        .unwrap_or(REPLAY_GAIN_OFF);
     AudioProtocolSettings {
         crossfade_seconds,
         gapless,
+        replay_gain_mode,
+    }
+}
+
+/// MPD's `replay_gain_mode` argument for the operator's
+/// `volume_normalization` setting.
+///
+/// The setting is the mode token `disabled` / `track` / `album`.
+/// `disabled` is MPD's `off`; the other two carry across
+/// unchanged. A token this build does not implement — MPD's
+/// `auto` included — answers `None` and the caller keeps `off`,
+/// because playing a file as mastered is the one outcome that is
+/// never a surprise.
+///
+/// A bool is still read: this field was one, and a device
+/// upgrading has `true` or `false` on disk until the options
+/// plugin next writes its settings. `true` meant levelling per
+/// track.
+fn replay_gain_mode_from_setting(
+    value: &serde_json::Value,
+) -> Option<&'static str> {
+    match value {
+        serde_json::Value::Bool(true) => Some(REPLAY_GAIN_TRACK),
+        serde_json::Value::Bool(false) => Some(REPLAY_GAIN_OFF),
+        serde_json::Value::String(s) => match s.trim() {
+            "disabled" => Some(REPLAY_GAIN_OFF),
+            "track" => Some(REPLAY_GAIN_TRACK),
+            "album" => Some(REPLAY_GAIN_ALBUM),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -1753,7 +1847,34 @@ async fn apply_fragment_cycle(
     // audio_output is already what we would have written and
     // restarting it under active playback is exactly the fault
     // the audio.terminus WARN classifier flagged.
-    let existing = tokio::fs::read_to_string(fragment_path).await.ok();
+    // A read that fails is not a fragment that differs.
+    //
+    // `.ok()` used to fold every error into `None`, which the
+    // compare below reads as "no file yet" — so an unreadable
+    // fragment took the write-and-restart path on every options
+    // update. A permission change or a transient IO error on that
+    // path became MPD restarting under playback, repeatedly,
+    // until systemd's restart budget stopped it.
+    //
+    // Absent is still absent and still legitimately written. Only
+    // an error we cannot interpret stops the cycle, because
+    // without the current bytes there is no evidence the fragment
+    // needs changing, and a restart on no evidence is the fault.
+    let existing = match tokio::fs::read_to_string(fragment_path).await {
+        Ok(contents) => Some(contents),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                path = %fragment_path.display(),
+                "fragment could not be read; leaving it and MPD alone. \
+                 LOGGING.md §2: the operator's audio_output may be stale \
+                 and this names why."
+            );
+            return FragmentWorkerStatus::Idle;
+        }
+    };
     if fragment_content_matches(existing.as_deref(), &rendered) {
         tracing::debug!(
             plugin = PLUGIN_NAME,
@@ -1805,6 +1926,31 @@ async fn apply_fragment_cycle(
 ///
 /// Isolated from `apply_fragment_cycle` so the dedupe rule is
 /// unit-testable without a filesystem or a restarter mock.
+/// Publish a mixer config only when it differs from the one
+/// already on the channel. Returns `true` when subscribers were
+/// notified.
+///
+/// `watch::Sender::send` notifies unconditionally, and the
+/// fragment worker wakes on every notification. The operator's
+/// audio options carry far more than the mixer mode, so an update
+/// that changed a band or a volume used to start a render cycle
+/// whose only possible outcome was reading the fragment back and
+/// finding it identical — and on a box where that read fails, a
+/// restart.
+fn publish_mixer_config_if_changed(
+    tx: &watch::Sender<MixerConfig>,
+    cfg: MixerConfig,
+) -> bool {
+    tx.send_if_modified(|current| {
+        if *current == cfg {
+            false
+        } else {
+            *current = cfg;
+            true
+        }
+    })
+}
+
 fn fragment_content_matches(existing: Option<&str>, rendered: &str) -> bool {
     match existing {
         Some(prev) => prev == rendered,
@@ -1996,12 +2142,14 @@ fn parse_correction(
                 other
             ))),
         },
-        "set_shuffle" => match trimmed {
-            "1" | "true" => Ok(PlaybackCommand::SetShuffle(true)),
-            "0" | "false" => Ok(PlaybackCommand::SetShuffle(false)),
-            other => Err(PluginError::Permanent(format!(
-                "set_shuffle payload must be '0'/'1' or 'true'/'false', got {:?}",
-                other
+        "set_shuffle" => match crate::album_shuffle::ShuffleMode::parse(
+            trimmed,
+        ) {
+            Some(mode) => Ok(PlaybackCommand::SetShuffle(mode)),
+            None => Err(PluginError::Permanent(format!(
+                "set_shuffle payload must be '0'/'1', 'true'/'false', \
+                 'tracks', 'albums' or 'similar', got {:?}",
+                trimmed
             ))),
         },
         "set_single" => match trimmed {
@@ -2307,13 +2455,25 @@ impl Plugin for MpdPlaybackPlugin {
                      source-format probe disarmed — source_codec still surfaces"
                 );
             }
+            // The play history lives in the plugin's state
+            // directory and survives a restart. The observer
+            // records into it; the library's two history reads
+            // answer from it.
+            let play_history = play_history::PlayHistory::open(
+                ctx.state_dir.join("play-history.toml"),
+            )
+            .await;
             self.ambient_observer =
                 Some(playback_supervisor::spawn_ambient_observer(
                     self.endpoint.clone(),
                     self.timeouts,
                     ambient_emitter,
-                    music_directory,
-                    self.mute.clone(),
+                    playback_supervisor::AmbientInputs {
+                        music_directory,
+                        mute: self.mute.clone(),
+                        shuffle: self.shuffle.clone(),
+                        history: play_history.clone(),
+                    },
                 ));
             tracing::info!(
                 plugin = PLUGIN_NAME,
@@ -2413,6 +2573,20 @@ impl Plugin for MpdPlaybackPlugin {
                  MPD acceptance"
             );
 
+            // Spawn the protocol-settings applier. MPD forgets its
+            // ReplayGain mode on every restart, and restarts do not
+            // wait for a custody; the applier gives every MPD
+            // session the operator's ReplayGain mode, crossfade
+            // and single mode, and sends every change, from the
+            // moment the options-settings subscriber above
+            // delivers them.
+            self.protocol_settings_applier =
+                Some(protocol_settings_applier::spawn(
+                    self.endpoint.clone(),
+                    self.timeouts,
+                    self.audio_protocol_settings_tx.subscribe(),
+                ));
+
             // Spawn the /etc/asound.d/ composition-change
             // watcher. On every detected change the watcher
             // dispatches a CycleOutput to the active custody's
@@ -2439,7 +2613,12 @@ impl Plugin for MpdPlaybackPlugin {
                 self.endpoint.clone(),
                 self.timeouts,
                 ctx.shelf_request_dispatcher.clone(),
-                self.mute.clone(),
+                shelves::ShelfInputs {
+                    mute: self.mute.clone(),
+                    shuffle: self.shuffle.clone(),
+                    play_history,
+                    fragment_status: self.subscribe_fragment_status(),
+                },
             )
             .await;
             self.shelves = Some(shelves);
@@ -2582,6 +2761,12 @@ impl Plugin for MpdPlaybackPlugin {
                 // awaits deterministic exit before we tear down
                 // the shelves (which owns the registry the sync
                 // upserts into).
+                // Its share kicks wait on the library's scan gate;
+                // release them first so this stop never waits for
+                // MPD to settle.
+                if let Some(shelves) = self.shelves.as_ref() {
+                    shelves.release_scan_waiters();
+                }
                 if let Some(handle) = self.network_shares_sync.take() {
                     handle.stop().await;
                 }
@@ -2599,6 +2784,9 @@ impl Plugin for MpdPlaybackPlugin {
                 // `setvol`); the take + stop is a no-op when
                 // the join handle is completed.
                 if let Some(handle) = self.startup_volume_applier.take() {
+                    handle.stop().await;
+                }
+                if let Some(handle) = self.protocol_settings_applier.take() {
                     handle.stop().await;
                 }
                 // Stop the asound watcher last. The
@@ -2723,6 +2911,7 @@ impl Warden for MpdPlaybackPlugin {
                             ),
                         ),
                     mute: self.mute.clone(),
+                    shuffle: self.shuffle.clone(),
                 },
             )
             .await
@@ -2947,7 +3136,7 @@ impl Respondent for MpdPlaybackPlugin {
                 "set_volume" => self.handle_set_volume(req).await,
                 "set_mute" => self.handle_set_bool(req, "set_mute").await,
                 "set_repeat" => self.handle_set_bool(req, "set_repeat").await,
-                "set_shuffle" => self.handle_set_bool(req, "set_shuffle").await,
+                "set_shuffle" => self.handle_set_shuffle(req).await,
                 "set_single" => self.handle_set_bool(req, "set_single").await,
                 "set_consume" => self.handle_set_bool(req, "set_consume").await,
                 "get_now_playing" => self.handle_get_now_playing(req).await,
@@ -3175,6 +3364,66 @@ impl MpdPlaybackPlugin {
     /// The payload shape is uniform (`{ "v": 1, "enabled": bool
     /// }`); the verb name selects which [`PlaybackCommand`]
     /// variant is dispatched.
+    /// `set_shuffle` on the shelf: off, by track, or by album.
+    ///
+    /// The glass sends `{ v, enabled }` and that is the fielded
+    /// contract — `true` is track shuffle, `false` is off. It is
+    /// the only shape an existing glass knows, so it keeps
+    /// working byte for byte.
+    ///
+    /// `{ v, mode }` is how albums are asked for. The mode went
+    /// in on the course-correction payload first, which the
+    /// operator never sends: the glass calls this verb, so a word
+    /// here was a parse failure and album shuffle was
+    /// unreachable from the only surface an operator has.
+    ///
+    /// Exactly one of the two is given. Both at once is refused
+    /// rather than resolved by precedence: a caller sending both
+    /// does not agree with itself, and guessing which half it
+    /// meant is how a device ends up in a mode nobody chose.
+    async fn handle_set_shuffle(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SetShufflePayload =
+            parse_versioned_payload(req, "set_shuffle")?;
+        let mode = match (payload.mode.as_deref(), payload.enabled) {
+            (Some(raw), None) => crate::album_shuffle::ShuffleMode::parse(raw)
+                .ok_or_else(|| {
+                    PluginError::Permanent(format!(
+                        "set_shuffle mode must be 'off', 'tracks', \
+                         'albums' or 'similar', got {raw:?}"
+                    ))
+                })?,
+            (None, Some(true)) => crate::album_shuffle::ShuffleMode::Tracks,
+            (None, Some(false)) => crate::album_shuffle::ShuffleMode::Off,
+            (Some(_), Some(_)) => {
+                return Err(PluginError::Permanent(
+                    "set_shuffle takes either 'enabled' or 'mode', not \
+                     both"
+                        .to_string(),
+                ));
+            }
+            (None, None) => {
+                return Err(PluginError::Permanent(
+                    "set_shuffle needs 'enabled' (bool) or 'mode' \
+                     ('off' / 'tracks' / 'albums' / 'similar')"
+                        .to_string(),
+                ));
+            }
+        };
+        let supervisor = self.active_supervisor("set_shuffle")?;
+        // Remembered before dispatch so the report cannot be
+        // published between the mode taking effect and this
+        // being written.
+        self.shuffle.set(mode);
+        supervisor
+            .command(PlaybackCommand::SetShuffle(mode))
+            .await
+            .map_err(playback_error_to_plugin_error)?;
+        encode_simple_ok(req)
+    }
+
     async fn handle_set_bool(
         &self,
         req: &Request,
@@ -3184,7 +3433,6 @@ impl MpdPlaybackPlugin {
         let cmd = match verb_name {
             "set_mute" => PlaybackCommand::SetMute(payload.enabled),
             "set_repeat" => PlaybackCommand::SetRepeat(payload.enabled),
-            "set_shuffle" => PlaybackCommand::SetShuffle(payload.enabled),
             "set_single" => PlaybackCommand::SetSingle(payload.enabled),
             "set_consume" => PlaybackCommand::SetConsume(payload.enabled),
             other => {
@@ -3825,6 +4073,24 @@ impl HasPayloadVersion for SeekByDeltaPayload {
 /// `set_mute`, `set_repeat`, `set_shuffle`, `set_single`,
 /// `set_consume`. Uniform shape lets one struct + one handler
 /// (`handle_set_bool`) drive every toggle verb.
+#[derive(Debug, serde::Deserialize)]
+struct SetShufflePayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    /// The fielded shape. `true` is track shuffle.
+    #[serde(default)]
+    enabled: Option<bool>,
+    /// The mode by name: `off`, `tracks`, `albums`, `similar`.
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+impl HasPayloadVersion for SetShufflePayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct SetBoolPayload {
     #[serde(default = "default_payload_version")]
@@ -4707,13 +4973,42 @@ mod tests {
 
     #[test]
     fn parse_set_shuffle_true_and_false() {
+        use crate::album_shuffle::ShuffleMode;
+        // The fielded spelling keeps its meaning: `1` is track
+        // shuffle, not the album mode.
         assert_eq!(
             parse_correction(&correction("set_shuffle", b"1", 1)).unwrap(),
-            PlaybackCommand::SetShuffle(true)
+            PlaybackCommand::SetShuffle(ShuffleMode::Tracks)
         );
         assert_eq!(
             parse_correction(&correction("set_shuffle", b"0", 1)).unwrap(),
-            PlaybackCommand::SetShuffle(false)
+            PlaybackCommand::SetShuffle(ShuffleMode::Off)
+        );
+    }
+
+    /// The operator can ask for albums over the same verb.
+    #[test]
+    fn parse_set_shuffle_accepts_albums() {
+        use crate::album_shuffle::ShuffleMode;
+        for raw in [&b"albums"[..], &b"album"[..]] {
+            assert_eq!(
+                parse_correction(&correction("set_shuffle", raw, 1)).unwrap(),
+                PlaybackCommand::SetShuffle(ShuffleMode::Albums),
+                "{:?}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+        // And similar, by that name.
+        assert_eq!(
+            parse_correction(&correction("set_shuffle", b"similar", 1))
+                .unwrap(),
+            PlaybackCommand::SetShuffle(ShuffleMode::Similar)
+        );
+        // And a word this build does not implement is refused
+        // rather than silently read as one of the four.
+        assert!(
+            parse_correction(&correction("set_shuffle", b"smart", 1)).is_err(),
+            "an unknown shuffle mode must be refused"
         );
     }
 
@@ -4864,7 +5159,7 @@ mod tests {
         // 4 = currentsong, 5 = play -> ACK.
         let (mut p, _mock) = loaded_plugin_with_mock(vec![
             ConnBehaviour::AckOnNth {
-                nth: 5,
+                nth: 6,
                 code: 2,
                 message: "Bad song index".to_string(),
             },
@@ -5274,6 +5569,108 @@ mod tests {
         p.stop_reactor().await;
     }
 
+    /// Both options-update paths go through the gate.
+    ///
+    /// The subscriber publishes the mixer config from two places —
+    /// the seed read and each subsequent state update — and the
+    /// gate only helps where it is actually called. A bare
+    /// `mixer_tx.send` at either site restores the wake-on-every-
+    /// update behaviour with the helper's own test still green.
+    #[test]
+    fn every_mixer_publication_goes_through_the_gate() {
+        let src = include_str!("lib.rs");
+        let body = &src[..src.find("mod tests {").unwrap_or(src.len())];
+        assert_eq!(
+            body.matches("publish_mixer_config_if_changed(&mixer_tx,")
+                .count(),
+            2,
+            "both publication sites must use the gate"
+        );
+        assert!(
+            !body.contains("mixer_tx.send("),
+            "no publication may bypass the gate"
+        );
+    }
+
+    /// An unchanged mixer config does not wake the worker.
+    ///
+    /// The operator's audio options carry bands, volumes and a
+    /// mixer mode on one subject. Every update used to republish
+    /// the mixer mode whether or not it moved, and the fragment
+    /// worker wakes on every publication — so changing a band
+    /// started a render cycle whose only possible outcome was
+    /// finding the fragment identical.
+    #[test]
+    fn an_unchanged_mixer_config_is_not_republished() {
+        let (tx, mut rx) = watch::channel(MixerConfig::Software);
+        rx.borrow_and_update();
+
+        assert!(
+            !publish_mixer_config_if_changed(&tx, MixerConfig::Software),
+            "the same mixer config must not notify"
+        );
+        assert!(!rx.has_changed().unwrap(), "no subscriber may be woken");
+
+        assert!(
+            publish_mixer_config_if_changed(&tx, MixerConfig::None),
+            "a different mixer config must notify"
+        );
+        assert!(rx.has_changed().unwrap(), "a real change must wake");
+        assert_eq!(*rx.borrow_and_update(), MixerConfig::None);
+    }
+
+    /// A fragment that cannot be read is not a fragment that
+    /// differs, and must not restart MPD.
+    ///
+    /// The read folded every error into "no file yet", which the
+    /// compare treats as a reason to write and restart. A
+    /// permission change or a transient IO error on that path
+    /// became MPD restarting under playback on every options
+    /// update, until systemd's restart budget stopped it.
+    #[tokio::test]
+    async fn an_unreadable_fragment_warns_and_does_not_restart_mpd() {
+        let tempdir = tempfile::tempdir().unwrap();
+        // A directory where a file is expected: the read fails
+        // with something other than NotFound.
+        let fragment_path = tempdir.path().join("mpd.conf");
+        std::fs::create_dir(&fragment_path).unwrap();
+
+        let restarter = Arc::new(NoOpRestarter::new());
+        let mut p = MpdPlaybackPlugin::new()
+            .with_restarter(Arc::clone(&restarter) as Arc<dyn MpdRestarter>)
+            .with_fragment_path(fragment_path.clone());
+        let stub = Arc::new(StubSourceAudioRouting::new());
+        stub.set_write_endpoint(default_alsa_write_endpoint());
+        p.install_routing(Some(Arc::clone(&stub) as Arc<dyn F3AudioRouting>))
+            .unwrap();
+        p.spawn_reactor().await.unwrap();
+        p.spawn_fragment_worker().await.unwrap();
+
+        // The witness is whether a write was attempted at all.
+        // `atomic_write_fragment` stages through a sibling
+        // `.<name>.tmp`, so that file appearing means the cycle
+        // went past the read and tried to replace the fragment —
+        // which is the path that ends in a restart. Waiting on a
+        // worker status cannot witness this: the status channel is
+        // seeded Idle, so a wait for Idle succeeds before any
+        // cycle has run.
+        let staging = tempdir.path().join(".mpd.conf.tmp");
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(750);
+        while std::time::Instant::now() < deadline {
+            assert!(
+                !staging.exists(),
+                "no write may be attempted when the fragment cannot be read"
+            );
+            assert_eq!(
+                restarter.call_count(),
+                0,
+                "MPD must not be restarted on a failed fragment read"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
     #[tokio::test]
     async fn fragment_worker_publishes_failed_when_restart_fails() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -5432,6 +5829,176 @@ mod tests {
     /// Build a respondent request for the supplied verb +
     /// JSON payload. Mirrors how the framework's source-verb
     /// dispatcher constructs the wire envelope.
+    /// The shelf verb is the only surface an operator has.
+    ///
+    /// `albums` went in on the course-correction payload first,
+    /// which the glass never sends — so a word on this verb was a
+    /// parse failure and album shuffle was unreachable. These
+    /// drive `handle_request` the way the glass does.
+    async fn shelf_set_shuffle(
+        payload: Value,
+    ) -> (
+        Result<Response, PluginError>,
+        Vec<String>,
+        crate::album_shuffle::ShuffleMode,
+    ) {
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut p, _mock) = loaded_plugin_with_mock(vec![
+            ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                // A playing row that is not first, so similar
+                // mode — which leads with the playing row — can
+                // never draw the order the queue already has.
+                // Interleaved so that album mode cannot either:
+                // the mock tags each row with its directory as
+                // the album, so these are two albums and no
+                // contiguous order is this one. A pin that could
+                // pass or fail on the draw is not a pin.
+                items: vec![
+                    (11, "blue/1.flac".to_string()),
+                    (21, "red/1.flac".to_string()),
+                    (12, "blue/2.flac".to_string()),
+                    (22, "red/2.flac".to_string()),
+                ],
+                playing: Some(2),
+            },
+            ConnBehaviour::HoldAfterWelcome,
+        ])
+        .await;
+        let reporter: Arc<dyn CustodyStateReporter> =
+            Arc::new(CapturingReporter::default());
+        let handle = p.take_custody(assignment(reporter, 11)).await.unwrap();
+        let got = p
+            .handle_request(&source_request("set_shuffle", payload))
+            .await;
+        let seen = commands.lock().unwrap().clone();
+        // What the now-playing publishers will read. The mode
+        // reaching MPD is not the same fact as the report being
+        // able to say so.
+        let remembered = p.shuffle.get();
+        p.release_custody(handle).await.unwrap();
+        (got, seen, remembered)
+    }
+
+    /// A shelf set_shuffle of albums reorders the queue and
+    /// leaves MPD random off.
+    #[tokio::test]
+    async fn shelf_set_shuffle_albums_reorders_with_random_off() {
+        let (got, seen, remembered) =
+            shelf_set_shuffle(json!({ "v": 1, "mode": "albums" })).await;
+        assert!(
+            got.is_ok(),
+            "the operator's surface must accept albums: {got:?}"
+        );
+        assert!(
+            seen.iter().any(|c| c == "random \"0\""),
+            "album order is the queue's: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|c| c != "random \"1\""),
+            "album mode must not hand the order back to MPD: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|c| c.starts_with("moveid ")),
+            "the chosen album order must reach the queue: {seen:?}"
+        );
+        // And the publishers can say so. The mode reaching MPD is
+        // not the same fact as the report carrying it: album order
+        // lives in the queue with random off, so a publisher that
+        // reads only MPD sees "not shuffling".
+        assert_eq!(
+            remembered,
+            crate::album_shuffle::ShuffleMode::Albums,
+            "the gesture must record the mode for now_playing"
+        );
+    }
+
+    /// A shelf set_shuffle of similar writes an order into the
+    /// queue, leaves MPD random off, and records the mode so
+    /// now_playing can say so. This is the surface the operator
+    /// selects it from.
+    #[tokio::test]
+    async fn shelf_set_shuffle_similar_reorders_with_random_off() {
+        let (got, seen, remembered) =
+            shelf_set_shuffle(json!({ "v": 1, "mode": "similar" })).await;
+        assert!(got.is_ok(), "the shelf must accept similar: {got:?}");
+        assert!(
+            seen.iter().any(|c| c == "random \"0\""),
+            "similar order is the queue's, so MPD's random stays off: \
+             {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|c| c != "random \"1\""),
+            "similar mode must not hand the order back to MPD to \
+             scramble: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|c| c.starts_with("moveid ")),
+            "the chosen order must reach the queue: {seen:?}"
+        );
+        assert_eq!(
+            remembered,
+            crate::album_shuffle::ShuffleMode::Similar,
+            "the gesture must record the mode for now_playing"
+        );
+    }
+
+    /// A shelf set_shuffle of { enabled: true } is still track
+    /// shuffle. This is the shape the fielded glass sends.
+    #[tokio::test]
+    async fn shelf_set_shuffle_enabled_true_is_still_track_shuffle() {
+        let (got, seen, remembered) =
+            shelf_set_shuffle(json!({ "v": 1, "enabled": true })).await;
+        assert!(got.is_ok(), "the fielded shape must keep working: {got:?}");
+        assert!(
+            seen.iter().any(|c| c == "random \"1\""),
+            "enabled true is MPD random: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|c| !c.starts_with("moveid ")),
+            "track shuffle must not reorder the operator's queue: {seen:?}"
+        );
+        assert_eq!(
+            remembered,
+            crate::album_shuffle::ShuffleMode::Tracks,
+            "the fielded shape records track shuffle, not albums"
+        );
+
+        let (got_off, seen_off, remembered_off) =
+            shelf_set_shuffle(json!({ "v": 1, "enabled": false })).await;
+        assert!(got_off.is_ok(), "{got_off:?}");
+        assert!(
+            seen_off.iter().any(|c| c == "random \"0\"")
+                && seen_off.iter().all(|c| !c.starts_with("moveid ")),
+            "enabled false is plain off: {seen_off:?}"
+        );
+        assert_eq!(
+            remembered_off,
+            crate::album_shuffle::ShuffleMode::Off,
+            "and records off"
+        );
+    }
+
+    /// A payload that does not agree with itself, or says
+    /// nothing, is refused rather than resolved by precedence.
+    #[tokio::test]
+    async fn shelf_set_shuffle_refuses_an_ambiguous_or_empty_payload() {
+        for payload in [
+            json!({ "v": 1, "enabled": true, "mode": "albums" }),
+            json!({ "v": 1 }),
+            json!({ "v": 1, "mode": "smart" }),
+        ] {
+            let (got, seen, _) = shelf_set_shuffle(payload.clone()).await;
+            assert!(got.is_err(), "{payload} must be refused");
+            assert!(
+                seen.iter()
+                    .all(|c| !c.starts_with("random ")
+                        && !c.starts_with("moveid ")),
+                "{payload} must change nothing: {seen:?}"
+            );
+        }
+    }
+
     fn source_request(verb: &str, payload: Value) -> Request {
         Request {
             request_type: verb.to_string(),
@@ -6091,6 +6658,52 @@ mod tests {
         assert!(!s.gapless);
     }
 
+    /// The operator's mode token becomes MPD's argument.
+    #[test]
+    fn volume_normalization_maps_to_the_mpd_replay_gain_argument() {
+        for (setting, want) in [
+            (json!("disabled"), REPLAY_GAIN_OFF),
+            (json!("track"), REPLAY_GAIN_TRACK),
+            (json!("album"), REPLAY_GAIN_ALBUM),
+        ] {
+            let s = parse_audio_protocol_settings_from_state(
+                &json!({ "volume_normalization": setting }),
+            );
+            assert_eq!(s.replay_gain_mode, want, "for {setting}");
+        }
+    }
+
+    /// The field this setting used to be still reads, so a device
+    /// upgrading keeps playing the way it did until the options
+    /// plugin next writes its settings. `true` meant levelling
+    /// per track.
+    #[test]
+    fn the_bool_volume_normalization_used_to_be_still_maps() {
+        let on = parse_audio_protocol_settings_from_state(
+            &json!({ "volume_normalization": true }),
+        );
+        assert_eq!(on.replay_gain_mode, REPLAY_GAIN_TRACK);
+        let off = parse_audio_protocol_settings_from_state(
+            &json!({ "volume_normalization": false }),
+        );
+        assert_eq!(off.replay_gain_mode, REPLAY_GAIN_OFF);
+    }
+
+    /// Absent, or a mode this build does not implement, plays the
+    /// file as mastered. That is the one outcome that is never a
+    /// surprise.
+    #[test]
+    fn an_unknown_volume_normalization_plays_the_file_as_mastered() {
+        for setting in [json!("auto"), json!("Album"), json!(7), json!(null)] {
+            let s = parse_audio_protocol_settings_from_state(
+                &json!({ "volume_normalization": setting }),
+            );
+            assert_eq!(s.replay_gain_mode, REPLAY_GAIN_OFF, "for {setting}");
+        }
+        let absent = parse_audio_protocol_settings_from_state(&json!({}));
+        assert_eq!(absent.replay_gain_mode, REPLAY_GAIN_OFF);
+    }
+
     #[test]
     fn protocol_settings_ignores_unrelated_fields() {
         let s = parse_audio_protocol_settings_from_state(&json!({
@@ -6208,6 +6821,33 @@ mod tests {
         );
     }
 
+    /// The operator's settings are kept when they arrive with no
+    /// custody live, as they do at load: nothing is subscribed to
+    /// the channel then, and a value sent to a channel with no
+    /// receiver is dropped.
+    #[test]
+    fn settings_that_arrive_with_no_custody_are_kept() {
+        let (tx, _) = watch::channel(None);
+        publish_audio_protocol_settings(
+            &tx,
+            &json!({
+                "volume_normalization": "album",
+                "crossfade_seconds": 4,
+                "gapless": false,
+            }),
+        );
+        let kept = *tx.subscribe().borrow();
+        assert_eq!(
+            kept,
+            Some(AudioProtocolSettings {
+                crossfade_seconds: 4,
+                gapless: false,
+                replay_gain_mode: REPLAY_GAIN_ALBUM,
+            }),
+            "the stored settings must be there for whoever starts next"
+        );
+    }
+
     // ---- supervisor session-init apply path ----
 
     #[tokio::test]
@@ -6231,10 +6871,11 @@ mod tests {
         // Seed the watch channel with non-default values BEFORE
         // spawning the supervisor; this is the operator's
         // persisted state at the moment a new custody starts.
-        let (tx, rx) = watch::channel(AudioProtocolSettings {
+        let (tx, rx) = watch::channel(Some(AudioProtocolSettings {
             crossfade_seconds: 7,
             gapless: false,
-        });
+            replay_gain_mode: REPLAY_GAIN_OFF,
+        }));
 
         let handle = playback_supervisor::spawn(
             endpoint,
@@ -6246,6 +6887,7 @@ mod tests {
             playback_supervisor::SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await

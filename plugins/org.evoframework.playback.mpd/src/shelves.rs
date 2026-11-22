@@ -105,8 +105,31 @@ pub(crate) struct ShelfBundle {
     /// discovered.json sidecar and probes them on a fixed
     /// cadence. Held so unload can stop the task cleanly.
     pub(crate) dlna_sync: Option<DlnaSyncHandle>,
+    /// Opens the library's scan gate once MPD has settled after
+    /// load, then runs the one restart pass. Held so unload can
+    /// release waiting kicks and stop it.
+    pub(crate) scan_settle: Option<crate::scan_door::ScanSettleHandle>,
+    /// Finished plays, recorded by the ambient observer; the
+    /// library's `recently_played` / `most_played` read it.
+    pub(crate) play_history: crate::play_history::PlayHistory,
     pub(crate) endpoint: MpdEndpoint,
     pub(crate) timeouts: ConnectTimeouts,
+}
+
+/// What the plugin holds and the shelves read: the two intent
+/// cells the now-playing publishers share, and the play history
+/// the library's two history reads answer from. Handed to
+/// [`ShelfBundle::init`] as one value, the way the ambient
+/// observer takes its inputs.
+pub(crate) struct ShelfInputs {
+    pub(crate) mute: crate::mute_cell::MuteCell,
+    pub(crate) shuffle: crate::album_shuffle::ShuffleModeCell,
+    pub(crate) play_history: crate::play_history::PlayHistory,
+    /// The fragment worker's status, which the scan gate watches
+    /// to tell when MPD has stopped restarting after load. `None`
+    /// when no worker runs.
+    pub(crate) fragment_status:
+        Option<tokio::sync::watch::Receiver<crate::FragmentWorkerStatus>>,
 }
 
 impl ShelfBundle {
@@ -127,8 +150,14 @@ impl ShelfBundle {
                 dyn evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher,
             >,
         >,
-        mute: crate::mute_cell::MuteCell,
+        inputs: ShelfInputs,
     ) -> Self {
+        let ShelfInputs {
+            mute,
+            shuffle,
+            play_history,
+            fragment_status,
+        } = inputs;
         let music_directory = source_probe::load_music_directory_from_mpd_conf(
             Path::new(source_probe::DEFAULT_MPD_CONF_PATH),
         )
@@ -167,6 +196,12 @@ impl ShelfBundle {
         let skip_traversal =
             SkipTraversal::new(registry.clone(), disposition_emitter.clone());
 
+        // One scan-time artwork hash table, shared by every shelf
+        // that renders list rows.
+        let artwork_hashes = crate::artwork_hash::ArtworkHashIndex::open(
+            state_dir.join("artwork-hashes.json"),
+        );
+
         // Construct each shelf's context.
         let queue = QueueContext::new(
             music_directory.clone(),
@@ -175,26 +210,45 @@ impl ShelfBundle {
             skip_traversal.clone(),
             shelf_dispatcher.clone(),
             mute,
-        );
+            shuffle,
+        )
+        .with_last_queue_store(crate::last_queue::LastQueueStore::at(
+            state_dir.join("last-queue.toml"),
+        ))
+        .with_artwork_hashes(artwork_hashes.clone());
         let playlist = PlaylistContext::new(
             music_directory.clone(),
             registry.clone(),
             subjects.clone(),
             DEFAULT_FAVOURITES_PLAYLIST_NAME.to_string(),
             shelf_dispatcher.clone(),
-        );
+        )
+        .with_artwork_hashes(artwork_hashes.clone());
         let favourites = FavouritesContext::new(
             music_directory.clone(),
             registry.clone(),
             subjects.clone(),
             DEFAULT_FAVOURITES_PLAYLIST_NAME.to_string(),
-        );
+        )
+        .with_artwork_hashes(artwork_hashes.clone());
+        // No index starts until MPD has settled after load; see
+        // `scan_door`. Every clone of the library shares this gate.
+        let scan_gate =
+            crate::scan_door::ScanGate::waiting(endpoint.clone(), timeouts);
         let library = LibraryContext::new(
             music_directory.clone(),
             registry.clone(),
             subjects.clone(),
             shelf_dispatcher.clone(),
-        );
+        )
+        .with_forgotten(
+            crate::forgotten_tracks::ForgottenTracks::open(
+                state_dir.join("forgotten-tracks.toml"),
+            )
+            .await,
+        )
+        .with_scan_gate(scan_gate.clone())
+        .with_artwork_hashes(artwork_hashes.clone());
         // The triage context clones the library, registry, and
         // subject announcer — every field is Arc-wrapped, so
         // the clone shares state rather than duplicating it.
@@ -270,7 +324,11 @@ impl ShelfBundle {
         // within the steward's load timeout. Per-source probes
         // run concurrently so worst-case wall-clock is the
         // slowest single probe, not the sum.
-        Self::run_warm_start_probes_blocking(&registry).await;
+        //
+        // Warm start starts no index: MPD may still restart under
+        // it. It only records which USB stores a mount brought
+        // Online, for the restart pass after settle.
+        Self::run_warm_start_probes_blocking(&registry, &scan_gate).await;
 
         // Warm-start rehydration: replace the empty envelopes
         // with MPD's persisted truth (queue, stored playlists,
@@ -316,6 +374,13 @@ impl ShelfBundle {
 
         let dlna_sync = Some(library::spawn_dlna_sync(library.clone()));
 
+        let scan_settle = Some(crate::scan_door::spawn_settle(
+            library.clone(),
+            fragment_status,
+            crate::scan_door::SETTLE_QUIET,
+            crate::scan_door::SETTLE_MAX,
+        ));
+
         tracing::info!(
             plugin = PLUGIN_NAME,
             music_directory = %music_directory.display(),
@@ -336,6 +401,8 @@ impl ShelfBundle {
             sticker_reconciler,
             idle_observer,
             dlna_sync,
+            scan_settle,
+            play_history,
             endpoint,
             timeouts,
         }
@@ -429,11 +496,15 @@ impl ShelfBundle {
     /// the source in Probing; the cascade emits `null` honestly
     /// for that source's items rather than fabricating a
     /// falsy default.
-    async fn run_warm_start_probes_blocking(registry: &SourceRegistry) {
+    async fn run_warm_start_probes_blocking(
+        registry: &SourceRegistry,
+        scan_gate: &crate::scan_door::ScanGate,
+    ) {
         let snapshot = registry.snapshot().await;
         let mut handles = Vec::with_capacity(snapshot.len());
         for record in snapshot {
             let registry = registry.clone();
+            let scan_gate = scan_gate.clone();
             let source_id = record.id.clone();
             handles.push(tokio::spawn(async move {
                 let full = match registry.get(&source_id).await {
@@ -445,15 +516,23 @@ impl ShelfBundle {
                     crate::source_registry::PROBE_BUDGET,
                 )
                 .await;
-                if let Err(e) =
-                    registry.transition(&source_id, outcome.new_state).await
-                {
-                    tracing::warn!(
-                        plugin = PLUGIN_NAME,
-                        source_id = %source_id,
-                        error = %e,
-                        "warm-start probe: registry transition failed"
-                    );
+                let mount_event = crate::scan_door::warm_start_mount_event(
+                    &full,
+                    &outcome.new_state,
+                );
+                match registry.transition(&source_id, outcome.new_state).await {
+                    Ok(_) if mount_event => {
+                        scan_gate.record_mount_event(&source_id);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = PLUGIN_NAME,
+                            source_id = %source_id,
+                            error = %e,
+                            "warm-start probe: registry transition failed"
+                        );
+                    }
                 }
             }));
         }
@@ -478,6 +557,37 @@ impl ShelfBundle {
     /// `emit` call so no explicit unload-time persist is
     /// needed.
     pub(crate) async fn shutdown(mut self) {
+        // Release any index still waiting for the scan gate. A
+        // kick must not start while the plugin goes down.
+        if let Some(handle) = self.scan_settle.take() {
+            handle.stop().await;
+        }
+        // Keep the queue first, while MPD is most likely still
+        // there to be asked. A reboot can lose it; this is what
+        // `restore_last_queue` gives back afterwards. A failure
+        // here is reported and does not hold up the unload.
+        match self.open_conn().await {
+            Ok(mut conn) => {
+                if let Err(e) = queue::snapshot_last_queue(
+                    &self.queue,
+                    &mut conn,
+                    crate::last_queue::SnapshotReason::Shutdown,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        "the queue could not be kept at shutdown"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "MPD unreachable at shutdown; the queue was not kept"
+            ),
+        }
         if let Some(handle) = self.idle_observer.take() {
             handle.stop().await;
         }
@@ -495,6 +605,14 @@ impl ShelfBundle {
                  next load may rehydrate from stale state"
             );
         }
+    }
+
+    /// Release every index kick still waiting for the scan gate
+    /// without starting it. Unload calls this before stopping the
+    /// tasks whose kicks wait there, so none of them holds the
+    /// unload until MPD settles.
+    pub(crate) fn release_scan_waiters(&self) {
+        self.library.scan_gate.stop();
     }
 
     /// Open a fresh MPD connection for one verb dispatch.
@@ -533,6 +651,9 @@ impl ShelfBundle {
             }
             "queue.clear_queue" => {
                 Ok(Some(self.dispatch_queue_clear_queue(req).await?))
+            }
+            "queue.restore_last_queue" => {
+                Ok(Some(self.dispatch_queue_restore_last_queue(req).await?))
             }
             "queue.load_playlist_to_queue" => {
                 Ok(Some(self.dispatch_queue_load_playlist_to_queue(req).await?))
@@ -576,6 +697,15 @@ impl ShelfBundle {
             )),
             "playlist.move_in_playlist" => {
                 Ok(Some(self.dispatch_playlist_move_in_playlist(req).await?))
+            }
+            "playlist.import_file" => {
+                Ok(Some(self.dispatch_playlist_import_file(req).await?))
+            }
+            "playlist.export_file" => {
+                Ok(Some(self.dispatch_playlist_export_file(req).await?))
+            }
+            "playlist.duplicate" => {
+                Ok(Some(self.dispatch_playlist_duplicate(req).await?))
             }
             "playlist.save_selection" => {
                 Ok(Some(self.dispatch_playlist_save_selection(req).await?))
@@ -689,6 +819,65 @@ impl ShelfBundle {
             "library.get_triage" => {
                 Ok(Some(self.dispatch_library_get_triage(req).await?))
             }
+            "library.recently_played" => {
+                let payload: crate::play_history::HistoryReadPayload =
+                    parse_json(req)?;
+                let body = crate::play_history::handle_recently_played(
+                    &self.play_history,
+                    &self.library.forgotten,
+                    payload,
+                )
+                .await
+                .map_err(library_verb_to_plugin_error)?;
+                Ok(Some(encode_json_response(req, &body)?))
+            }
+            "library.most_played" => {
+                let payload: crate::play_history::HistoryReadPayload =
+                    parse_json(req)?;
+                let body = crate::play_history::handle_most_played(
+                    &self.play_history,
+                    &self.library.forgotten,
+                    payload,
+                )
+                .await
+                .map_err(library_verb_to_plugin_error)?;
+                Ok(Some(encode_json_response(req, &body)?))
+            }
+            "library.suggest" => {
+                let payload: crate::suggest::SuggestPayload = parse_json(req)?;
+                let mut conn = self.open_conn().await?;
+                let body = crate::suggest::handle_suggest(
+                    &self.library,
+                    &mut conn,
+                    payload,
+                )
+                .await
+                .map_err(library_verb_to_plugin_error)?;
+                Ok(Some(encode_json_response(req, &body)?))
+            }
+            "library.forget_album" => {
+                let payload: library::ForgetAlbumPayload = parse_json(req)?;
+                let mut conn = self.open_conn().await?;
+                let body = library::handle_forget_album(
+                    &self.library,
+                    &mut conn,
+                    payload,
+                )
+                .await
+                .map_err(library_verb_to_plugin_error)?;
+                Ok(Some(encode_json_response(req, &body)?))
+            }
+            "library.forget_track" => {
+                let payload: crate::forgotten_tracks::ForgetTrackPayload =
+                    parse_json(req)?;
+                let body = crate::forgotten_tracks::handle_forget_track(
+                    &self.library,
+                    payload,
+                )
+                .await
+                .map_err(library_verb_to_plugin_error)?;
+                Ok(Some(encode_json_response(req, &body)?))
+            }
             "library.reconcile_triage" => {
                 Ok(Some(self.dispatch_library_reconcile_triage(req).await?))
             }
@@ -748,6 +937,17 @@ impl ShelfBundle {
     ) -> Result<Response, PluginError> {
         let mut conn = self.open_conn().await?;
         queue::handle_clear_queue(&self.queue, &mut conn)
+            .await
+            .map_err(queue_verb_to_plugin_error)?;
+        encode_ok_response(req)
+    }
+
+    async fn dispatch_queue_restore_last_queue(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let mut conn = self.open_conn().await?;
+        queue::handle_restore_last_queue(&self.queue, &mut conn)
             .await
             .map_err(queue_verb_to_plugin_error)?;
         encode_ok_response(req)
@@ -938,6 +1138,58 @@ impl ShelfBundle {
         encode_ok_response(req)
     }
 
+    async fn dispatch_playlist_import_file(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: crate::playlist_import::ImportFilePayload =
+            parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        let body = crate::playlist_import::handle_import_file(
+            &self.playlist,
+            &mut conn,
+            Path::new(crate::playlist_import::DEFAULT_UPLOADS_DIR),
+            payload,
+        )
+        .await
+        .map_err(import_error_to_plugin_error)?;
+        encode_json_response(req, &body)
+    }
+
+    async fn dispatch_playlist_export_file(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: crate::playlist_export::ExportFilePayload =
+            parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        let body = crate::playlist_export::handle_export_file(
+            &self.playlist,
+            &mut conn,
+            payload,
+        )
+        .await
+        .map_err(playlist_verb_to_plugin_error)?;
+        encode_json_response(req, &body)
+    }
+
+    async fn dispatch_playlist_duplicate(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: crate::playlist_duplicate::DuplicatePayload =
+            parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        crate::playlist_duplicate::handle_duplicate(
+            &self.playlist,
+            &mut conn,
+            payload,
+        )
+        .await
+        .map_err(playlist_verb_to_plugin_error)?;
+        encode_ok_response(req)
+    }
+
     async fn dispatch_playlist_save_selection(
         &self,
         req: &Request,
@@ -1048,7 +1300,7 @@ impl ShelfBundle {
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: library::AddSourcePayload = parse_json(req)?;
-        let res = library::handle_add_source(&self.library, payload)
+        let res = library::add_source_for_consumer(&self.library, payload)
             .await
             .map_err(library_verb_to_plugin_error)?;
         encode_json_response(req, &res)
@@ -1060,7 +1312,7 @@ impl ShelfBundle {
     ) -> Result<Response, PluginError> {
         let payload: library::RemoveSourcePayload = parse_json(req)?;
         let mut conn = self.open_conn().await?;
-        library::handle_remove_source(
+        library::remove_source_for_consumer(
             &self.library,
             &self.queue,
             &mut conn,
@@ -1228,6 +1480,7 @@ impl ShelfBundle {
         let mut conn = self.open_conn().await?;
         let env = library::handle_browse_by_tag(
             &mut conn,
+            &self.library,
             payload,
             verb_name,
             tag,
@@ -1347,7 +1600,8 @@ fn queue_verb_to_plugin_error(e: queue::VerbError) -> PluginError {
         VerbError::PayloadVersion { .. }
         | VerbError::EmptyUris
         | VerbError::PositionOutOfRange { .. }
-        | VerbError::QueueEmpty => PluginError::Permanent(e.to_string()),
+        | VerbError::QueueEmpty
+        | VerbError::NoSavedQueue => PluginError::Permanent(e.to_string()),
         VerbError::Mpd { .. } => PluginError::Transient(e.to_string()),
     }
 }
@@ -1363,6 +1617,23 @@ fn playlist_verb_to_plugin_error(e: playlist::VerbError) -> PluginError {
             PluginError::Permanent(e.to_string())
         }
         VerbError::Mpd { .. } => PluginError::Transient(e.to_string()),
+    }
+}
+
+/// Import refusals are the operator's to fix — the file, the
+/// name, the payload — except an MPD failure, which is the
+/// playlist shelf's usual Transient.
+fn import_error_to_plugin_error(
+    e: crate::playlist_import::ImportError,
+) -> PluginError {
+    use crate::playlist_import::ImportError;
+    match e {
+        ImportError::Verb(v) => playlist_verb_to_plugin_error(v),
+        ImportError::OneSource
+        | ImportError::FormatUnknown { .. }
+        | ImportError::UploadRefused { .. }
+        | ImportError::Unparseable { .. }
+        | ImportError::Nothing { .. } => PluginError::Permanent(e.to_string()),
     }
 }
 
@@ -1386,16 +1657,298 @@ fn library_verb_to_plugin_error(e: library::VerbError) -> PluginError {
         | VerbError::SourceOffline { .. }
         | VerbError::Register { .. }
         | VerbError::SourceOutsideMusicDirectory { .. }
+        | VerbError::UsbClaimInvalid { .. }
         | VerbError::UnknownWork { .. }
         | VerbError::RewritePrefixInvalid
         | VerbError::RewritePrefixUnchanged
-        | VerbError::ParkPrefixInvalid => PluginError::Permanent(e.to_string()),
+        | VerbError::ParkPrefixInvalid
+        | VerbError::ForgetUriEmpty
+        | VerbError::ForgetAlbumEmpty
+        | VerbError::ForgetAlbumUnknown { .. } => {
+            PluginError::Permanent(e.to_string())
+        }
         // WorkAggregateNotReady is transient — the next
         // Database / Update idle event populates the cache.
         // Operator retry succeeds; treat as transient so
         // the steward's retry policy applies.
         VerbError::Mpd { .. } | VerbError::WorkAggregateNotReady => {
             PluginError::Transient(e.to_string())
+        }
+        // A refusal by name stays one: not retryable, and the glass
+        // routes on the subclass (household_policy_locked opens the
+        // household door).
+        VerbError::Refused {
+            subclass, reason, ..
+        } => PluginError::WithSubclass {
+            class: evo_plugin_sdk::error_taxonomy::ErrorClass::PermissionDenied,
+            subclass,
+            message: reason,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::playback_supervisor::test_mock::{
+        short_timeouts, spawn_mock_mpd, CapturingSubjectAnnouncer,
+        ConnBehaviour,
+    };
+
+    /// The queue is kept at shutdown, in the plugin's state
+    /// directory, so a reboot does not cost the operator the
+    /// queue they had. This is the whole bundle, brought up the
+    /// way load brings it up and torn down the way unload does.
+    /// The whole bundle, brought up the way load brings it up,
+    /// over a mock whose every connection holds the same
+    /// two-row queue with the second row playing.
+    ///
+    /// Every connection the bundle opens — observers, the
+    /// reconciler, a verb, the shutdown snapshot — sees the same
+    /// queue; which slot each lands on must not matter.
+    async fn live_bundle(dir: &Path) -> ShelfBundle {
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let behaviours = (0..12)
+            .map(|_| ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![
+                    (1, "INTERNAL/a/1.flac".to_string()),
+                    (2, "INTERNAL/b/2.flac".to_string()),
+                ],
+                playing: Some(1),
+            })
+            .collect();
+        let (endpoint, _mock) = spawn_mock_mpd(behaviours).await;
+        let subjects = Arc::new(CapturingSubjectAnnouncer::default());
+        ShelfBundle::init(
+            dir.to_path_buf(),
+            subjects as Arc<dyn SubjectAnnouncer>,
+            endpoint,
+            short_timeouts(),
+            None,
+            ShelfInputs {
+                mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                play_history: crate::play_history::PlayHistory::disabled(),
+                fragment_status: None,
+            },
+        )
+        .await
+    }
+
+    /// The two history reads are reachable on this shelf, and a
+    /// bundle whose history holds one finish answers it: a row
+    /// on `recently_played`, a count of one on `most_played`.
+    #[tokio::test]
+    async fn the_history_reads_dispatch_on_the_library_shelf() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = live_bundle(dir.path()).await;
+        bundle
+            .play_history
+            .record_finish("INTERNAL/a.flac", 7)
+            .await;
+
+        let req = request("library.recently_played", r#"{"v":1}"#);
+        let resp = bundle.dispatch_request(&req).await.unwrap().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v["plays"][0]["uri"], "INTERNAL/a.flac", "{v}");
+        assert_eq!(v["plays"][0]["finished_at"], 7);
+
+        let req = request("library.most_played", r#"{"v":1}"#);
+        let resp = bundle.dispatch_request(&req).await.unwrap().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v["tracks"][0]["uri"], "INTERNAL/a.flac", "{v}");
+        assert_eq!(v["tracks"][0]["count"], 1);
+        assert_eq!(v["tracks"].as_array().unwrap().len(), 1, "no zero rows");
+
+        bundle.shutdown().await;
+    }
+
+    fn request(verb: &str, payload: &str) -> Request {
+        Request {
+            request_type: verb.to_string(),
+            payload: payload.as_bytes().to_vec(),
+            correlation_id: 1,
+            deadline: None,
+            instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
+        }
+    }
+
+    /// `playlist.import_file` is reachable on this shelf: a
+    /// payload naming neither source is refused by the verb,
+    /// not dropped as an unmatched request type.
+    #[tokio::test]
+    async fn import_file_dispatches_on_the_playlist_shelf() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = live_bundle(dir.path()).await;
+        let req = request("playlist.import_file", r#"{"v":1,"name":"X"}"#);
+        match bundle.dispatch_request(&req).await {
+            Err(PluginError::Permanent(msg)) => {
+                assert!(msg.contains("exactly one of"), "{msg}")
+            }
+            other => panic!(
+                "import_file must dispatch and refuse a sourceless payload: \
+                 {other:?}"
+            ),
+        }
+        bundle.shutdown().await;
+    }
+
+    /// `playlist.export_file` is reachable on this shelf: a bad
+    /// name is refused by the verb, not dropped as unmatched.
+    #[tokio::test]
+    async fn export_file_dispatches_on_the_playlist_shelf() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = live_bundle(dir.path()).await;
+        let req = request("playlist.export_file", r#"{"v":1,"name":"a/b"}"#);
+        match bundle.dispatch_request(&req).await {
+            Err(PluginError::Permanent(msg)) => {
+                assert!(msg.contains("invalid"), "{msg}")
+            }
+            other => panic!(
+                "export_file must dispatch and refuse a bad name: {other:?}"
+            ),
+        }
+        bundle.shutdown().await;
+    }
+
+    /// `playlist.duplicate` is reachable on this shelf: the
+    /// favourites name is refused by the verb, not dropped as
+    /// unmatched.
+    #[tokio::test]
+    async fn duplicate_dispatches_on_the_playlist_shelf() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = live_bundle(dir.path()).await;
+        let req = request(
+            "playlist.duplicate",
+            r#"{"v":1,"source":"__favourites__","target":"Copy"}"#,
+        );
+        match bundle.dispatch_request(&req).await {
+            Err(PluginError::Permanent(msg)) => {
+                assert!(msg.contains("favourites"), "{msg}")
+            }
+            other => panic!(
+                "duplicate must dispatch and refuse favourites: {other:?}"
+            ),
+        }
+        bundle.shutdown().await;
+    }
+
+    /// `library.forget_track` is reachable on this shelf: an
+    /// empty URI is refused by the verb, not dropped as
+    /// unmatched.
+    #[tokio::test]
+    async fn forget_track_dispatches_on_the_library_shelf() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = live_bundle(dir.path()).await;
+        let req = request("library.forget_track", r#"{"v":1,"uri":""}"#);
+        match bundle.dispatch_request(&req).await {
+            Err(PluginError::Permanent(msg)) => {
+                assert!(msg.contains("must not be empty"), "{msg}")
+            }
+            other => panic!(
+                "forget_track must dispatch and refuse an empty uri: {other:?}"
+            ),
+        }
+        bundle.shutdown().await;
+    }
+
+    /// `library.forget_album` is reachable on this shelf: an
+    /// empty album is refused by the verb, not dropped as
+    /// unmatched.
+    #[tokio::test]
+    async fn forget_album_dispatches_on_the_library_shelf() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = live_bundle(dir.path()).await;
+        let req = request("library.forget_album", r#"{"v":1,"album":" "}"#);
+        match bundle.dispatch_request(&req).await {
+            Err(PluginError::Permanent(msg)) => {
+                assert!(msg.contains("album must not be empty"), "{msg}")
+            }
+            other => panic!(
+                "forget_album must dispatch and refuse an empty album: {other:?}"
+            ),
+        }
+        bundle.shutdown().await;
+    }
+
+    /// `library.suggest` is reachable on this shelf: an empty
+    /// prefix is answered with an empty list by the verb, not
+    /// dropped as unmatched.
+    #[tokio::test]
+    async fn suggest_dispatches_on_the_library_shelf() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = live_bundle(dir.path()).await;
+        let req = request("library.suggest", r#"{"v":1,"prefix":""}"#);
+        let resp = bundle.dispatch_request(&req).await.unwrap().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v["suggestions"], serde_json::json!([]), "{v}");
+        bundle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_keeps_the_queue_for_the_next_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = live_bundle(dir.path()).await;
+        assert!(
+            !dir.path().join("last-queue.toml").exists(),
+            "nothing is kept until something ends"
+        );
+
+        // The verb is reachable on this shelf, and with nothing
+        // kept it refuses rather than falling through unmatched.
+        let req = request("queue.restore_last_queue", r#"{"v":1}"#);
+        match bundle.dispatch_request(&req).await {
+            Err(PluginError::Permanent(msg)) => {
+                assert!(msg.contains("no saved queue"), "{msg}")
+            }
+            other => panic!(
+                "restore_last_queue must dispatch and refuse with nothing \
+                 kept: {other:?}"
+            ),
+        }
+
+        bundle.shutdown().await;
+
+        let kept = crate::last_queue::LastQueueStore::at(
+            dir.path().join("last-queue.toml"),
+        )
+        .load()
+        .await
+        .expect("shutdown must keep the queue");
+        assert_eq!(kept.uris, vec!["INTERNAL/a/1.flac", "INTERNAL/b/2.flac"]);
+        assert_eq!(kept.current, Some(1));
+        assert_eq!(kept.reason, crate::last_queue::SnapshotReason::Shutdown);
+    }
+
+    /// A nested refusal by name reaches the glass by name, as a
+    /// permission refusal, not as a retryable MPD error.
+    #[test]
+    fn a_library_refusal_keeps_its_subclass() {
+        let e = library::VerbError::Refused {
+            verb: "remove_source".into(),
+            subclass: "household_policy_locked".into(),
+            reason: "the household policy protects this group".into(),
+        };
+        match library_verb_to_plugin_error(e) {
+            PluginError::WithSubclass {
+                class,
+                subclass,
+                message,
+            } => {
+                assert_eq!(
+                    class,
+                    evo_plugin_sdk::error_taxonomy::ErrorClass::PermissionDenied
+                );
+                assert_eq!(subclass, "household_policy_locked");
+                assert_eq!(message, "the household policy protects this group");
+            }
+            other => panic!("expected WithSubclass, got {other:?}"),
         }
     }
 }

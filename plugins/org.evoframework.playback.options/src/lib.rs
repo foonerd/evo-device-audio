@@ -62,6 +62,11 @@
 //!   not. Absent state is a valid "first-boot" condition, not
 //!   a fault.
 //!
+//! - Holds one sleep timer (`options.set_sleep_timer`): after a
+//!   wait it fades the global volume on `audio.playback` to
+//!   silence, pauses, and puts the volume back. In memory only;
+//!   see `src/sleep_timer.rs`.
+//!
 //! ## What this plugin does NOT do
 //!
 //! - **Open ALSA, parse aplay -L, drive MPD.** That's
@@ -97,13 +102,14 @@ use evo_device_audio_shared::transition_envelope::{
 use evo_plugin_sdk::contract::{
     BuildInfo, ExternalAddressing, HappeningEmitter, HealthReport, LoadContext,
     Plugin, PluginDescription, PluginError, PluginIdentity, Request,
-    Respondent, Response, RuntimeCapabilities, SubjectAnnouncement,
-    SubjectAnnouncer, SubjectQuerier, SubjectStateStream,
+    Respondent, Response, RuntimeCapabilities, ShelfRequestDispatcher,
+    SubjectAnnouncement, SubjectAnnouncer, SubjectQuerier, SubjectStateStream,
     SubjectStateStreamError, SubjectStateSubscriber,
 };
 use evo_plugin_sdk::Manifest;
 use serde::{Deserialize, Serialize};
 
+mod sleep_timer;
 pub mod transition;
 
 /// Timeout the orchestrator waits for the playback warden's
@@ -168,6 +174,11 @@ const HAPPENING_EVENT_TYPE: &str = "audio.options.changed";
 const MIXER_TRANSITION_STARTED: &str = "audio.mixer_transition.started";
 const MIXER_TRANSITION_APPLIED: &str = "audio.mixer_transition.applied";
 const MIXER_TRANSITION_ROLLED_BACK: &str = "audio.mixer_transition.rolled_back";
+/// The authority applied but the warden's unmute did not ack.
+/// Not a rollback: the operator's mixer is in force and the
+/// chain simply did not resume.
+const MIXER_TRANSITION_UNMUTE_INCOMPLETE: &str =
+    "audio.mixer_transition.unmute_incomplete";
 const MIXER_TRANSITION_FAILED: &str = "audio.mixer_transition.failed";
 
 /// External-addressing scheme + value the plugin uses for its
@@ -191,6 +202,92 @@ const STATE_FILENAME: &str = "state.toml";
 /// `manifest.toml`'s `[capabilities.respondent].request_types`;
 /// admission would refuse a mismatch. Lockstep enforced by the
 /// `manifest_request_types_match_runtime` test.
+/// Mode tokens the `audio.composition` shelf declares. Kept here
+/// so a mode this distribution does not implement cannot be
+/// recorded for the glass to paint. `resampler` is reserved in
+/// the schema and deliberately absent until it exists.
+const DECLARED_COMPOSITION_MODES: &[&str] = &["passthrough", "eq_only"];
+
+/// What ReplayGain does to playback.
+///
+/// MPD applies the gain tags the decoder read from the file, so
+/// this decides what the listener hears: `Disabled` plays the
+/// file as mastered, `Track` levels each track against its own
+/// tag, `Album` levels the album as one so the quiet track on a
+/// loud record stays quiet.
+///
+/// This replaced a bool. A bool could say "level it" but not
+/// "level it against what", and track-vs-album is the whole
+/// question for anyone playing albums.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VolumeNormalization {
+    /// Play the file as mastered. The audiophile default: no
+    /// in-chain post-processing unless the operator asks.
+    #[default]
+    Disabled,
+    /// Level each track against its own ReplayGain tag.
+    Track,
+    /// Level the album as one, preserving the dynamics the
+    /// mastering engineer put between its tracks.
+    Album,
+}
+
+impl VolumeNormalization {
+    /// The token carried on the wire and stored in settings.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Track => "track",
+            Self::Album => "album",
+        }
+    }
+
+    /// Parse a wire token. `None` for anything this
+    /// distribution does not offer — MPD's `auto` included,
+    /// because "whichever tag happens to be present" is not a
+    /// choice an operator can reason about.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "disabled" => Some(Self::Disabled),
+            "track" => Some(Self::Track),
+            "album" => Some(Self::Album),
+            _ => None,
+        }
+    }
+}
+
+/// Accept the token, and the bool this field used to be.
+///
+/// A device that already has settings on disk carries
+/// `volume_normalization = false` (or `true`). Refusing those
+/// would fail the settings load on upgrade and take every other
+/// option down with it, so the old shape is still read: `false`
+/// is `Disabled`, and `true` is `Track` — levelling per track is
+/// what MPD's `replay_gain_mode track` does and what the bool
+/// was understood to mean.
+impl<'de> serde::Deserialize<'de> for VolumeNormalization {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        match serde_json::Value::deserialize(d)? {
+            serde_json::Value::Bool(true) => Ok(Self::Track),
+            serde_json::Value::Bool(false) => Ok(Self::Disabled),
+            serde_json::Value::String(s) => Self::parse(&s).ok_or_else(|| {
+                D::Error::custom(format!(
+                    "unknown volume_normalization {s:?}; expected \
+                     disabled, track or album"
+                ))
+            }),
+            other => Err(D::Error::custom(format!(
+                "volume_normalization must be a string, got {other}"
+            ))),
+        }
+    }
+}
+
 const REQUEST_TYPES: &[&str] = &[
     "options.get_settings",
     "options.set_resampling",
@@ -206,6 +303,7 @@ const REQUEST_TYPES: &[&str] = &[
     "options.set_exclusive_mode",
     "options.set_crossfade_seconds",
     "options.set_gapless",
+    "options.set_composition_mode",
     "options.set_eq_engaged",
     "options.set_eq_band",
     "options.list_eq_presets",
@@ -214,6 +312,7 @@ const REQUEST_TYPES: &[&str] = &[
     "options.delete_eq_preset",
     "options.restore_last_known_good",
     "options.reset_to_defaults",
+    "options.set_sleep_timer",
 ];
 
 /// Upper bound for the crossfade-seconds operator setting.
@@ -388,11 +487,12 @@ pub struct Settings {
     /// distribution's first detected playback card).
     #[serde(default)]
     pub output_device: String,
-    /// `volume_normalization` MPD policy. `true` enables MPD's
-    /// loudness equalisation across tracks; `false` is the
-    /// audiophile default (no in-chain post-processing).
+    /// What ReplayGain does to playback — disabled, per track,
+    /// or per album. See [`VolumeNormalization`]. Default
+    /// `Disabled`: the audiophile posture is no in-chain
+    /// post-processing unless the operator asks for it.
     #[serde(default)]
-    pub volume_normalization: bool,
+    pub volume_normalization: VolumeNormalization,
     /// Initial volume the playback plugin restores on plugin
     /// load / steward restart. Valid range 0..=100. Default 30
     /// — protects ears + speakers when the device boots after a
@@ -444,6 +544,20 @@ pub struct Settings {
     /// brief gap between adjacent tracks).
     #[serde(default = "default_gapless")]
     pub gapless: bool,
+    /// Which composition mode is active.
+    ///
+    /// Written by the composition plugin, which owns the mode
+    /// and is the only party that knows when it changed —
+    /// including the mode it restores from its own state at
+    /// load. It lives here so the operator's glass can read it
+    /// at mount from the settings subject it already holds,
+    /// rather than asking a second shelf.
+    ///
+    /// Empty until the composition plugin reports one. Empty
+    /// means "not yet reported", not "passthrough": a glass
+    /// painting a mode it was never told is guessing.
+    #[serde(default)]
+    pub composition_mode: String,
     /// Parametric-EQ engagement flag. When `true`, the
     /// composition plugin's eq_only mode applies the
     /// configured bands to the PCM byte stream. When `false`,
@@ -535,8 +649,9 @@ impl Default for Settings {
             mixer_control: String::new(),
             dop: false,
             output_device: String::new(),
-            volume_normalization: false,
+            volume_normalization: VolumeNormalization::default(),
             startup_volume_percent: default_startup_volume_percent(),
+            composition_mode: String::new(),
             max_volume_percent: default_max_volume_percent(),
             volume_curve: VolumeCurve::default(),
             exclusive_mode: false,
@@ -705,6 +820,12 @@ pub struct PlaybackOptionsPlugin {
     /// init attempt.
     envelope_observed_channel:
         tokio::sync::Mutex<Option<Arc<EnvelopeObservedChannel>>>,
+    /// Shelf-request dispatcher from `LoadContext`. The sleep
+    /// timer reaches `audio.playback` through it for the volume
+    /// and the pause. `None` refuses arming the timer.
+    shelf_dispatcher: Option<Arc<dyn ShelfRequestDispatcher>>,
+    /// The one sleep timer. In memory only; unload cancels it.
+    sleep_timer: sleep_timer::SleepTimer,
     requests_handled: std::sync::atomic::AtomicU64,
 }
 
@@ -742,6 +863,8 @@ impl PlaybackOptionsPlugin {
             subject_publish_timeout_override: None,
             transition_overall_timeout_override: None,
             envelope_observed_channel: tokio::sync::Mutex::new(None),
+            shelf_dispatcher: None,
+            sleep_timer: sleep_timer::SleepTimer::default(),
             requests_handled: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -1504,6 +1627,8 @@ impl Plugin for PlaybackOptionsPlugin {
             self.subject_state_subscriber =
                 ctx.subject_state_subscriber.as_ref().map(Arc::clone);
             self.subject_querier = ctx.subject_querier.as_ref().map(Arc::clone);
+            self.shelf_dispatcher =
+                ctx.shelf_request_dispatcher.as_ref().map(Arc::clone);
             // Announce the settings subject so consumers
             // (playback.mpd, future UI plugins) can resolve
             // its canonical id + subscribe to state changes
@@ -1542,6 +1667,9 @@ impl Plugin for PlaybackOptionsPlugin {
                 requests_handled = self.requests_handled(),
                 "plugin unload"
             );
+            // A restart cancels the sleep timer. One that is
+            // fading puts the volume back first.
+            self.sleep_timer.cancel().await;
             self.happening_emitter = None;
             self.loaded = false;
             Ok(())
@@ -1620,6 +1748,9 @@ impl Respondent for PlaybackOptionsPlugin {
                     self.handle_set_crossfade_seconds(req).await
                 }
                 "options.set_gapless" => self.handle_set_gapless(req).await,
+                "options.set_composition_mode" => {
+                    self.handle_set_composition_mode(req).await
+                }
                 "options.set_eq_engaged" => {
                     self.handle_set_eq_engaged(req).await
                 }
@@ -1641,6 +1772,9 @@ impl Respondent for PlaybackOptionsPlugin {
                 }
                 "options.reset_to_defaults" => {
                     self.handle_reset_to_defaults(req).await
+                }
+                "options.set_sleep_timer" => {
+                    self.handle_set_sleep_timer(req).await
                 }
                 other => Err(PluginError::Permanent(format!(
                     "request type {other:?} declared but no handler wired"
@@ -2010,35 +2144,47 @@ impl PlaybackOptionsPlugin {
 
         // Step 7 — unmute. Symmetric to step 2: publish
         // envelope_requested with state=Unmuted, await the
-        // warden's matching ack. Failure here is a rollback
-        // even though the new authority has already been
-        // persisted — the operator-facing behaviour is the
-        // chain remains muted with the prior settings
-        // restored; the operator can re-attempt the gesture
-        // once the underlying cause clears.
-        let unmute_generation = match self
+        // warden's matching ack.
+        //
+        // A failure here is NOT a rollback. The warden unmutes by
+        // resuming the chain, and a resume the player cannot
+        // perform says nothing about the mixer: MPD answers
+        // `Bad song index` when there is no valid song position
+        // to resume, and `Broken pipe` when the connection went
+        // with it. Neither is evidence the operator's chosen
+        // authority is wrong.
+        //
+        // It used to roll back, which meant a Pi with a hardware
+        // mixer and nothing playing could not keep Hardware: the
+        // gesture persisted it, the unmute failed because there
+        // was nothing to resume, and the restore put Software
+        // back. The operator chose Hardware and the device
+        // disagreed for a reason that had nothing to do with
+        // mixers.
+        //
+        // The authority stands, verified at step 6, and the
+        // unmute's failure is recorded against the transition so
+        // the chain not coming back is still visible.
+        let mut unmute_failure: Option<String> = None;
+        match self
             .publish_envelope_requested(EnvelopeState::Unmuted)
             .await
         {
-            Ok(g) => g,
-            Err(e) => {
-                return self
-                    .rollback_or_fail_restore(
-                        from,
-                        to,
-                        "unmute",
-                        e,
-                        prior_settings,
+            Ok(unmute_generation) => {
+                if let Err(e) = self
+                    .await_envelope_ack(
+                        unmute_generation,
+                        EnvelopeState::Unmuted,
                     )
-                    .await;
+                    .await
+                {
+                    unmute_failure = Some(e);
+                }
             }
-        };
-        if let Err(e) = self
-            .await_envelope_ack(unmute_generation, EnvelopeState::Unmuted)
-            .await
-        {
-            return self
-                .rollback_or_fail_restore(from, to, "unmute", e, prior_settings)
+            Err(e) => unmute_failure = Some(e),
+        }
+        if let Some(reason) = unmute_failure {
+            self.emit_lifecycle_unmute_incomplete(from, to, &reason)
                 .await;
         }
 
@@ -2122,6 +2268,31 @@ impl PlaybackOptionsPlugin {
                 "to": to.as_wire_str(),
                 "carried_level": carried_level,
                 "effective_level": effective_level,
+            }),
+        )
+        .await;
+    }
+
+    /// The authority applied, and the chain did not come back.
+    ///
+    /// Recorded rather than rolled back: the operator's chosen
+    /// mixer is in force, but the warden's unmute did not ack, so
+    /// whatever was playing is not playing now. On a player with
+    /// nothing queued that is the expected answer and not a
+    /// fault — which is exactly why it must not undo the mixer.
+    async fn emit_lifecycle_unmute_incomplete(
+        &self,
+        from: MixerType,
+        to: MixerType,
+        reason: &str,
+    ) {
+        self.emit_lifecycle(
+            MIXER_TRANSITION_UNMUTE_INCOMPLETE,
+            serde_json::json!({
+                "v": PAYLOAD_VERSION,
+                "from": from.as_wire_str(),
+                "to": to.as_wire_str(),
+                "reason": reason,
             }),
         )
         .await;
@@ -2312,6 +2483,49 @@ impl PlaybackOptionsPlugin {
         )
     }
 
+    /// Arm, replace, or cancel the sleep timer. `seconds` is the
+    /// wait before the fade and `fade_ms` how long the global
+    /// volume takes to reach silence; `seconds` 0 cancels. When
+    /// the fade ends playback pauses and the volume returns to
+    /// its level before the fade. Not a setting: nothing is
+    /// persisted, no happening is emitted, the settings subject
+    /// does not change, and crossfade stays as it is.
+    async fn handle_set_sleep_timer(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SetSleepTimerPayload = parse_versioned(req)?;
+        if payload.seconds == 0 {
+            self.sleep_timer.cancel().await;
+        } else {
+            let dispatcher =
+                self.shelf_dispatcher.as_ref().map(Arc::clone).ok_or_else(
+                    || {
+                        PluginError::Permanent(
+                            "the sleep timer reaches audio.playback through \
+                             the shelf dispatcher, and none was provided \
+                             at load"
+                                .to_string(),
+                        )
+                    },
+                )?;
+            self.sleep_timer
+                .arm(
+                    dispatcher,
+                    Duration::from_secs(u64::from(payload.seconds)),
+                    Duration::from_millis(u64::from(payload.fade_ms)),
+                )
+                .await;
+        }
+        encode(
+            req,
+            &SimpleOk {
+                v: PAYLOAD_VERSION,
+                status: "ok",
+            },
+        )
+    }
+
     /// Enable / disable gapless playback. When `true`, the
     /// playback warden engages MPD's single-mode-off + zero-
     /// pause queue traversal. When `false`, the warden falls
@@ -2327,6 +2541,59 @@ impl PlaybackOptionsPlugin {
             .gapless = payload.value;
         self.persist_settings().await?;
         self.emit_changed("gapless", serde_json::Value::Bool(payload.value))
+            .await;
+        encode(
+            req,
+            &SimpleOk {
+                v: PAYLOAD_VERSION,
+                status: "ok",
+            },
+        )
+    }
+
+    /// Record which composition mode is active.
+    ///
+    /// The composition shelf owns the mode; this only carries it
+    /// so the glass can read it at mount from the settings
+    /// subject it already holds. The value must be a mode that
+    /// shelf declares — an unknown token is refused rather than
+    /// recorded, because a glass painting a mode no plugin
+    /// implements is worse than one painting nothing.
+    ///
+    /// Idempotent by construction: recording the mode already
+    /// recorded persists nothing and emits nothing. The
+    /// composition plugin reports on every change AND on the
+    /// mode it restores at load, so without this a restart would
+    /// republish the settings subject for a mode that did not
+    /// move — and every subscriber would re-render for it.
+    async fn handle_set_composition_mode(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SetCompositionModePayload = parse_versioned(req)?;
+        let mode = payload.mode.trim().to_string();
+        if !DECLARED_COMPOSITION_MODES.contains(&mode.as_str()) {
+            return Err(PluginError::Permanent(format!(
+                "unknown composition mode {:?}; declared modes: {:?}",
+                mode, DECLARED_COMPOSITION_MODES
+            )));
+        }
+        {
+            let mut w =
+                self.settings.write().expect("settings RwLock poisoned");
+            if w.composition_mode == mode {
+                return encode(
+                    req,
+                    &SimpleOk {
+                        v: PAYLOAD_VERSION,
+                        status: "ok",
+                    },
+                );
+            }
+            w.composition_mode = mode.clone();
+        }
+        self.persist_settings().await?;
+        self.emit_changed("composition_mode", serde_json::Value::String(mode))
             .await;
         encode(
             req,
@@ -2705,14 +2972,21 @@ impl PlaybackOptionsPlugin {
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SetVolumeNormalizationPayload = parse_versioned(req)?;
+        let Some(mode) = VolumeNormalization::parse(&payload.mode) else {
+            return Err(PluginError::Permanent(format!(
+                "unknown volume_normalization {:?}; expected disabled, \
+                 track or album",
+                payload.mode
+            )));
+        };
         self.settings
             .write()
             .expect("settings RwLock poisoned")
-            .volume_normalization = payload.value;
+            .volume_normalization = mode;
         self.persist_settings().await?;
         self.emit_changed(
             "volume_normalization",
-            serde_json::Value::Bool(payload.value),
+            serde_json::Value::String(mode.as_str().to_string()),
         )
         .await;
         encode(
@@ -3078,10 +3352,28 @@ impl HasPayloadVersion for SetOutputDevicePayload {
 struct SetVolumeNormalizationPayload {
     #[serde(default = "default_payload_version")]
     v: u32,
-    value: bool,
+    /// The mode token. Named `mode`, not `value`: a bool's
+    /// `value` could not say which of two levellings was meant.
+    mode: String,
 }
 
 impl HasPayloadVersion for SetVolumeNormalizationPayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SetSleepTimerPayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    /// Seconds until the fade starts; 0 cancels.
+    seconds: u32,
+    /// Milliseconds the global volume takes to reach silence.
+    fade_ms: u32,
+}
+
+impl HasPayloadVersion for SetSleepTimerPayload {
     fn payload_version(&self) -> u32 {
         self.v
     }
@@ -3140,6 +3432,19 @@ impl HasPayloadVersion for SetCrossfadeSecondsPayload {
 }
 
 #[derive(Debug, Deserialize)]
+struct SetCompositionModePayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    mode: String,
+}
+
+impl HasPayloadVersion for SetCompositionModePayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct SetGaplessPayload {
     #[serde(default = "default_payload_version")]
     v: u32,
@@ -3782,7 +4087,11 @@ mod tests {
         assert!(matches!(s.mixer_type, MixerType::Software));
         assert!(!s.dop);
         assert!(s.output_device.is_empty());
-        assert!(!s.volume_normalization);
+        assert_eq!(
+            s.volume_normalization,
+            VolumeNormalization::Disabled,
+            "audiophile default — the file plays as mastered"
+        );
     }
 
     #[test]
@@ -3814,7 +4123,7 @@ mod tests {
         assert_eq!(v["v"], 1);
         assert_eq!(v["mixer_type"], "software");
         assert_eq!(v["dop"], false);
-        assert_eq!(v["volume_normalization"], false);
+        assert_eq!(v["volume_normalization"], "disabled");
     }
 
     #[tokio::test]
@@ -4047,13 +4356,84 @@ mod tests {
     #[tokio::test]
     async fn set_volume_normalization_round_trips() {
         let (p, _dir) = loaded_plugin().await;
-        p.handle_request(&req(
-            "options.set_volume_normalization",
-            json!({ "v": 1, "value": true }),
-        ))
-        .await
-        .unwrap();
-        assert!(p.settings().volume_normalization);
+        for (token, want) in [
+            ("track", VolumeNormalization::Track),
+            ("album", VolumeNormalization::Album),
+            ("disabled", VolumeNormalization::Disabled),
+        ] {
+            p.handle_request(&req(
+                "options.set_volume_normalization",
+                json!({ "v": 1, "mode": token }),
+            ))
+            .await
+            .unwrap();
+            assert_eq!(p.settings().volume_normalization, want);
+
+            let resp = p
+                .handle_request(&req("options.get_settings", json!({ "v": 1 })))
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&resp.payload).unwrap();
+            assert_eq!(
+                v["volume_normalization"], token,
+                "the mode must reach the settings projection the glass reads"
+            );
+        }
+    }
+
+    /// A mode this distribution does not offer is refused, not
+    /// recorded. MPD's `auto` is deliberately absent: "whichever
+    /// tag happens to be present" is not a choice an operator can
+    /// reason about.
+    #[tokio::test]
+    async fn an_unknown_volume_normalization_mode_is_refused() {
+        let (p, _dir) = loaded_plugin().await;
+        for junk in ["auto", "", "Track", "on", "true"] {
+            let got = p
+                .handle_request(&req(
+                    "options.set_volume_normalization",
+                    json!({ "v": 1, "mode": junk }),
+                ))
+                .await;
+            assert!(got.is_err(), "{junk:?} must be refused");
+            assert_eq!(
+                p.settings().volume_normalization,
+                VolumeNormalization::Disabled,
+                "{junk:?} must not be recorded"
+            );
+        }
+    }
+
+    /// Settings already on disk still load.
+    ///
+    /// This field was a bool. Refusing the old shape would fail
+    /// the settings load on upgrade and take every other option
+    /// down with it, so `false` reads as Disabled and `true` as
+    /// Track — levelling per track is what the bool meant.
+    #[test]
+    fn the_bool_this_field_used_to_be_still_loads() {
+        let as_bool: Settings =
+            serde_json::from_value(json!({ "volume_normalization": true }))
+                .expect("a stored bool must still load");
+        assert_eq!(as_bool.volume_normalization, VolumeNormalization::Track);
+
+        let off: Settings =
+            serde_json::from_value(json!({ "volume_normalization": false }))
+                .expect("a stored bool must still load");
+        assert_eq!(off.volume_normalization, VolumeNormalization::Disabled);
+
+        let as_token: Settings =
+            serde_json::from_value(json!({ "volume_normalization": "album" }))
+                .expect("the token must load");
+        assert_eq!(as_token.volume_normalization, VolumeNormalization::Album);
+
+        assert!(
+            serde_json::from_value::<Settings>(
+                json!({ "volume_normalization": "auto" })
+            )
+            .is_err(),
+            "a mode this build does not implement must not load"
+        );
     }
 
     #[tokio::test]
@@ -4065,6 +4445,98 @@ mod tests {
             "audiophile default — no in-chain fade"
         );
         assert!(s.gapless, "audiophile default — gapless on");
+    }
+
+    /// The glass reads the active composition mode at mount from
+    /// the settings subject it already holds.
+    #[tokio::test]
+    async fn composition_mode_round_trips_through_settings() {
+        let (p, _dir) = loaded_plugin().await;
+        assert_eq!(
+            p.settings().composition_mode,
+            "",
+            "empty until the composition plugin reports one — empty \
+             means 'not yet reported', not 'passthrough'"
+        );
+
+        p.handle_request(&req(
+            "options.set_composition_mode",
+            json!({ "v": 1, "mode": "eq_only" }),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(p.settings().composition_mode, "eq_only");
+
+        let resp = p
+            .handle_request(&req("options.get_settings", json!({ "v": 1 })))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(
+            v["composition_mode"], "eq_only",
+            "the field must be on the settings projection the glass reads"
+        );
+    }
+
+    /// A mode no plugin implements is refused, not recorded. A
+    /// glass painting a mode the device cannot be in is worse
+    /// than one painting nothing.
+    #[tokio::test]
+    async fn an_undeclared_composition_mode_is_refused() {
+        let (p, _dir) = loaded_plugin().await;
+        for junk in ["resampler", "", "EQ_ONLY", "../etc"] {
+            let got = p
+                .handle_request(&req(
+                    "options.set_composition_mode",
+                    json!({ "v": 1, "mode": junk }),
+                ))
+                .await;
+            assert!(got.is_err(), "{junk:?} must be refused");
+            assert_eq!(
+                p.settings().composition_mode,
+                "",
+                "{junk:?} must not be recorded"
+            );
+        }
+    }
+
+    /// Recording the mode already recorded changes nothing.
+    ///
+    /// The composition plugin reports on every change and again
+    /// on the mode it restores at load, so without this a restart
+    /// would republish the settings subject — and every
+    /// subscriber would re-render — for a mode that did not move.
+    #[tokio::test]
+    async fn recording_an_unchanged_composition_mode_emits_nothing() {
+        let dir = tempdir().unwrap();
+        let emitter = Arc::new(CapturingEmitter::default());
+        let mut p = PlaybackOptionsPlugin::new()
+            .with_state_path(dir.path().join(STATE_FILENAME));
+        p.happening_emitter = Some(Arc::clone(&emitter) as Arc<_>);
+        p.subject_announcer = Some(Arc::new(CapturingAnnouncer::default()));
+        p.loaded = true;
+
+        let set = |mode: &str| {
+            req(
+                "options.set_composition_mode",
+                json!({ "v": 1, "mode": mode }),
+            )
+        };
+        let emitted = || emitter.events.lock().unwrap().len();
+
+        p.handle_request(&set("eq_only")).await.unwrap();
+        let after_first = emitted();
+        assert!(after_first > 0, "a real change must emit");
+
+        p.handle_request(&set("eq_only")).await.unwrap();
+        assert_eq!(
+            emitted(),
+            after_first,
+            "an unchanged mode must not emit a change"
+        );
+
+        p.handle_request(&set("passthrough")).await.unwrap();
+        assert!(emitted() > after_first, "a real change must still emit");
     }
 
     #[tokio::test]
@@ -4151,6 +4623,319 @@ mod tests {
             }
             other => panic!("expected Permanent, got {other:?}"),
         }
+    }
+
+    // ----- sleep timer -----
+
+    /// Stands in for `audio.playback`: keeps one global volume and
+    /// records every verb the sleep timer sends, in order.
+    #[derive(Default)]
+    struct StubPlayback {
+        volume: Mutex<u8>,
+        calls: Mutex<Vec<(String, String, Value)>>,
+    }
+
+    impl StubPlayback {
+        fn at(volume: u8) -> Arc<Self> {
+            let stub = Self::default();
+            *stub.volume.lock().unwrap() = volume;
+            Arc::new(stub)
+        }
+
+        fn volume(&self) -> u8 {
+            *self.volume.lock().unwrap()
+        }
+
+        fn calls(&self) -> Vec<(String, String, Value)> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn verbs(&self) -> Vec<String> {
+            self.calls().into_iter().map(|(_, verb, _)| verb).collect()
+        }
+    }
+
+    impl ShelfRequestDispatcher for StubPlayback {
+        fn dispatch<'a>(
+            &'a self,
+            shelf: &'a str,
+            request_type: &'a str,
+            payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<u8>,
+                            evo_plugin_sdk::contract::ShelfDispatchError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            use evo_plugin_sdk::contract::ShelfDispatchError;
+            Box::pin(async move {
+                let body: Value =
+                    serde_json::from_slice(&payload).unwrap_or(Value::Null);
+                self.calls.lock().unwrap().push((
+                    shelf.to_string(),
+                    request_type.to_string(),
+                    body.clone(),
+                ));
+                let answer = match request_type {
+                    "get_now_playing" => {
+                        json!({ "v": 1, "volume": self.volume() })
+                    }
+                    "set_volume" => {
+                        let level = body["volume"]
+                            .as_u64()
+                            .and_then(|v| u8::try_from(v).ok())
+                            .ok_or_else(|| ShelfDispatchError::Permanent {
+                                detail: "set_volume needs a u8 volume".into(),
+                            })?;
+                        *self.volume.lock().unwrap() = level;
+                        json!({ "v": 1, "status": "ok" })
+                    }
+                    "pause" => json!({ "v": 1, "status": "ok" }),
+                    other => {
+                        return Err(ShelfDispatchError::VerbNotStockedOnShelf {
+                            shelf: shelf.to_string(),
+                            request_type: other.to_string(),
+                        })
+                    }
+                };
+                Ok(answer.to_string().into_bytes())
+            })
+        }
+    }
+
+    async fn plugin_with_playback(
+        stub: &Arc<StubPlayback>,
+    ) -> (PlaybackOptionsPlugin, tempfile::TempDir) {
+        let (mut p, dir) = loaded_plugin().await;
+        p.shelf_dispatcher =
+            Some(Arc::clone(stub) as Arc<dyn ShelfRequestDispatcher>);
+        (p, dir)
+    }
+
+    fn sleep_timer(seconds: u32, fade_ms: u32) -> Request {
+        req(
+            "options.set_sleep_timer",
+            json!({ "v": 1, "seconds": seconds, "fade_ms": fade_ms }),
+        )
+    }
+
+    async fn advance(by: Duration) {
+        tokio::time::sleep(by).await;
+    }
+
+    /// Pin: the sleep timer is not crossfade. A whole run — wait,
+    /// fade, pause, restore — leaves the crossfade setting, the
+    /// options file, the settings subject and the happenings as
+    /// they were, and sends `audio.playback` nothing but the
+    /// volume read, the volume steps and the pause.
+    #[tokio::test(start_paused = true)]
+    async fn the_sleep_timer_leaves_the_crossfade_setting() {
+        let stub = StubPlayback::at(60);
+        let (mut p, dir) = plugin_with_playback(&stub).await;
+        let emitter = Arc::new(CapturingEmitter::default());
+        let announcer = Arc::new(CapturingAnnouncer::default());
+        p.happening_emitter = Some(emitter.clone());
+        p.subject_announcer = Some(announcer.clone());
+        p.handle_request(&req(
+            "options.set_crossfade_seconds",
+            json!({ "v": 1, "value": 5 }),
+        ))
+        .await
+        .unwrap();
+        // The setter publishes the settings subject from a spawned
+        // task; let it land before the counts are taken, so they
+        // measure the timer alone. The crossfade set itself shows
+        // as one happening and one subject update.
+        advance(Duration::from_secs(1)).await;
+        let state_path = dir.path().join(STATE_FILENAME);
+        let file_before = std::fs::read(&state_path).unwrap();
+        let events_before = emitter.count();
+        let updates_before = announcer.updates().len();
+        assert_eq!((events_before, updates_before), (1, 1));
+
+        p.handle_request(&sleep_timer(30, 2000)).await.unwrap();
+        advance(Duration::from_secs(40)).await;
+
+        assert!(
+            stub.verbs().iter().any(|v| v == "pause"),
+            "the timer ran to the pause"
+        );
+        assert_eq!(p.settings().crossfade_seconds, 5);
+        assert_eq!(
+            std::fs::read(&state_path).unwrap(),
+            file_before,
+            "nothing is written to the options file"
+        );
+        assert_eq!(emitter.count(), events_before, "no happening");
+        assert_eq!(
+            announcer.updates().len(),
+            updates_before,
+            "the settings subject does not move"
+        );
+        for (shelf, verb, _) in stub.calls() {
+            assert_eq!(shelf, "audio.playback");
+            assert!(
+                ["get_now_playing", "set_volume", "pause"]
+                    .contains(&verb.as_str()),
+                "the timer sent {verb:?}"
+            );
+        }
+    }
+
+    /// Pin: the volume is not left silent. The fade steps the
+    /// global volume down to 0, playback pauses, and only then the
+    /// volume returns to its level before the fade.
+    #[tokio::test(start_paused = true)]
+    async fn the_volume_is_back_after_the_sleep_timer_pauses() {
+        let stub = StubPlayback::at(40);
+        let (p, _dir) = plugin_with_playback(&stub).await;
+        let resp = p.handle_request(&sleep_timer(10, 3000)).await.unwrap();
+        let v: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v, json!({ "v": 1, "status": "ok" }));
+        advance(Duration::from_secs(9)).await;
+        assert!(stub.calls().is_empty(), "nothing before the wait is over");
+        advance(Duration::from_secs(5)).await;
+
+        let calls = stub.calls();
+        let verbs = stub.verbs();
+        assert_eq!(verbs[0], "get_now_playing");
+        assert_eq!(verbs.iter().filter(|v| *v == "pause").count(), 1);
+        let pause = verbs.iter().position(|v| v == "pause").unwrap();
+        let fade: Vec<u64> = calls[1..pause]
+            .iter()
+            .map(|(_, verb, body)| {
+                assert_eq!(verb, "set_volume");
+                body["volume"].as_u64().unwrap()
+            })
+            .collect();
+        assert!(
+            fade.windows(2).all(|w| w[1] < w[0]),
+            "the fade only goes down: {fade:?}"
+        );
+        assert_eq!(fade.last(), Some(&0), "silence before the pause");
+        assert_eq!(verbs[pause + 1..], ["set_volume"], "one restore");
+        assert_eq!(calls[pause + 1].2["volume"], 40);
+        assert_eq!(stub.volume(), 40, "not silent after the pause");
+        assert!(!p.sleep_timer.is_armed().await);
+    }
+
+    /// Pin: a restart cancels the sleep timer. Unload disarms it,
+    /// no options file is written, and a plugin loaded again from
+    /// the same state starts with no timer; the wait passes and
+    /// nothing reaches `audio.playback`.
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_leaves_no_sleep_timer_armed() {
+        let stub = StubPlayback::at(50);
+        let (mut p, dir) = plugin_with_playback(&stub).await;
+        p.handle_request(&sleep_timer(30, 1000)).await.unwrap();
+        assert!(p.sleep_timer.is_armed().await);
+        p.unload().await.unwrap();
+        assert!(!p.sleep_timer.is_armed().await);
+
+        let state_path = dir.path().join(STATE_FILENAME);
+        assert!(!state_path.exists(), "the timer wrote no options file");
+        let mut again =
+            PlaybackOptionsPlugin::new().with_state_path(state_path.clone());
+        let settings = again.load_settings_from_disk().await.unwrap();
+        *again.settings.write().unwrap() = settings;
+        again.shelf_dispatcher =
+            Some(Arc::clone(&stub) as Arc<dyn ShelfRequestDispatcher>);
+        again.loaded = true;
+        assert!(!again.sleep_timer.is_armed().await);
+
+        advance(Duration::from_secs(60)).await;
+        assert!(
+            stub.calls().is_empty(),
+            "no fade and no pause after a restart"
+        );
+    }
+
+    /// A restart during the fade puts the volume back and does not
+    /// pause.
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_during_the_fade_puts_the_volume_back() {
+        let stub = StubPlayback::at(50);
+        let (mut p, _dir) = plugin_with_playback(&stub).await;
+        p.handle_request(&sleep_timer(5, 4000)).await.unwrap();
+        advance(Duration::from_secs(7)).await;
+        assert!(stub.volume() < 50, "fading");
+        p.unload().await.unwrap();
+        assert_eq!(stub.volume(), 50);
+        advance(Duration::from_secs(10)).await;
+        assert!(!stub.verbs().iter().any(|v| v == "pause"));
+        assert_eq!(stub.volume(), 50);
+    }
+
+    /// `seconds` 0 cancels: a timer still waiting never reaches
+    /// `audio.playback`. Cancelling with nothing armed is not an
+    /// error.
+    #[tokio::test(start_paused = true)]
+    async fn seconds_zero_cancels_the_sleep_timer() {
+        let stub = StubPlayback::at(50);
+        let (p, _dir) = plugin_with_playback(&stub).await;
+        p.handle_request(&sleep_timer(30, 1000)).await.unwrap();
+        advance(Duration::from_secs(10)).await;
+        p.handle_request(&sleep_timer(0, 0)).await.unwrap();
+        assert!(!p.sleep_timer.is_armed().await);
+        advance(Duration::from_secs(60)).await;
+        assert!(stub.calls().is_empty());
+        p.handle_request(&sleep_timer(0, 0)).await.unwrap();
+    }
+
+    /// A cancel during the fade stops it and puts the volume back
+    /// to its level before the fade; playback is not paused.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_during_the_fade_restores_the_level() {
+        let stub = StubPlayback::at(70);
+        let (p, _dir) = plugin_with_playback(&stub).await;
+        p.handle_request(&sleep_timer(5, 4000)).await.unwrap();
+        advance(Duration::from_secs(7)).await;
+        assert!(stub.volume() < 70, "fading");
+        p.handle_request(&sleep_timer(0, 0)).await.unwrap();
+        assert_eq!(stub.volume(), 70);
+        let sent = stub.calls().len();
+        advance(Duration::from_secs(10)).await;
+        assert_eq!(stub.calls().len(), sent, "the fade stopped");
+        assert!(!stub.verbs().iter().any(|v| v == "pause"));
+    }
+
+    /// A second set replaces the armed timer: the first wait
+    /// passes with nothing sent, and the one pause comes at the
+    /// second timer's time.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_set_replaces_the_armed_sleep_timer() {
+        let stub = StubPlayback::at(30);
+        let (p, _dir) = plugin_with_playback(&stub).await;
+        p.handle_request(&sleep_timer(10, 1000)).await.unwrap();
+        advance(Duration::from_secs(5)).await;
+        p.handle_request(&sleep_timer(30, 1000)).await.unwrap();
+        advance(Duration::from_secs(20)).await;
+        assert!(stub.calls().is_empty(), "the first timer was replaced");
+        advance(Duration::from_secs(12)).await;
+        assert_eq!(stub.verbs().iter().filter(|v| *v == "pause").count(), 1);
+        assert_eq!(stub.volume(), 30);
+    }
+
+    /// Without the shelf dispatcher the timer cannot reach
+    /// `audio.playback`: arming is refused and nothing is armed;
+    /// cancelling still answers.
+    #[tokio::test]
+    async fn arming_the_sleep_timer_without_a_dispatcher_is_refused() {
+        let (p, _dir) = loaded_plugin().await;
+        match p.handle_request(&sleep_timer(10, 1000)).await.unwrap_err() {
+            PluginError::Permanent(msg) => {
+                assert!(msg.contains("audio.playback"), "got: {msg}")
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+        assert!(!p.sleep_timer.is_armed().await);
+        p.handle_request(&sleep_timer(0, 0)).await.unwrap();
     }
 
     #[tokio::test]
@@ -4841,6 +5626,21 @@ mod tests {
         StubQuerier,
         tempfile::TempDir,
     ) {
+        let (p, a, sub, q, d, _emitter) =
+            envelope_wired_plugin_with_emitter().await;
+        (p, a, sub, q, d)
+    }
+
+    /// As [`envelope_wired_plugin`], and hands back the emitter so
+    /// a test can assert what the transition recorded.
+    async fn envelope_wired_plugin_with_emitter() -> (
+        PlaybackOptionsPlugin,
+        Arc<CapturingAnnouncer>,
+        StubStateSubscriber,
+        StubQuerier,
+        tempfile::TempDir,
+        Arc<CapturingEmitter>,
+    ) {
         const OBSERVED_CID: &str = "stub-envelope-observed-cid";
         let dir = tempdir().unwrap();
         let state_path = dir.path().join(STATE_FILENAME);
@@ -4857,7 +5657,8 @@ mod tests {
         let mut p = PlaybackOptionsPlugin::new()
             .with_state_path(state_path)
             .with_envelope_ack_timeout_override(Duration::from_millis(200));
-        p.happening_emitter = Some(Arc::new(CapturingEmitter::default()));
+        let emitter = Arc::new(CapturingEmitter::default());
+        p.happening_emitter = Some(Arc::clone(&emitter) as Arc<_>);
         p.subject_announcer =
             Some(Arc::clone(&announcer) as Arc<dyn SubjectAnnouncer>);
         p.subject_state_subscriber = Some(
@@ -4866,7 +5667,7 @@ mod tests {
         p.subject_querier =
             Some(Arc::new(querier.clone()) as Arc<dyn SubjectQuerier>);
         p.loaded = true;
-        (p, announcer, subscriber, querier, dir)
+        (p, announcer, subscriber, querier, dir, emitter)
     }
 
     fn envelope_observed_state(
@@ -4963,6 +5764,129 @@ mod tests {
         assert!(
             requests[1].generation > requests[0].generation,
             "generation monotonic across envelope publishes"
+        );
+    }
+
+    /// A resume the player cannot do must not put the mixer back.
+    ///
+    /// The warden unmutes by resuming the chain. On a player with
+    /// no valid song position MPD answers `Bad song index`, and
+    /// the connection often goes with it (`Broken pipe`). Neither
+    /// says anything about the mixer — but the unmute failure used
+    /// to restore the prior settings, so a Pi with a hardware
+    /// mixer and nothing playing could not keep Hardware: the
+    /// gesture persisted it and the restore put Software back.
+    ///
+    /// The mute is acked here and the unmute never is, which is
+    /// exactly the shape of that field failure.
+    #[tokio::test]
+    async fn an_unacked_unmute_keeps_the_chosen_mixer() {
+        const OBSERVED_CID: &str = "stub-envelope-observed-cid";
+        let (p, announcer, subscriber, _querier, _dir, emitter) =
+            envelope_wired_plugin_with_emitter().await;
+
+        // Marco's Pi: Innomaker on the Allo overlay, card 2.
+        // Hardware mode needs the coordinates first; silent
+        // degrade is forbidden.
+        p.handle_request(&req(
+            "options.set_mixer_device",
+            json!({ "v": 1, "value": "hw:2" }),
+        ))
+        .await
+        .unwrap();
+        p.handle_request(&req(
+            "options.set_mixer_control",
+            json!({ "v": 1, "value": "Master" }),
+        ))
+        .await
+        .unwrap();
+
+        // Ack the mute. Never ack the unmute — the resume the
+        // warden attempts is the one MPD refuses.
+        let subscriber_clone = subscriber.clone();
+        let announcer_clone = Arc::clone(&announcer);
+        let ack_task = tokio::spawn(async move {
+            let mut acked = std::collections::HashSet::new();
+            for _ in 0..200 {
+                for req in envelope_requested_publishes(&announcer_clone) {
+                    if req.requested_state == EnvelopeState::Muted
+                        && !acked.contains(&req.generation)
+                    {
+                        subscriber_clone.publish(
+                            OBSERVED_CID,
+                            envelope_observed_state(
+                                req.generation,
+                                req.requested_state,
+                            ),
+                        );
+                        acked.insert(req.generation);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+
+        let resp = p
+            .handle_request(&req(
+                "options.set_mixer_type",
+                json!({ "v": 1, "value": "hardware" }),
+            ))
+            .await;
+        ack_task.abort();
+
+        // The gesture does not fail on the operator.
+        let resp = resp.expect("an unacked unmute must not fail the gesture");
+        let v: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v["status"], "ok", "payload: {v}");
+
+        // And the authority the operator chose is the one in
+        // force. This is the whole row.
+        assert_eq!(
+            p.settings().mixer_type,
+            MixerType::Hardware,
+            "a resume the player cannot do must not put the mixer \
+             back on Software"
+        );
+
+        // Both envelope publishes still happened: the unmute was
+        // attempted, it just was not acked.
+        let requests = envelope_requested_publishes(&announcer);
+        assert_eq!(requests.len(), 2, "mute then unmute: {requests:?}");
+        assert_eq!(requests[1].requested_state, EnvelopeState::Unmuted);
+
+        // Not swallowed. The chain did not come back, and the
+        // transition says so — the operator's mixer is right and
+        // their music is not playing, which are two facts.
+        // The lifecycle happenings are emitted detached, so wait
+        // for the one this row is about rather than reading the
+        // vector the instant the gesture returns.
+        let kinds = |()| -> Vec<String> {
+            emitter
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|e| e.event_type.clone())
+                .collect()
+        };
+        let mut seen = kinds(());
+        for _ in 0..200 {
+            if seen.iter().any(|k| k == MIXER_TRANSITION_UNMUTE_INCOMPLETE) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            seen = kinds(());
+        }
+        let kinds = seen;
+        assert!(
+            kinds
+                .iter()
+                .any(|k| k == MIXER_TRANSITION_UNMUTE_INCOMPLETE),
+            "the unacked unmute must be recorded: {kinds:?}"
+        );
+        assert!(
+            !kinds.iter().any(|k| k == MIXER_TRANSITION_ROLLED_BACK),
+            "nothing was rolled back: {kinds:?}"
         );
     }
 

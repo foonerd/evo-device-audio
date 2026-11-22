@@ -460,7 +460,7 @@ debian_package_for_binary() {
         lsblk|findmnt|blockdev)    echo "util-linux" ;;
         fsck.vfat)                 echo "dosfstools" ;;
         fsck.exfat)                echo "exfatprogs" ;;
-        ntfsfix)                   echo "ntfs-3g" ;;
+        ntfs-3g|ntfsfix)           echo "ntfs-3g" ;;
         e2fsck)                    echo "e2fsprogs" ;;
         eject)                     echo "eject" ;;
         evo-*)               echo "PLUGIN_PROVIDED" ;;
@@ -1061,6 +1061,48 @@ place_opt_evo() {
     rm -f "${tmp_cat}"
 }
 
+# A top-level `key = "value"` string from a bundle manifest, read
+# before its first table. Prints nothing when the key is absent,
+# empty, or not a plain string.
+manifest_string() {
+    local manifest="$1" key="$2"
+    awk -v k="${key}" '
+        /^\[/ { exit }
+        $0 ~ "^" k " = \"[^\"\\\\]*\"$" {
+            v = $0
+            sub("^" k " = \"", "", v)
+            sub("\"$", "", v)
+            print v
+            exit
+        }
+    ' "${manifest}"
+}
+
+# The installed release, which the system.info plugin reads: the
+# staged manifest's `release`, `architecture` and `built_at_utc`,
+# and nothing else. `version` is the Cargo version, not the
+# release, and is not copied. A key the manifest lacks is left out
+# of the record, never invented. Called once the staged binaries
+# are in place and bootstrap has run, so the wipe is behind it and
+# the file stays root-owned at 0644.
+INSTALLED_RECORD="${INSTALLED_RECORD:-/var/lib/evo/installed.toml}"
+write_installed_record() {
+    local manifest="${1:-${STAGE_DIR}/bundle-manifest.toml}"
+    local out="${2:-${INSTALLED_RECORD}}"
+    local tmp key value
+    mkdir -p "$(dirname "${out}")"
+    tmp="$(mktemp "${out}.XXXXXX")"
+    for key in release architecture built_at_utc; do
+        value="$(manifest_string "${manifest}" "${key}")"
+        if [[ -n "${value}" ]]; then
+            printf '%s = "%s"\n' "${key}" "${value}" >> "${tmp}"
+        fi
+    done
+    chmod 0644 "${tmp}"
+    mv -f "${tmp}" "${out}"
+    echo "  recorded the installed release in ${out}: $(manifest_string "${manifest}" release || true)"
+}
+
 install_main_systemd_unit() {
     # Main evo.service unit lives at /etc/systemd/system/evo.service.
     # bootstrap.sh handles only the .d/ drop-ins (exec-start.conf etc.);
@@ -1145,6 +1187,95 @@ invoke_bootstrap_placement() {
         fi
         return "$rc"
     fi
+}
+
+# evo-plugin-tool, the operator CLI, from the signed 0.1.13.0 slot
+# on the artefacts plane. The URL is pinned to the plane commit
+# that published the slot, so a later push to the plane cannot
+# change what an install places.
+#
+# The binary, its .sha256 and its .sig are fetched to a temp dir.
+# The hash is checked first, then the signature against the
+# commons plugin key that bootstrap placed in /etc/evo/trust.d/.
+# Only a binary that passes both is installed, under a temporary
+# name in /opt/evo/bin that is then renamed into place, so the
+# path is the earlier file or the verified one and never part of
+# either. A missing file, a missing key, a bad hash or a bad
+# signature returns non-zero, places nothing, and leaves no temp
+# file.
+#
+# The function uses nothing else from this script:
+# deploy-distribution.sh ships its text to the target and runs it
+# there as root. The optional arguments, a root prefix and a slot
+# base URL, are for the regression test.
+place_plugin_tool() {
+    local root="${1:-}"
+    local base="${2:-https://raw.githubusercontent.com/foonerd/evo-device-audio-artefacts/8c75e6e/binaries/evo-plugin-tool/0.1.13.0}"
+    local key="${root}/etc/evo/trust.d/commons-plugin-signing-public.pem"
+    local bin_dir="${root}/opt/evo/bin"
+    local triple tool name tmp want have staged
+    case "$(uname -m)" in
+        x86_64)  triple="x86_64-unknown-linux-gnu" ;;
+        aarch64) triple="aarch64-unknown-linux-gnu" ;;
+        armv7l)  triple="armv7-unknown-linux-gnueabihf" ;;
+        *)
+            echo "FAIL: no evo-plugin-tool for architecture $(uname -m)" >&2
+            return 1
+            ;;
+    esac
+    for tool in curl sha256sum openssl awk install mktemp mv; do
+        if ! command -v "${tool}" >/dev/null 2>&1; then
+            echo "FAIL: required tool missing: ${tool}" >&2
+            return 1
+        fi
+    done
+    if [[ ! -f "${key}" ]]; then
+        echo "FAIL: commons plugin key missing at ${key}; evo-plugin-tool not placed" >&2
+        return 4
+    fi
+    if ! tmp="$(mktemp -d)"; then
+        echo "FAIL: could not create a temp dir for evo-plugin-tool" >&2
+        return 4
+    fi
+    for name in evo-plugin-tool evo-plugin-tool.sha256 evo-plugin-tool.sig; do
+        if ! curl -fsSL --connect-timeout 10 --max-time 300 \
+                -o "${tmp}/${name}" "${base}/${triple}/${name}"; then
+            echo "FAIL: fetch ${base}/${triple}/${name} failed" >&2
+            rm -rf "${tmp}"
+            return 2
+        fi
+    done
+    want="$(awk 'NR == 1 { print $1 }' "${tmp}/evo-plugin-tool.sha256")" || want=""
+    have="$(sha256sum "${tmp}/evo-plugin-tool" | awk '{ print $1 }')" || have=""
+    if [[ ! "${want}" =~ ^[0-9a-f]{64}$ || "${have}" != "${want}" ]]; then
+        echo "FAIL: evo-plugin-tool sha256 is ${have:-unreadable}; its .sha256 says ${want:-nothing}" >&2
+        rm -rf "${tmp}"
+        return 3
+    fi
+    if ! openssl pkeyutl -verify -pubin -inkey "${key}" \
+            -rawin -in "${tmp}/evo-plugin-tool" \
+            -sigfile "${tmp}/evo-plugin-tool.sig" >/dev/null 2>&1; then
+        echo "FAIL: evo-plugin-tool signature does not verify against ${key}" >&2
+        rm -rf "${tmp}"
+        return 3
+    fi
+    # A staged copy left by a run that was killed before its
+    # rename.
+    rm -f "${bin_dir}"/.evo-plugin-tool.*
+    if ! staged="$(mktemp "${bin_dir}/.evo-plugin-tool.XXXXXX")"; then
+        echo "FAIL: could not stage evo-plugin-tool in ${bin_dir}" >&2
+        rm -rf "${tmp}"
+        return 4
+    fi
+    if ! install -m 0755 -o root -g root "${tmp}/evo-plugin-tool" "${staged}" \
+            || ! mv -f "${staged}" "${bin_dir}/evo-plugin-tool"; then
+        echo "FAIL: could not place ${bin_dir}/evo-plugin-tool" >&2
+        rm -f "${staged}"
+        rm -rf "${tmp}"
+        return 4
+    fi
+    rm -rf "${tmp}"
+    echo "  placed ${bin_dir}/evo-plugin-tool from ${base}/${triple} (sha256 ${have})"
 }
 
 purge_evo_mpd_includes() {
@@ -1587,8 +1718,9 @@ verify_storage_usb_provisioning() {
 
     # Wrapper — exists, mode 0755, --version returns exit 0 and
     # prints the stable version tag. Accepted versions:
-    #   evo-usb-mount 5 — current (host-ns attach; NTFS via
-    #                     ntfs-3g, not kernel ntfs3).
+    #   evo-usb-mount 7 — current. Force detach is systemd-run
+    #                     as a child of PID 1, then umount -i -l.
+    #   evo-usb-mount 5 — host-ns attach; NTFS via ntfs-3g.
     #   evo-usb-mount 4 — systemd-mount --type as given (NTFS
     #                     hits ntfs3 and rejects §2 options).
     #   evo-usb-mount 3 — raw mount(8) inside the steward unit.
@@ -1600,7 +1732,8 @@ verify_storage_usb_provisioning() {
     if [[ -x /usr/local/bin/evo-usb-mount ]]; then
         local ver
         ver="$(/usr/local/bin/evo-usb-mount --version 2>/dev/null || true)"
-        if [[ "${ver}" == "evo-usb-mount 5" ]] \
+        if [[ "${ver}" == "evo-usb-mount 7" ]] \
+           || [[ "${ver}" == "evo-usb-mount 5" ]] \
            || [[ "${ver}" == "evo-usb-mount 4" ]] \
            || [[ "${ver}" == "evo-usb-mount 3" ]] \
            || [[ "${ver}" == "evo-usb-mount 2" ]] \
@@ -1957,7 +2090,7 @@ case "${MODE}" in
         echo "[3/7] system packages (baseline + per-plugin prerequisites, parity-verified) ..." ; ensure_system_packages ; echo "  ok"
         echo "[4/7] stop prior steward ..." ; stop_prior_steward    ; echo "  ok"
         echo "[5/7] /opt/evo (binaries + plugins + catalogue) ..." ; place_opt_evo  ; echo "  ok"
-        echo "[6/7] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
+        echo "[6/7] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate + evo-plugin-tool ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; write_installed_record ; TMPDIR="${WORK_DIR}" place_plugin_tool ; echo "  ok"
         echo "[7/7] start + verify ..."   ; start_operator_surface ; verify_post_condition
         ;;
     reinstall)
@@ -1967,7 +2100,7 @@ case "${MODE}" in
         echo "[4/7] FULL WIPE (binaries + config + state + music) ..."
         wipe_full ; echo "  ok"
         echo "[5/7] /opt/evo ..."        ; place_opt_evo           ; echo "  ok"
-        echo "[6/7] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
+        echo "[6/7] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate + evo-plugin-tool ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; write_installed_record ; TMPDIR="${WORK_DIR}" place_plugin_tool ; echo "  ok"
         echo "[7/7] start + verify ..."  ; start_operator_surface ; verify_post_condition
         MUSIC_HASH_CHANGED="true"
         ;;
@@ -1979,7 +2112,7 @@ case "${MODE}" in
         echo "[5/8] CONFIG WIPE (binaries + config + state, music preserved) ..."
         wipe_config ; echo "  ok"
         echo "[6/8] /opt/evo ..."        ; place_opt_evo           ; echo "  ok"
-        echo "[7/8] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
+        echo "[7/8] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate + evo-plugin-tool ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; write_installed_record ; TMPDIR="${WORK_DIR}" place_plugin_tool ; echo "  ok"
         echo "[8/8] start + verify + music library byte-equal ..."  ; start_operator_surface ; verify_post_condition ; verify_music_hashes_preserved
         ;;
     wipe-user-data)

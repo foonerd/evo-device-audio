@@ -74,7 +74,8 @@ response_budget_ms = 5000
 # Cancel verb: any caller can dismiss an active handle (banner
 # widget's operator-gesture path lands here).
 "system.notifications.cancel" = { kind = "none" }
-# Operator-configuration verbs: step-up-gated against
-# system_admin (same scope class as the power shelf).
-"system.notifications.set_base_mode" = { kind = "step_up", scope = "system_admin" }
-"system.notifications.set_quiet_hours" = { kind = "step_up", scope = "system_admin" }
+# Operator-configuration verbs: write:system_admin (same scope as
+# the power shelf). While the household policy protects
+# system_admin, each needs the owner's step-up session on the call.
+"system.notifications.set_base_mode" = { kind = "write", scope = "system_admin" }
+"system.notifications.set_quiet_hours" = { kind = "write", scope = "system_admin" }

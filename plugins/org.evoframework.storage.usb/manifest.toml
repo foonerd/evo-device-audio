@@ -70,17 +70,16 @@ response_budget_ms = 180000
 [capabilities.respondent.verb_capabilities]
 # Read verb anonymous (widget seed).
 "storage.usb.list_drives" = { kind = "none" }
-# Mount / repair / rename ride the same household door as
-# share.mount — `network_admin`. `storage_admin` is not on
-# the steward bootstrap or LAN-privileged set, so the gate
-# returned verb_capability_scope_not_granted and glass
-# painted "That didn't work" with no password card.
-"storage.usb.mount" = { kind = "step_up", scope = "network_admin" }
-# Same household door as mount. Glass library Remove
-# still has no password of its own: it nests as
-# plugin-system, which now holds network_admin as
-# StepUp. A LAN-trust or unpaired peer cannot call
-# this verb directly.
-"storage.usb.safe_remove" = { kind = "step_up", scope = "network_admin" }
-"storage.usb.repair_filesystem" = { kind = "step_up", scope = "network_admin" }
-"storage.usb.rename" = { kind = "step_up", scope = "network_admin" }
+# Mount / safe-remove / repair / rename ride the same household
+# door as share.mount: `write:network_admin`. A pair or kiosk
+# bearer holds the scope, and so does a LAN caller without a
+# bearer while the household policy polices the LAN. While the
+# policy protects network_admin, each verb needs the owner's
+# step-up session on the call. Glass library Remove has no
+# password of its own: it nests as plugin-system, which holds
+# network_admin, and carries the sitting of the consumer it
+# serves. A public-origin caller without a bearer is refused.
+"storage.usb.mount" = { kind = "write", scope = "network_admin" }
+"storage.usb.safe_remove" = { kind = "write", scope = "network_admin" }
+"storage.usb.repair_filesystem" = { kind = "write", scope = "network_admin" }
+"storage.usb.rename" = { kind = "write", scope = "network_admin" }

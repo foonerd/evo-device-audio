@@ -106,6 +106,7 @@
 #![allow(clippy::manual_async_fn)]
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use evo_plugin_sdk::contract::audio_routing::{
@@ -115,7 +116,8 @@ use evo_plugin_sdk::contract::audio_routing::{
 use evo_plugin_sdk::contract::{
     BuildInfo, ExternalAddressing, HealthReport, LoadContext, Plugin,
     PluginDescription, PluginError, PluginIdentity, Request, Respondent,
-    Response, RuntimeCapabilities, SubjectStateStreamError,
+    Response, RuntimeCapabilities, ShelfRequestDispatcher,
+    SubjectStateStreamError,
 };
 use evo_plugin_sdk::Manifest;
 use serde::{Deserialize, Serialize};
@@ -138,6 +140,13 @@ pub const PLUGIN_NAME: &str = "org.evoframework.composition.alsa";
 
 /// Sole respondent surface this plugin exposes.
 const REQUEST_COMPOSITION_SELECT_MODE: &str = "composition.select_mode";
+
+/// Filename under the plugin's state directory holding the
+/// active composition mode. One declared mode token, newline
+/// terminated — small enough to read and write whole, and
+/// readable by an operator looking at why their device came back
+/// in the mode it did.
+const MODE_STATE_FILE: &str = "composition_mode";
 
 /// Wire-protocol payload version for the request/response
 /// envelope.
@@ -189,6 +198,50 @@ impl Default for EqRuntimeState {
     }
 }
 
+/// What the delivery plugin's `evo.audio.zones` / `eq_claim`
+/// subject says: whether one zone's EQ should be heard on the
+/// one pipe, and with which bands. Absent, malformed, or
+/// `claimed: false` all mean the options EQ.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum ZoneEqClaim {
+    /// No zone claims the pipe; the options EQ sounds.
+    #[default]
+    None,
+    /// This zone's EQ sounds, engaged, with these bands.
+    Claimed {
+        /// The claiming zone, for the log.
+        zone_id: String,
+        /// Its ten bands.
+        bands: [crate::eq_dsp::EqBandParams; crate::eq_dsp::EQ_BAND_COUNT],
+    },
+}
+
+/// The two inputs the one cascade chooses its bands from. The
+/// options subscriber writes `options`; the zone-claim subscriber
+/// writes `claim`; each then publishes [`sounding_eq`] to the
+/// worker's channel. There is one cascade and one channel.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EqInputs {
+    /// The operator's global EQ, from `audio.options.settings`.
+    pub options: EqRuntimeState,
+    /// The zone claim, from `evo.audio.zones` / `eq_claim`.
+    pub claim: ZoneEqClaim,
+}
+
+/// The EQ the cascade sounds. While a zone claims the pipe, its
+/// bands, engaged; otherwise the options EQ as it is. The mode
+/// gate is the worker's: in any mode but `eq_only` nothing is
+/// applied, whatever this says.
+pub fn sounding_eq(inputs: &EqInputs) -> EqRuntimeState {
+    match &inputs.claim {
+        ZoneEqClaim::Claimed { bands, .. } => EqRuntimeState {
+            engaged: true,
+            bands: *bands,
+        },
+        ZoneEqClaim::None => inputs.options.clone(),
+    }
+}
+
 /// ALSA composition plugin.
 pub struct AlsaCompositionPlugin {
     loaded: bool,
@@ -203,11 +256,27 @@ pub struct AlsaCompositionPlugin {
     /// between passthrough and eq_only processing without
     /// restarting the substrate lifecycle.
     mode_tx: watch::Sender<String>,
-    /// Watch channel publishing the operator's EQ runtime
-    /// state (engaged flag + 10 band parameters). Seeded with
-    /// the audiophile-grade flat defaults at construction;
-    /// updated by the `audio.options.settings` subscriber.
+    /// Cross-shelf dispatcher, from
+    /// [`LoadContext::shelf_request_dispatcher`]. Used to report
+    /// the active mode onto the operator's audio-options
+    /// settings, which is the subject the glass already reads at
+    /// mount. `None` in an in-process test harness; the steward's
+    /// wire adapter always populates it in production.
+    shelf_dispatcher: Option<Arc<dyn ShelfRequestDispatcher>>,
+    /// The plugin's own state directory, from
+    /// [`LoadContext::state_dir`]. `None` before load, which is
+    /// how a unit-test construction stays off the filesystem.
+    state_dir: Option<PathBuf>,
+    /// Watch channel publishing the EQ the cascade sounds
+    /// (engaged flag + 10 band parameters): [`sounding_eq`] of
+    /// [`eq_inputs`](Self::eq_inputs). Seeded with the flat
+    /// defaults at construction; republished whenever either
+    /// input changes.
     eq_state_tx: watch::Sender<EqRuntimeState>,
+    /// The options EQ and the zone claim the sounding EQ is
+    /// chosen from. Two subscribers write it; one function reads
+    /// it.
+    eq_inputs: Arc<std::sync::Mutex<EqInputs>>,
     /// Audio routing handle pulled from
     /// [`LoadContext::audio_routing`] at load time. `None`
     /// before the first successful load and after every
@@ -293,9 +362,12 @@ impl AlsaCompositionPlugin {
         let (mode_tx, _) = watch::channel(MODE_PASSTHROUGH.to_string());
         let (eq_state_tx, _) = watch::channel(EqRuntimeState::default());
         Self {
+            shelf_dispatcher: None,
+            state_dir: None,
             loaded: false,
             mode_tx,
             eq_state_tx,
+            eq_inputs: Arc::new(std::sync::Mutex::new(EqInputs::default())),
             audio_routing: None,
             requests_handled: std::sync::atomic::AtomicU64::new(0),
             reactor: None,
@@ -332,6 +404,103 @@ impl AlsaCompositionPlugin {
     pub fn requests_handled(&self) -> u64 {
         self.requests_handled
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Where the active mode is remembered between loads.
+    ///
+    /// `None` until [`Plugin::load`] supplies the plugin's state
+    /// directory, so a plugin constructed for a unit test does
+    /// not write to the machine running it.
+    fn mode_state_path(&self) -> Option<PathBuf> {
+        self.state_dir.as_ref().map(|d| d.join(MODE_STATE_FILE))
+    }
+
+    /// Report the active mode onto the operator's audio-options
+    /// settings.
+    ///
+    /// The mode lives on this shelf, but the glass reads
+    /// `audio.options.settings` at mount and nothing else. Rather
+    /// than giving it a second shelf to ask, the mode is written
+    /// where it already looks.
+    ///
+    /// The options verb is idempotent — reporting the mode it
+    /// already holds persists nothing and republishes nothing —
+    /// which is what makes it safe to call on every change and
+    /// again on the mode restored at load.
+    ///
+    /// Best-effort and detached: a glass that paints a stale mode
+    /// is a worse outcome than a slow one, but neither is worth
+    /// failing a load or a mode gesture over. Absent dispatcher
+    /// (an in-process harness) is silent.
+    fn report_mode_to_options(&self, mode: &str) {
+        let Some(dispatcher) = self.shelf_dispatcher.clone() else {
+            return;
+        };
+        let mode = mode.to_string();
+        tokio::spawn(async move {
+            let payload = serde_json::json!({ "v": 1, "mode": mode });
+            let Ok(bytes) = serde_json::to_vec(&payload) else {
+                return;
+            };
+            if let Err(e) = dispatcher
+                .dispatch(
+                    "audio.options",
+                    "options.set_composition_mode",
+                    bytes,
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    mode = %mode,
+                    error = %e,
+                    "could not report the composition mode to audio \
+                     options; the glass may paint a stale mode until the \
+                     next change. LOGGING.md §2: operator-visible state \
+                     diverging from the device."
+                );
+            }
+        });
+    }
+
+    /// Record the active mode so the next load restores it.
+    ///
+    /// Best-effort and deliberately quiet about absence: with no
+    /// state directory there is nothing to write to and nothing
+    /// to warn about. A write that fails is logged, because the
+    /// operator's next boot will not carry their choice.
+    fn persist_mode(&self, mode: &str) {
+        let Some(path) = self.mode_state_path() else {
+            return;
+        };
+        if let Err(e) = std::fs::write(&path, format!("{}\n", mode.trim())) {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                path = %path.display(),
+                error = %e,
+                "could not record the active composition mode; the next \
+                 load will fall back to the default. LOGGING.md §2: an \
+                 operator's processing choice silently not surviving a \
+                 restart is the defect this records."
+            );
+        }
+    }
+
+    /// Read back the mode recorded by a previous load.
+    ///
+    /// Anything unreadable, empty, or not a declared mode answers
+    /// `None` and the caller keeps the default. A state file is
+    /// not a reason to refuse a load, and an unknown token in it
+    /// is not a mode this build can honour.
+    fn recorded_mode(&self) -> Option<String> {
+        let path = self.mode_state_path()?;
+        let raw = std::fs::read_to_string(path).ok()?;
+        let mode = raw.trim();
+        if mode.is_empty() || !DECLARED_MODES.contains(&mode) {
+            return None;
+        }
+        Some(mode.to_string())
     }
 
     /// Currently active composition mode. Reads through `mode_tx`
@@ -537,15 +706,17 @@ impl AlsaCompositionPlugin {
         let subscriber = Arc::clone(subscriber);
         let querier = Arc::clone(querier);
         let eq_tx = self.eq_state_tx.clone();
+        let inputs = Arc::clone(&self.eq_inputs);
         let addressing = ExternalAddressing {
             scheme: "evo.audio.options".to_string(),
             value: "settings".to_string(),
         };
 
         tokio::spawn(async move {
-            let canonical_id = match resolve_options_addressing_with_backoff(
+            let canonical_id = match resolve_addressing_with_backoff(
                 querier.as_ref(),
                 &addressing,
+                "audio-options settings",
             )
             .await
             {
@@ -586,7 +757,7 @@ impl AlsaCompositionPlugin {
                 };
             if let Some(state) = initial_state {
                 let new_state = parse_eq_runtime_state_from_state(&state);
-                let _ = eq_tx.send_replace(new_state);
+                set_options_input(&inputs, &eq_tx, new_state);
             }
             loop {
                 match stream.recv().await {
@@ -594,7 +765,7 @@ impl AlsaCompositionPlugin {
                         if let Some(state) = update.state.as_ref() {
                             let new_state =
                                 parse_eq_runtime_state_from_state(state);
-                            let _ = eq_tx.send_replace(new_state);
+                            set_options_input(&inputs, &eq_tx, new_state);
                         }
                     }
                     Err(SubjectStateStreamError::Lagged { dropped }) => {
@@ -609,6 +780,93 @@ impl AlsaCompositionPlugin {
                             plugin = PLUGIN_NAME,
                             "audio-options subject stream closed; \
                              subscriber task exiting"
+                        );
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Subscribe to the delivery plugin's `evo.audio.zones` /
+    /// `eq_claim` subject: which zone's EQ, if any, the one pipe
+    /// should sound. Every update rewrites the claim input and
+    /// republishes the sounding EQ to the worker. Best-effort
+    /// like the options subscriber: when the subject never
+    /// resolves, the claim stays `None` and the cascade keeps
+    /// using the options EQ, as it does today. This plugin does
+    /// not read `zones.toml`.
+    async fn spawn_zone_eq_claim_subscriber(&self, ctx: &LoadContext) {
+        let Some(subscriber) = ctx.subject_state_subscriber.as_ref() else {
+            return;
+        };
+        let Some(querier) = ctx.subject_querier.as_ref() else {
+            return;
+        };
+        let subscriber = Arc::clone(subscriber);
+        let querier = Arc::clone(querier);
+        let eq_tx = self.eq_state_tx.clone();
+        let inputs = Arc::clone(&self.eq_inputs);
+        let addressing = ExternalAddressing {
+            scheme: "evo.audio.zones".to_string(),
+            value: "eq_claim".to_string(),
+        };
+        tokio::spawn(async move {
+            let canonical_id = match resolve_addressing_with_backoff(
+                querier.as_ref(),
+                &addressing,
+                "zone eq_claim",
+            )
+            .await
+            {
+                Some(id) => id,
+                None => return,
+            };
+            let mut stream = match subscriber
+                .subscribe_subject(canonical_id.clone())
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        canonical_id = %canonical_id,
+                        "subscribe to zone eq_claim subject failed"
+                    );
+                    return;
+                }
+            };
+            if let Ok(Some(state)) =
+                subscriber.current_state(canonical_id.clone()).await
+            {
+                set_claim_input(
+                    &inputs,
+                    &eq_tx,
+                    parse_zone_eq_claim_from_state(&state),
+                );
+            }
+            loop {
+                match stream.recv().await {
+                    Ok(update) => {
+                        let claim = update
+                            .state
+                            .as_ref()
+                            .map(parse_zone_eq_claim_from_state)
+                            .unwrap_or_default();
+                        set_claim_input(&inputs, &eq_tx, claim);
+                    }
+                    Err(SubjectStateStreamError::Lagged { dropped }) => {
+                        tracing::warn!(
+                            plugin = PLUGIN_NAME,
+                            dropped = dropped,
+                            "zone eq_claim subject stream lagged; continuing"
+                        );
+                    }
+                    Err(SubjectStateStreamError::Closed) => {
+                        tracing::debug!(
+                            plugin = PLUGIN_NAME,
+                            "zone eq_claim subject stream closed"
                         );
                         return;
                     }
@@ -748,16 +1006,110 @@ fn parse_eq_runtime_state_from_state(
     EqRuntimeState { engaged, bands }
 }
 
-/// Resolve the `audio.options.settings` addressing with
-/// bounded exponential backoff. Mirrors the playback.mpd
-/// pattern: the canonical Phase 2 discovery order admits
-/// composition.alsa before playback.options on the reference
-/// distribution, so the first resolve attempt typically
-/// returns `Ok(None)` and the retry succeeds on attempt 2 or
-/// 3.
-async fn resolve_options_addressing_with_backoff(
+/// Extract the zone EQ claim from an `evo.audio.zones` /
+/// `eq_claim` subject-state payload. Only
+/// `{ claimed: true, engaged: true, bands: [10] }` with every
+/// band carrying its three fields is a claim; anything else —
+/// `claimed: false`, a missing or short or long band list, a
+/// band missing a field — is `None`, and the options EQ sounds.
+fn parse_zone_eq_claim_from_state(state: &serde_json::Value) -> ZoneEqClaim {
+    let claimed = state
+        .get("claimed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let engaged = state
+        .get("engaged")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !claimed || !engaged {
+        return ZoneEqClaim::None;
+    }
+    let Some(arr) = state.get("bands").and_then(|v| v.as_array()) else {
+        return ZoneEqClaim::None;
+    };
+    if arr.len() != crate::eq_dsp::EQ_BAND_COUNT {
+        return ZoneEqClaim::None;
+    }
+    let mut bands =
+        [crate::eq_dsp::EqBandParams::default(); crate::eq_dsp::EQ_BAND_COUNT];
+    for (i, entry) in arr.iter().enumerate() {
+        let (Some(freq_hz), Some(gain_db), Some(q)) = (
+            entry.get("freq_hz").and_then(|v| v.as_u64()),
+            entry.get("gain_db").and_then(|v| v.as_f64()),
+            entry.get("q").and_then(|v| v.as_f64()),
+        ) else {
+            return ZoneEqClaim::None;
+        };
+        bands[i] = crate::eq_dsp::EqBandParams {
+            freq_hz: freq_hz as u32,
+            gain_db: gain_db as f32,
+            q: q as f32,
+        };
+    }
+    let zone_id = state
+        .get("zone_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    ZoneEqClaim::Claimed { zone_id, bands }
+}
+
+/// Record a new options EQ and republish the sounding EQ.
+fn set_options_input(
+    inputs: &std::sync::Mutex<EqInputs>,
+    eq_tx: &watch::Sender<EqRuntimeState>,
+    options: EqRuntimeState,
+) {
+    let sounding = {
+        let mut i = inputs.lock().unwrap_or_else(|e| e.into_inner());
+        i.options = options;
+        sounding_eq(&i)
+    };
+    let _ = eq_tx.send_replace(sounding);
+}
+
+/// Record a new zone claim and republish the sounding EQ.
+fn set_claim_input(
+    inputs: &std::sync::Mutex<EqInputs>,
+    eq_tx: &watch::Sender<EqRuntimeState>,
+    claim: ZoneEqClaim,
+) {
+    let sounding = {
+        let mut i = inputs.lock().unwrap_or_else(|e| e.into_inner());
+        match &claim {
+            ZoneEqClaim::Claimed { zone_id, .. }
+                if i.claim == ZoneEqClaim::None =>
+            {
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    zone_id = %zone_id,
+                    "zone eq claims the pipe; its bands sound in eq_only"
+                );
+            }
+            ZoneEqClaim::None if i.claim != ZoneEqClaim::None => {
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    "zone eq claim dropped; the options eq sounds"
+                );
+            }
+            _ => {}
+        }
+        i.claim = claim;
+        sounding_eq(&i)
+    };
+    let _ = eq_tx.send_replace(sounding);
+}
+
+/// Resolve a subject addressing with bounded exponential
+/// backoff. Mirrors the playback.mpd pattern: the canonical
+/// Phase 2 discovery order admits composition.alsa before the
+/// plugins whose subjects it reads, so the first resolve attempt
+/// typically returns `Ok(None)` and the retry succeeds on
+/// attempt 2 or 3. `what` names the subject in the log.
+async fn resolve_addressing_with_backoff(
     querier: &dyn evo_plugin_sdk::contract::SubjectQuerier,
     addressing: &ExternalAddressing,
+    what: &str,
 ) -> Option<String> {
     const MAX_ATTEMPTS: u32 = 10;
     const INITIAL_DELAY_MS: u64 = 100;
@@ -771,8 +1123,8 @@ async fn resolve_options_addressing_with_backoff(
                         plugin = PLUGIN_NAME,
                         attempt = attempt + 1,
                         canonical_id = %id,
-                        "audio-options settings subject resolved after \
-                         admission-order retry"
+                        subject = what,
+                        "subject resolved after admission-order retry"
                     );
                 }
                 return Some(id);
@@ -782,8 +1134,9 @@ async fn resolve_options_addressing_with_backoff(
                     tracing::info!(
                         plugin = PLUGIN_NAME,
                         delay_ms,
-                        "audio-options settings subject not yet announced; \
-                         retrying with exponential backoff"
+                        subject = what,
+                        "subject not yet announced; retrying with \
+                         exponential backoff"
                     );
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
@@ -795,8 +1148,8 @@ async fn resolve_options_addressing_with_backoff(
                     plugin = PLUGIN_NAME,
                     error = %e,
                     attempt = attempt + 1,
-                    "resolve_addressing for audio-options settings failed; \
-                     retrying"
+                    subject = what,
+                    "resolve_addressing failed; retrying"
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
                     .await;
@@ -806,9 +1159,9 @@ async fn resolve_options_addressing_with_backoff(
     }
     tracing::warn!(
         plugin = PLUGIN_NAME,
-        "audio-options settings subject did not resolve within retry budget; \
-         eq state subscriber not wired (eq_only mode reads defaults until \
-         operator settings land)"
+        subject = what,
+        "subject did not resolve within retry budget; its subscriber is not \
+         wired (the cascade reads what it has until the subject lands)"
     );
     None
 }
@@ -1079,6 +1432,28 @@ impl Plugin for AlsaCompositionPlugin {
         ctx: &'a LoadContext,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
         async move {
+            self.state_dir = Some(ctx.state_dir.clone());
+            self.shelf_dispatcher =
+                ctx.shelf_request_dispatcher.as_ref().map(Arc::clone);
+            // Restore the operator's mode before the substrate
+            // starts, so the first worker subscribes to the mode
+            // they chose rather than to the default and then
+            // switches under them.
+            if let Some(mode) = self.recorded_mode() {
+                if mode != *self.mode_tx.borrow() {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        mode = %mode,
+                        "restored the recorded composition mode"
+                    );
+                    self.mode_tx.send_replace(mode);
+                }
+            }
+            // Report whatever mode this load came up in —
+            // restored or default. A device that has been in
+            // eq_only since before the glass existed still has to
+            // say so the first time anything asks.
+            self.report_mode_to_options(&self.current_mode());
             self.install_routing(ctx.audio_routing.clone())?;
             self.spawn_reactor().await?;
             self.spawn_worker().await?;
@@ -1090,6 +1465,10 @@ impl Plugin for AlsaCompositionPlugin {
             // composition stage stays available for the
             // passthrough mode without the operator surface.
             self.spawn_options_settings_subscriber(ctx).await;
+            // And to the delivery plugin's zone EQ claim, which
+            // picks a zone's bands over the options bands while
+            // one engaged zone holds the playing output.
+            self.spawn_zone_eq_claim_subscriber(ctx).await;
             Ok(())
         }
     }
@@ -1249,6 +1628,20 @@ impl Respondent for AlsaCompositionPlugin {
             // interior mutability so `handle_request` stays
             // `&self` under the concurrent-dispatch contract.
             self.mode_tx.send_replace(new_mode.clone());
+            // And remember it. The mode was held in memory only,
+            // so a device the operator put into eq_only came back
+            // in passthrough at the next load — their processing
+            // silently off, with nothing on the glass to say so.
+            //
+            // Written after the substrate has been told, and
+            // best-effort: a mode that is active but unrecorded is
+            // a mode that does not survive a restart, which is the
+            // defect's own severity. A mode recorded but refused
+            // by the substrate would be worse.
+            self.persist_mode(&new_mode);
+            // And tell the glass, through the settings subject it
+            // already reads at mount.
+            self.report_mode_to_options(&new_mode);
             encode_response(req, SelectModeResponse::ok(new_mode))
         }
     }
@@ -1405,6 +1798,328 @@ mod tests {
                 DECLARED_MODES
             );
         }
+    }
+
+    /// Load has to wire the state directory and restore the
+    /// recorded mode, not merely be able to.
+    ///
+    /// Persisting the mode is worth nothing if nothing reads it
+    /// back, and the read happens in `load`. No test in this tree
+    /// constructs a `LoadContext` — the SDK offers no test
+    /// constructor for one — so `load` cannot be driven from here
+    /// and the wiring is pinned where it lives. Mutating either
+    /// line away leaves every behavioural test green.
+    #[test]
+    fn load_wires_the_state_dir_and_restores_the_mode() {
+        let src = include_str!("lib.rs");
+        let load_at = src
+            .find("    fn load<'a>(")
+            .expect("the plugin must have a load");
+        let body_end = src[load_at + 1..]
+            .find("\n    fn ")
+            .map(|i| load_at + 1 + i)
+            .unwrap_or(src.len());
+        let body = &src[load_at..body_end];
+
+        assert!(
+            body.contains("self.state_dir = Some(ctx.state_dir.clone())"),
+            "load must take the plugin's state directory, or nothing \
+             can be recorded or read back"
+        );
+        assert!(
+            body.contains("self.recorded_mode()"),
+            "load must restore the recorded mode, or persisting it \
+             changes nothing an operator sees"
+        );
+        // Before the substrate starts, so the first worker
+        // subscribes to the restored mode rather than to the
+        // default and then switching under the operator.
+        let restore = body.find("self.recorded_mode()").expect("checked above");
+        let spawn = body
+            .find("self.spawn_reactor()")
+            .expect("load must spawn the reactor");
+        assert!(
+            restore < spawn,
+            "the mode must be restored before the substrate starts"
+        );
+
+        // And the glass is told what this load came up in.
+        // Persisting the mode is invisible to an operator whose
+        // glass reads only the settings subject.
+        assert!(
+            body.contains("ctx.shelf_request_dispatcher"),
+            "load must take the cross-shelf dispatcher, or the mode \
+             cannot be reported to audio options"
+        );
+        assert!(
+            body.contains("self.report_mode_to_options(&self.current_mode())"),
+            "load must report the mode it came up in, restored or default"
+        );
+    }
+
+    /// A dispatcher that records what was sent to which shelf.
+    #[derive(Default)]
+    struct RecordingDispatcher {
+        calls: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl std::fmt::Debug for RecordingDispatcher {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RecordingDispatcher")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl ShelfRequestDispatcher for RecordingDispatcher {
+        fn dispatch<'a>(
+            &'a self,
+            shelf: &'a str,
+            request_type: &'a str,
+            payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Vec<u8>,
+                            evo_plugin_sdk::contract::ShelfDispatchError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push((
+                    shelf.to_string(),
+                    request_type.to_string(),
+                    String::from_utf8_lossy(&payload).to_string(),
+                ));
+                Ok(b"{}".to_vec())
+            })
+        }
+    }
+
+    /// Wait for the detached report to land, or give up.
+    async fn wait_for_dispatch(
+        d: &Arc<RecordingDispatcher>,
+        n: usize,
+    ) -> Vec<(String, String, String)> {
+        for _ in 0..100 {
+            {
+                let calls = d.calls.lock().unwrap();
+                if calls.len() >= n {
+                    return calls.clone();
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        d.calls.lock().unwrap().clone()
+    }
+
+    /// Choosing a mode tells the glass, through the settings
+    /// subject it already reads at mount.
+    ///
+    /// The mode lives on this shelf, but the glass reads
+    /// `audio.options.settings` and nothing else. Rather than
+    /// giving it a second shelf to ask, the mode is written where
+    /// it already looks.
+    #[tokio::test]
+    async fn selecting_a_mode_reports_it_to_audio_options() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dispatcher = Arc::new(RecordingDispatcher::default());
+        let mut p = AlsaCompositionPlugin::new();
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.shelf_dispatcher =
+            Some(Arc::clone(&dispatcher) as Arc<dyn ShelfRequestDispatcher>);
+        p.install_routing(Some(Arc::new(StubAudioRouting::new()) as _))
+            .unwrap();
+
+        let req = Request {
+            request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
+            payload: json!({ "v": 1, "mode": "eq_only" })
+                .to_string()
+                .into_bytes(),
+            correlation_id: 9,
+            deadline: None,
+            instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
+        };
+        let resp = p.handle_request(&req).await.unwrap();
+        assert_eq!(decode_payload(&resp.payload)["status"], "ok");
+
+        let calls = wait_for_dispatch(&dispatcher, 1).await;
+        assert_eq!(calls.len(), 1, "exactly one report: {calls:?}");
+        assert_eq!(calls[0].0, "audio.options", "the shelf the glass reads");
+        assert_eq!(calls[0].1, "options.set_composition_mode");
+        assert!(
+            calls[0].2.contains("eq_only"),
+            "the report must carry the mode: {}",
+            calls[0].2
+        );
+    }
+
+    /// A refused gesture reports nothing. The device did not
+    /// change mode, so the glass must not be told it did.
+    #[tokio::test]
+    async fn a_refused_mode_is_not_reported() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dispatcher = Arc::new(RecordingDispatcher::default());
+        let mut p = AlsaCompositionPlugin::new();
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.shelf_dispatcher =
+            Some(Arc::clone(&dispatcher) as Arc<dyn ShelfRequestDispatcher>);
+        p.install_routing(Some(Arc::new(StubAudioRouting::new()) as _))
+            .unwrap();
+
+        let req = Request {
+            request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
+            payload: json!({ "v": 1, "mode": "resampler" })
+                .to_string()
+                .into_bytes(),
+            correlation_id: 10,
+            deadline: None,
+            instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
+        };
+        let resp = p.handle_request(&req).await.unwrap();
+        assert_eq!(decode_payload(&resp.payload)["status"], "bad_request");
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            dispatcher.calls.lock().unwrap().is_empty(),
+            "a refused mode must not be reported"
+        );
+    }
+
+    /// The gesture itself records the mode.
+    ///
+    /// The tests below drive the helpers directly and stay green
+    /// whether or not anything ever calls them. This one goes in
+    /// through `handle_request`, which is the only path an
+    /// operator has.
+    #[tokio::test]
+    async fn selecting_a_mode_writes_it_to_the_plugin_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut p = AlsaCompositionPlugin::new();
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.install_routing(Some(Arc::new(StubAudioRouting::new()) as _))
+            .unwrap();
+
+        let req = Request {
+            request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
+            payload: json!({ "v": 1, "mode": "eq_only" })
+                .to_string()
+                .into_bytes(),
+            correlation_id: 7,
+            deadline: None,
+            instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
+        };
+        let resp = p.handle_request(&req).await.unwrap();
+        assert_eq!(decode_payload(&resp.payload)["status"], "ok");
+
+        let recorded =
+            std::fs::read_to_string(dir.path().join(MODE_STATE_FILE))
+                .expect("the gesture must write the state file");
+        assert_eq!(recorded.trim(), MODE_EQ_ONLY);
+    }
+
+    /// A refused gesture records nothing. The device is still in
+    /// the mode it was in, and the state file must say so.
+    #[tokio::test]
+    async fn a_refused_mode_is_not_recorded() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut p = AlsaCompositionPlugin::new();
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.install_routing(Some(Arc::new(StubAudioRouting::new()) as _))
+            .unwrap();
+
+        let req = Request {
+            request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
+            payload: json!({ "v": 1, "mode": "resampler" })
+                .to_string()
+                .into_bytes(),
+            correlation_id: 8,
+            deadline: None,
+            instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
+        };
+        let resp = p.handle_request(&req).await.unwrap();
+        assert_eq!(decode_payload(&resp.payload)["status"], "bad_request");
+        assert!(
+            !dir.path().join(MODE_STATE_FILE).exists(),
+            "a refused mode must not be recorded"
+        );
+    }
+
+    /// The operator's mode survives a restart.
+    ///
+    /// It was held in memory only, so a device put into eq_only
+    /// came back in passthrough at the next load — the operator's
+    /// processing silently off, with nothing on the glass saying
+    /// so. The gesture now records it and the next load reads it
+    /// back.
+    #[tokio::test]
+    async fn the_selected_mode_is_recorded_and_restored() {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        // A gesture on a plugin that knows its state directory.
+        let p = AlsaCompositionPlugin::new();
+        p.persist_mode(MODE_EQ_ONLY);
+        assert!(
+            p.recorded_mode().is_none(),
+            "with no state directory nothing is written and nothing read"
+        );
+
+        let mut p = AlsaCompositionPlugin::new();
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.persist_mode(MODE_EQ_ONLY);
+        assert_eq!(
+            p.recorded_mode().as_deref(),
+            Some(MODE_EQ_ONLY),
+            "the mode must be readable back"
+        );
+
+        // A fresh load over the same state directory comes up in
+        // the recorded mode, not the default.
+        let mut next = AlsaCompositionPlugin::new();
+        assert_eq!(next.current_mode(), MODE_PASSTHROUGH);
+        next.state_dir = Some(dir.path().to_path_buf());
+        let restored = next.recorded_mode().expect("a mode was recorded");
+        next.mode_tx.send_replace(restored);
+        assert_eq!(
+            next.current_mode(),
+            MODE_EQ_ONLY,
+            "the next load must come up in the recorded mode"
+        );
+    }
+
+    /// A state file is not a reason to refuse a load, and a token
+    /// this build does not declare is not a mode it can honour.
+    #[tokio::test]
+    async fn an_unusable_recorded_mode_falls_back_to_the_default() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut p = AlsaCompositionPlugin::new();
+        p.state_dir = Some(dir.path().to_path_buf());
+
+        for junk in ["", "   ", "eq-only", "passthru", "../etc/passwd"] {
+            std::fs::write(dir.path().join(MODE_STATE_FILE), junk)
+                .expect("write state");
+            assert!(
+                p.recorded_mode().is_none(),
+                "{junk:?} must not be honoured as a mode"
+            );
+        }
+
+        // And a declared mode still reads back, so the guard above
+        // is not simply refusing everything.
+        std::fs::write(dir.path().join(MODE_STATE_FILE), "eq_only\n")
+            .expect("write state");
+        assert_eq!(p.recorded_mode().as_deref(), Some(MODE_EQ_ONLY));
     }
 
     #[tokio::test]
@@ -2326,6 +3041,438 @@ mod tests {
             payload, received,
             "eq_only mode with engaged=false must pass bytes \
              through unchanged"
+        );
+
+        p.unload().await.unwrap();
+    }
+
+    // ---- the zone EQ claim: which bands the one cascade sounds ----
+
+    fn boosted(
+        gain: f32,
+    ) -> [crate::eq_dsp::EqBandParams; crate::eq_dsp::EQ_BAND_COUNT] {
+        let mut b = [crate::eq_dsp::EqBandParams::default();
+            crate::eq_dsp::EQ_BAND_COUNT];
+        b[0].gain_db = gain;
+        b
+    }
+
+    /// While a zone claims, its bands sound engaged whatever the
+    /// options say; without a claim the options EQ sounds as it
+    /// is; an options change under a claim changes nothing; and
+    /// when the claim drops the options EQ is back, changes
+    /// included.
+    #[test]
+    fn the_sounding_eq_is_the_claim_while_there_is_one() {
+        let mut inputs = EqInputs::default();
+        assert_eq!(sounding_eq(&inputs), EqRuntimeState::default());
+        inputs.options = EqRuntimeState {
+            engaged: true,
+            bands: boosted(2.0),
+        };
+        assert_eq!(
+            sounding_eq(&inputs),
+            inputs.options,
+            "no claim: the options eq, verbatim"
+        );
+        inputs.options.engaged = false;
+        inputs.claim = ZoneEqClaim::Claimed {
+            zone_id: "zone:1".to_string(),
+            bands: boosted(7.0),
+        };
+        let s = sounding_eq(&inputs);
+        assert!(s.engaged, "a claim is engaged whatever the options say");
+        assert_eq!(s.bands, boosted(7.0));
+        inputs.options = EqRuntimeState {
+            engaged: true,
+            bands: boosted(-9.0),
+        };
+        assert_eq!(
+            sounding_eq(&inputs),
+            s,
+            "options.set_eq_band changes nothing while a claim is true"
+        );
+        inputs.claim = ZoneEqClaim::None;
+        assert_eq!(
+            sounding_eq(&inputs),
+            inputs.options,
+            "the claim dropped: the options eq, changes included"
+        );
+    }
+
+    /// The parser admits only the one true shape; everything
+    /// else is no claim and the options EQ sounds.
+    #[test]
+    fn a_claim_is_only_the_one_true_shape() {
+        let band = json!({ "freq_hz": 1000, "gain_db": 0.0, "q": 1.0 });
+        let ten = vec![band.clone(); 10];
+        let good = json!({ "v": 1, "claimed": true, "zone_id": "zone:4", "engaged": true, "bands": ten });
+        match parse_zone_eq_claim_from_state(&good) {
+            ZoneEqClaim::Claimed { zone_id, bands } => {
+                assert_eq!(zone_id, "zone:4");
+                assert_eq!(bands.len(), 10);
+            }
+            other => panic!("{other:?}"),
+        }
+        for (what, state) in [
+            ("claimed false", json!({ "v": 1, "claimed": false })),
+            (
+                "claimed false with a full claim beside it",
+                json!({ "v": 1, "claimed": false, "zone_id": "zone:4", "engaged": true, "bands": vec![band.clone(); 10] }),
+            ),
+            ("empty", json!({})),
+            (
+                "engaged false",
+                json!({ "v": 1, "claimed": true, "engaged": false, "bands": vec![band.clone(); 10] }),
+            ),
+            (
+                "nine bands",
+                json!({ "v": 1, "claimed": true, "engaged": true, "bands": vec![band.clone(); 9] }),
+            ),
+            (
+                "eleven bands",
+                json!({ "v": 1, "claimed": true, "engaged": true, "bands": vec![band.clone(); 11] }),
+            ),
+            (
+                "no bands",
+                json!({ "v": 1, "claimed": true, "engaged": true }),
+            ),
+            (
+                "a band missing q",
+                json!({ "v": 1, "claimed": true, "engaged": true, "bands": vec![json!({ "freq_hz": 1000, "gain_db": 0.0 }); 10] }),
+            ),
+        ] {
+            assert_eq!(
+                parse_zone_eq_claim_from_state(&state),
+                ZoneEqClaim::None,
+                "{what}"
+            );
+        }
+    }
+
+    /// Through the two setters the worker's channel carries the
+    /// sounding EQ: a claim replaces the options bands, an
+    /// options write under the claim leaves the channel alone,
+    /// and dropping the claim restores the options bands.
+    #[test]
+    fn the_setters_publish_the_sounding_eq_to_the_one_channel() {
+        let p = AlsaCompositionPlugin::new();
+        set_options_input(
+            &p.eq_inputs,
+            &p.eq_state_tx,
+            EqRuntimeState {
+                engaged: true,
+                bands: boosted(2.0),
+            },
+        );
+        assert_eq!(p.eq_state_tx.borrow().bands, boosted(2.0));
+        set_claim_input(
+            &p.eq_inputs,
+            &p.eq_state_tx,
+            ZoneEqClaim::Claimed {
+                zone_id: "zone:1".to_string(),
+                bands: boosted(7.0),
+            },
+        );
+        assert_eq!(p.eq_state_tx.borrow().bands, boosted(7.0));
+        assert!(p.eq_state_tx.borrow().engaged);
+        set_options_input(
+            &p.eq_inputs,
+            &p.eq_state_tx,
+            EqRuntimeState {
+                engaged: false,
+                bands: boosted(-9.0),
+            },
+        );
+        assert_eq!(
+            p.eq_state_tx.borrow().bands,
+            boosted(7.0),
+            "options.set_eq_band while a claim is true"
+        );
+        assert!(p.eq_state_tx.borrow().engaged);
+        set_claim_input(&p.eq_inputs, &p.eq_state_tx, ZoneEqClaim::None);
+        assert_eq!(p.eq_state_tx.borrow().bands, boosted(-9.0));
+        assert!(!p.eq_state_tx.borrow().engaged);
+    }
+
+    /// There is one cascade and one channel: the claim path
+    /// names no second EqProcessor, no zones file, and the
+    /// worker reads one receiver.
+    #[test]
+    fn there_is_one_cascade_and_no_read_of_zones_toml() {
+        let lib = include_str!("lib.rs");
+        // Code only: a comment may say the file is not read.
+        let production: String = lib
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !production.contains("zones.toml")
+                && !production.contains("ZoneStore"),
+            "composition.alsa does not read zones.toml"
+        );
+        assert_eq!(
+            production
+                .matches("watch::channel(EqRuntimeState::default())")
+                .count(),
+            1,
+            "one channel"
+        );
+        let flow = include_str!("byte_flow.rs");
+        assert_eq!(flow.matches("EqProcessor::new(").count(), 1, "one cascade");
+        assert!(
+            production.contains("fn spawn_zone_eq_claim_subscriber"),
+            "the claim is read from the subject"
+        );
+        assert!(
+            production
+                .contains("self.spawn_zone_eq_claim_subscriber(ctx).await;"),
+            "and the subscriber is spawned at load"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_eq_only_sounds_the_claimed_zones_bands() {
+        // End-to-end: mode = eq_only, the options EQ disengaged,
+        // a zone claim carrying band 0 = peaking @ 1 kHz + 12 dB.
+        // Pump a 1 kHz sine through f32le stereo named-pipe.
+        // The output amplitude must be substantially boosted
+        // relative to the input — proving the worker has
+        // actually routed the bytes through the EqProcessor.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (input_path, output_path) =
+            crate::test_support::make_fifo_pair(dir.path());
+
+        let mut p = AlsaCompositionPlugin::new();
+        let stub = Arc::new(StubAudioRouting::new());
+        let f32_endpoints = CompositionEndpoints {
+            input: ReadEndpoint {
+                kind: EndpointKind::NamedPipe,
+                path: input_path.clone(),
+                format: AudioFormat::Pcm {
+                    codec: PcmCodec::PcmF32,
+                    rate_hz: 44_100,
+                    channels: 2,
+                },
+                buffer_frames: 1024,
+            },
+            output: WriteEndpoint {
+                kind: EndpointKind::NamedPipe,
+                path: output_path.clone(),
+                format: AudioFormat::Pcm {
+                    codec: PcmCodec::PcmF32,
+                    rate_hz: 44_100,
+                    channels: 2,
+                },
+                buffer_frames: 1024,
+            },
+        };
+        stub.set_endpoints(f32_endpoints);
+        p.install_routing(Some(Arc::clone(&stub) as _)).unwrap();
+        p.spawn_reactor().await.unwrap();
+
+        // Pre-publish the operator settings BEFORE spawning
+        // the worker so the substrate reads the engaged +
+        // boosted state at substrate-open time.
+        p.mode_tx.send_replace(MODE_EQ_ONLY.to_string());
+        let mut bands = [crate::eq_dsp::EqBandParams::default();
+            crate::eq_dsp::EQ_BAND_COUNT];
+        bands[0] = crate::eq_dsp::EqBandParams {
+            freq_hz: 1000,
+            gain_db: 12.0,
+            q: 1.0,
+        };
+        // The options EQ is off; a zone claims the pipe with the
+        // boosted band. The claim's bands are what sound.
+        set_options_input(
+            &p.eq_inputs,
+            &p.eq_state_tx,
+            EqRuntimeState::default(),
+        );
+        set_claim_input(
+            &p.eq_inputs,
+            &p.eq_state_tx,
+            ZoneEqClaim::Claimed {
+                zone_id: "zone:1".to_string(),
+                bands,
+            },
+        );
+
+        p.spawn_worker().await.unwrap();
+        let (mut writer, mut reader) =
+            open_test_fifo_sides(input_path, output_path).await;
+
+        let mut status_rx =
+            p.subscribe_worker_status().expect("worker running");
+        wait_for_worker_status(&mut status_rx, 500, |s| {
+            matches!(
+                s,
+                WorkerStatus::Running {
+                    kind: EndpointKind::NamedPipe
+                }
+            )
+        })
+        .await;
+
+        // Build a 1 kHz sine + write to the input pipe.
+        // 4410 frames = 100 ms at 44.1 kHz.
+        let two_pi_f = 2.0 * std::f64::consts::PI * 1000.0;
+        let mut input_bytes = Vec::with_capacity(4410 * 2 * 4);
+        for i in 0..4410 {
+            let t = i as f64 / 44_100.0;
+            let s = (two_pi_f * t).sin() as f32 * 0.3; // -10 dB headroom
+            for _ in 0..2 {
+                input_bytes.extend_from_slice(&s.to_le_bytes());
+            }
+        }
+        writer.write_all(&input_bytes).await.expect("write");
+        writer.flush().await.expect("flush");
+
+        let mut output_bytes = vec![0u8; input_bytes.len()];
+        reader.read_exact(&mut output_bytes).await.expect("read");
+
+        // Measure peak amplitude on the second half (filter
+        // has settled). Boost should be ≥ 1.5x relative to
+        // the input peak.
+        let mut peak_in: f32 = 0.0;
+        let mut peak_out: f32 = 0.0;
+        for f in 2205..4410 {
+            let off = f * 2 * 4;
+            let s_in = f32::from_le_bytes([
+                input_bytes[off],
+                input_bytes[off + 1],
+                input_bytes[off + 2],
+                input_bytes[off + 3],
+            ]);
+            let s_out = f32::from_le_bytes([
+                output_bytes[off],
+                output_bytes[off + 1],
+                output_bytes[off + 2],
+                output_bytes[off + 3],
+            ]);
+            peak_in = peak_in.max(s_in.abs());
+            peak_out = peak_out.max(s_out.abs());
+        }
+        assert!(
+            peak_out > peak_in * 1.5,
+            "engaged EQ must boost the centre-frequency sine \
+             end-to-end through the worker; \
+             peak_in={peak_in} peak_out={peak_out}"
+        );
+
+        p.unload().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_passthrough_ignores_a_zone_claim() {
+        // End-to-end: mode = passthrough, a zone claim carrying a
+        // +12 dB band. The claim must not be heard.
+        // Pump a 1 kHz sine through f32le stereo named-pipe.
+        // The output amplitude must be substantially boosted
+        // relative to the input — proving the worker has
+        // actually routed the bytes through the EqProcessor.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (input_path, output_path) =
+            crate::test_support::make_fifo_pair(dir.path());
+
+        let mut p = AlsaCompositionPlugin::new();
+        let stub = Arc::new(StubAudioRouting::new());
+        let f32_endpoints = CompositionEndpoints {
+            input: ReadEndpoint {
+                kind: EndpointKind::NamedPipe,
+                path: input_path.clone(),
+                format: AudioFormat::Pcm {
+                    codec: PcmCodec::PcmF32,
+                    rate_hz: 44_100,
+                    channels: 2,
+                },
+                buffer_frames: 1024,
+            },
+            output: WriteEndpoint {
+                kind: EndpointKind::NamedPipe,
+                path: output_path.clone(),
+                format: AudioFormat::Pcm {
+                    codec: PcmCodec::PcmF32,
+                    rate_hz: 44_100,
+                    channels: 2,
+                },
+                buffer_frames: 1024,
+            },
+        };
+        stub.set_endpoints(f32_endpoints);
+        p.install_routing(Some(Arc::clone(&stub) as _)).unwrap();
+        p.spawn_reactor().await.unwrap();
+
+        // Pre-publish the operator settings BEFORE spawning
+        // the worker so the substrate reads the engaged +
+        // boosted state at substrate-open time.
+        p.mode_tx.send_replace(MODE_PASSTHROUGH.to_string());
+        let mut bands = [crate::eq_dsp::EqBandParams::default();
+            crate::eq_dsp::EQ_BAND_COUNT];
+        bands[0] = crate::eq_dsp::EqBandParams {
+            freq_hz: 1000,
+            gain_db: 12.0,
+            q: 1.0,
+        };
+        // The options EQ is off; a zone claims the pipe with the
+        // boosted band. The claim's bands are what sound.
+        set_options_input(
+            &p.eq_inputs,
+            &p.eq_state_tx,
+            EqRuntimeState::default(),
+        );
+        set_claim_input(
+            &p.eq_inputs,
+            &p.eq_state_tx,
+            ZoneEqClaim::Claimed {
+                zone_id: "zone:1".to_string(),
+                bands,
+            },
+        );
+
+        p.spawn_worker().await.unwrap();
+        let (mut writer, mut reader) =
+            open_test_fifo_sides(input_path, output_path).await;
+
+        let mut status_rx =
+            p.subscribe_worker_status().expect("worker running");
+        wait_for_worker_status(&mut status_rx, 500, |s| {
+            matches!(
+                s,
+                WorkerStatus::Running {
+                    kind: EndpointKind::NamedPipe
+                }
+            )
+        })
+        .await;
+
+        // Build a 1 kHz sine + write to the input pipe.
+        // 4410 frames = 100 ms at 44.1 kHz.
+        let two_pi_f = 2.0 * std::f64::consts::PI * 1000.0;
+        let mut input_bytes = Vec::with_capacity(4410 * 2 * 4);
+        for i in 0..4410 {
+            let t = i as f64 / 44_100.0;
+            let s = (two_pi_f * t).sin() as f32 * 0.3; // -10 dB headroom
+            for _ in 0..2 {
+                input_bytes.extend_from_slice(&s.to_le_bytes());
+            }
+        }
+        writer.write_all(&input_bytes).await.expect("write");
+        writer.flush().await.expect("flush");
+
+        let mut output_bytes = vec![0u8; input_bytes.len()];
+        reader.read_exact(&mut output_bytes).await.expect("read");
+
+        // A zone's bands are applied in no mode but eq_only: in
+        // passthrough the bytes come out as they went in, claim
+        // or no claim.
+        assert_eq!(
+            output_bytes, input_bytes,
+            "passthrough must ignore the zone claim"
         );
 
         p.unload().await.unwrap();

@@ -376,6 +376,15 @@ pub(crate) enum ConnBehaviour {
     /// Welcome, then respond to the first `idle` command with
     /// `changed: player\nOK\n`, then hold.
     IdleOnceThenHold,
+    /// A track at its last half-second, then the next one. The
+    /// first `status` reports `first` playing at 179.5 of 180;
+    /// every later `status` reports `second` at 0.5. `currentsong`
+    /// follows the same switch. `idle` holds. Pairs with
+    /// [`IdleOnceThenHold`] on the idle connection to show a
+    /// player moving on because the song ended.
+    ///
+    /// [`IdleOnceThenHold`]: Self::IdleOnceThenHold
+    FinishesThenAdvances { first: String, second: String },
     /// A library that records every command it is sent.
     ///
     /// `listallinfo <path>` answers with `files`, so a caller
@@ -447,6 +456,11 @@ pub(crate) enum ConnBehaviour {
     /// MPD ended up holding. `library` maps an lsinfo path to
     /// its `(subdirectories, files)`; the root is the empty
     /// string.
+    ///
+    /// A `playlistadd` of a URI under `refused:` is ACKed the way
+    /// MPD refuses a song its database does not hold; inside a
+    /// command list the commands before it have landed and the
+    /// rest do not run, which is MPD's own behaviour.
     StoredPlaylists {
         commands: Arc<Mutex<Vec<String>>>,
         playlists: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
@@ -683,6 +697,15 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                         out.push_str(&format!(
                             "file: {path}\nPos: {pos}\nId: {id}\n"
                         ));
+                        // The directory is the album, so a row
+                        // under `blue/` is on album `blue`. Album
+                        // shuffle groups by this tag; without it
+                        // every file is its own album and no
+                        // fixture can make an order the planner
+                        // cannot draw.
+                        if let Some((dir, _)) = path.rsplit_once('/') {
+                            out.push_str(&format!("Album: {dir}\n"));
+                        }
                     }
                     out.push_str("OK\n");
                     let _ = w.write_all(out.as_bytes()).await;
@@ -836,6 +859,27 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                     if !in_list {
                         let _ = w.write_all(b"OK\n").await;
                     }
+                } else if cmd.starts_with("listallinfo") {
+                    // As MPD answers it: a path that names a file
+                    // lists that file, and a directory with nothing
+                    // playable under it lists nothing. A file is told
+                    // from a directory by its extension, which is all
+                    // these fixtures' paths carry.
+                    let path =
+                        cmd.split('"').nth(1).unwrap_or_default().to_string();
+                    let is_file = path
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|leaf| leaf.contains('.'));
+                    let out = if path.contains("no-such") {
+                        "ACK [50@0] {listallinfo} No such directory\n"
+                            .to_string()
+                    } else if is_file {
+                        format!("file: {path}\nOK\n")
+                    } else {
+                        "OK\n".to_string()
+                    };
+                    let _ = w.write_all(out.as_bytes()).await;
                 } else if cmd.starts_with("idle") {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     return;
@@ -917,6 +961,18 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                             } else if c.starts_with("playlistadd")
                                 && a.len() >= 2
                             {
+                                // A URI under `refused:` is one
+                                // MPD's database does not hold.
+                                // MPD ACKs it and stops the list
+                                // there: what came before has
+                                // landed, what follows never runs.
+                                if a[1].starts_with("refused:") {
+                                    out.push_str(
+                                        "ACK [50@0] {playlistadd} No such \
+                                         song\n",
+                                    );
+                                    break;
+                                }
                                 held.entry(a[0].clone())
                                     .or_default()
                                     .push(a[1].clone());
@@ -925,7 +981,9 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                                 out.push_str("list_OK\n");
                             }
                         }
-                        out.push_str("OK\n");
+                        if !out.contains("ACK [") {
+                            out.push_str("OK\n");
+                        }
                         out
                     } else if cmd.starts_with("count") {
                         // Models a library that matches nothing,
@@ -965,6 +1023,79 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                             }
                             for f in files {
                                 out.push_str(&format!("file: {f}\n"));
+                            }
+                        }
+                        out.push_str("OK\n");
+                        out
+                    } else if cmd.starts_with("listallinfo") {
+                        // Every file in the library, the way the
+                        // album enumeration walks the database.
+                        let mut out = String::new();
+                        for (_, _, files) in library.iter() {
+                            for f in files {
+                                out.push_str(&format!("file: {f}\n"));
+                            }
+                        }
+                        out.push_str("OK\n");
+                        out
+                    } else if cmd.starts_with("list ") {
+                        // `list "artist"` / `list "album"`: the
+                        // distinct values, path-derived — the first
+                        // segment is the artist, the second the
+                        // album, the stem the title.
+                        let tag =
+                            args(&cmd).first().cloned().unwrap_or_default();
+                        let mut seen: Vec<String> = Vec::new();
+                        for (_, _, files) in library.iter() {
+                            for f in files {
+                                let segs: Vec<&str> = f.split('/').collect();
+                                let v = match (tag.as_str(), segs.len()) {
+                                    ("artist", n) if n >= 3 => segs[0],
+                                    ("album", n) if n >= 3 => segs[1],
+                                    _ => continue,
+                                };
+                                if !seen.iter().any(|s| s == v) {
+                                    seen.push(v.to_string());
+                                }
+                            }
+                        }
+                        let mut out = String::new();
+                        let key =
+                            if tag == "artist" { "Artist" } else { "Album" };
+                        for v in seen {
+                            out.push_str(&format!("{key}: {v}\n"));
+                        }
+                        out.push_str("OK\n");
+                        out
+                    } else if cmd.starts_with("search ") {
+                        // `search "<field>" "<q>"`: every file in
+                        // the library whose path contains the
+                        // query, case-insensitively, with its
+                        // path-derived tags when the path has an
+                        // artist / album / title shape.
+                        let q = args(&cmd)
+                            .get(1)
+                            .cloned()
+                            .unwrap_or_default()
+                            .to_lowercase();
+                        let mut out = String::new();
+                        for (_, _, files) in library.iter() {
+                            for f in files {
+                                if f.to_lowercase().contains(&q) {
+                                    out.push_str(&format!("file: {f}\n"));
+                                    let segs: Vec<&str> =
+                                        f.split('/').collect();
+                                    if segs.len() >= 3 {
+                                        let stem = segs[segs.len() - 1]
+                                            .rsplit_once('.')
+                                            .map(|(s, _)| s)
+                                            .unwrap_or(segs[segs.len() - 1]);
+                                        out.push_str(&format!(
+                                            "Artist: {}\nAlbum: {}\nTitle: {}\n",
+                                            segs[0], segs[1], stem
+                                        ));
+                                    }
+                                }
                             }
                         }
                         out.push_str("OK\n");
@@ -1059,6 +1190,47 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                     return;
                 }
                 let _ = w.write_all(reply.as_bytes()).await;
+                let _ = w.flush().await;
+            }
+        }
+        ConnBehaviour::FinishesThenAdvances {
+            ref first,
+            ref second,
+        } => {
+            let song = |file: &str| {
+                format!(
+                    "file: {file}\nTitle: T\nArtist: A\nAlbum: X\n\
+                     Time: 180\nduration: 180.000\nOK\n"
+                )
+            };
+            let before = b"state: play\nsong: 0\nelapsed: 179.500\nduration: 180.000\nvolume: 50\nOK\n";
+            let after = b"state: play\nsong: 1\nelapsed: 0.500\nduration: 180.000\nvolume: 50\nOK\n";
+            let mut status_reads = 0usize;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                if line.starts_with("status") {
+                    status_reads += 1;
+                    let body: &[u8] =
+                        if status_reads <= 1 { before } else { after };
+                    let _ = w.write_all(body).await;
+                } else if line.starts_with("currentsong") {
+                    let body = if status_reads <= 1 {
+                        song(first)
+                    } else {
+                        song(second)
+                    };
+                    let _ = w.write_all(body.as_bytes()).await;
+                } else if line.starts_with("idle") {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    return;
+                } else {
+                    let _ = w.write_all(b"OK\n").await;
+                }
                 let _ = w.flush().await;
             }
         }

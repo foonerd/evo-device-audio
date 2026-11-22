@@ -1,0 +1,28 @@
+schema_version: "1.0"
+plugin: org.evoframework.system.backup
+owner: evo-device-audio
+isolation: oop
+has_os_dependencies: false
+
+# Two operator gestures on the `system.backup` shelf. The plugin
+# owns no file and no secret. Every part of a backup is read from,
+# and put back through, the shelf verbs of the plugin that owns it,
+# over the framework's shelf dispatcher. It reads no other plugin's
+# state directory and no other plugin's credentials.
+
+capability_intent:
+  - id: owner_shelf_dispatch
+    need: call the owners' shelf verbs through the framework's shelf dispatcher — `delivery.list_logical_outputs` and `delivery.add_logical_output` on `audio.delivery`; `zone.list`, `zone.add`, `zone.set_eq_engaged` and `zone.set_eq_band` on `audio.zones`; `playlist.list_playlists`, `playlist.export_file` and `playlist.import_file` on `audio.playlist`; `options.get_settings`, `options.list_eq_presets`, `options.save_eq_preset` and the `options.set_*` setters on `audio.options`. No verb that removes anything, and nothing on `networking.shares`.
+    access_path: framework/shelf_dispatch
+    failure_mode: with no dispatcher both verbs refuse; an owner that cannot answer refuses the export; an item an owner refuses on import is reported and skipped.
+
+required_binaries: []
+required_kernel_modules: []
+required_system_services: []
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+  expected:
+    - steward state directory exists
+host_provisioning: {}

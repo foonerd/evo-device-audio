@@ -58,7 +58,20 @@ pub(crate) struct PlaybackStateReport {
     /// MPD `repeat` mode (queue-repeat).
     pub(crate) repeat: bool,
     /// MPD `random` mode (operator-facing name: shuffle).
+    ///
+    /// Unchanged: this is MPD's flag and nothing else. Album
+    /// order lives in the queue with `random` off, so this reads
+    /// false under album shuffle.
     pub(crate) shuffle: bool,
+    /// How shuffle picks what plays next: `off`, `tracks` or
+    /// `albums`.
+    ///
+    /// MPD cannot report this -- it has no album mode -- so every
+    /// publisher had to guess, and the only guess `status` offers
+    /// is "not shuffling". That is how the control lost album
+    /// across a refresh. Carried beside `shuffle` rather than
+    /// replacing it: the flag is a fielded contract.
+    pub(crate) shuffle_mode: crate::album_shuffle::ShuffleMode,
     /// MPD `single` mode (stop after current song; combined with
     /// `repeat`, becomes single-track loop).
     pub(crate) single: bool,
@@ -89,15 +102,55 @@ pub(crate) struct CurrentSongReport {
     pub(crate) classical: crate::mpd::ClassicalTags,
 }
 
+/// Operator intent MPD cannot report.
+///
+/// Mute and the shuffle mode are the same category of fact: the
+/// device holds them and MPD's `status` does not carry them. Every
+/// now-playing publisher needs both, so they travel together
+/// rather than as two more positional arguments through five call
+/// chains.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PublisherIntent {
+    /// The operator's mute intent.
+    pub(crate) muted: bool,
+    /// The shuffle mode the operator asked for.
+    pub(crate) shuffle_mode: crate::album_shuffle::ShuffleMode,
+}
+
+/// The cells that intent lives in, travelling as one borrow.
+///
+/// A publisher does not take a snapshot from its caller — it
+/// reads both cells at the moment it builds the report, so the
+/// report cannot carry a mute from before the toggle it is
+/// reporting. The observers that own the cells pass this down
+/// their call chains; `read` makes the snapshot at the leaf.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IntentCells<'a> {
+    /// The software mute cell.
+    pub(crate) mute: &'a crate::mute_cell::MuteCell,
+    /// The remembered shuffle mode.
+    pub(crate) shuffle: &'a crate::album_shuffle::ShuffleModeCell,
+}
+
+impl IntentCells<'_> {
+    /// Snapshot both cells for one report.
+    pub(crate) fn read(&self) -> PublisherIntent {
+        PublisherIntent {
+            muted: self.mute.is_muted(),
+            shuffle_mode: self.shuffle.get(),
+        }
+    }
+}
+
 impl PlaybackStateReport {
     /// Build a report from an MPD status plus an optional current
-    /// song. The `muted` flag is plugin-state (not in MPD); the
-    /// caller supplies the explicit mute state from the
-    /// warden's mute-toggle tracking.
+    /// song. `intent` carries the two facts MPD's `status` does
+    /// not: the operator's mute, and the shuffle mode behind
+    /// MPD's `random` flag.
     pub(crate) fn from_mpd(
         status: MpdStatus,
         song: Option<MpdSong>,
-        muted: bool,
+        intent: PublisherIntent,
     ) -> Self {
         Self {
             state: status.state,
@@ -105,9 +158,13 @@ impl PlaybackStateReport {
             elapsed_ms: status.elapsed.map(duration_to_millis_u64),
             duration_ms: status.duration.map(duration_to_millis_u64),
             volume: status.volume,
-            muted,
+            muted: intent.muted,
             repeat: status.repeat,
             shuffle: status.random,
+            shuffle_mode: crate::album_shuffle::reported_shuffle_mode(
+                status.random,
+                intent.shuffle_mode,
+            ),
             single: status.single,
             consume: status.consume,
             current_song: song.map(CurrentSongReport::from_mpd_song),
@@ -270,11 +327,92 @@ mod tests {
         }
     }
 
+    // ----- intent projection -----
+
+    /// The projection carries intent MPD's status cannot.
+    ///
+    /// `MpdStatus` has only `random`. Album shuffle leaves it off
+    /// and lives in the queue, so the mode arrives from the
+    /// device's own cell and nowhere else. A projection that
+    /// dropped it would still serialise and still render — and
+    /// the control would lose album across a refresh exactly as
+    /// it did before, because the payload would say "off".
+    #[test]
+    fn the_projection_carries_the_remembered_album_mode() {
+        let r = PlaybackStateReport::from_mpd(
+            stopped_status(),
+            None,
+            PublisherIntent {
+                muted: false,
+                shuffle_mode: crate::album_shuffle::ShuffleMode::Albums,
+            },
+        );
+        assert_eq!(
+            r.shuffle_mode,
+            crate::album_shuffle::ShuffleMode::Albums,
+            "album shuffle in force must reach the report"
+        );
+        assert!(
+            !r.shuffle,
+            "and must not turn MPD's flag on to say so: the flag is \
+             MPD's own and album mode leaves it off"
+        );
+    }
+
+    /// The publisher reads both cells at the moment it reports.
+    ///
+    /// `IntentCells` is a borrow, not a snapshot: a report built
+    /// after a toggle must carry what the cells hold then, not
+    /// what they held when the publisher was handed them. Holding
+    /// a snapshot instead is how a report comes to disagree with
+    /// the device it is reporting on.
+    #[test]
+    fn the_publisher_reads_both_cells_when_it_builds_the_report() {
+        let mute = crate::mute_cell::MuteCell::new();
+        let shuffle = crate::album_shuffle::ShuffleModeCell::new();
+        let cells = IntentCells {
+            mute: &mute,
+            shuffle: &shuffle,
+        };
+
+        assert_eq!(
+            cells.read().shuffle_mode,
+            crate::album_shuffle::ShuffleMode::Off
+        );
+        assert!(!cells.read().muted);
+
+        shuffle.set(crate::album_shuffle::ShuffleMode::Albums);
+        assert_eq!(
+            cells.read().shuffle_mode,
+            crate::album_shuffle::ShuffleMode::Albums,
+            "a mode set after the borrow was taken must still be read"
+        );
+
+        mute.set_muted(true);
+        assert!(
+            cells.read().muted,
+            "and the same cell pair carries the mute, read at the \
+             same moment"
+        );
+        assert_eq!(
+            cells.read().shuffle_mode,
+            crate::album_shuffle::ShuffleMode::Albums,
+            "reading one must not disturb the other"
+        );
+    }
+
     // ----- serialisation -----
 
     #[test]
     fn minimal_report_has_only_state() {
-        let r = PlaybackStateReport::from_mpd(stopped_status(), None, false);
+        let r = PlaybackStateReport::from_mpd(
+            stopped_status(),
+            None,
+            PublisherIntent {
+                muted: false,
+                shuffle_mode: crate::album_shuffle::ShuffleMode::Off,
+            },
+        );
         let out = r.serialise();
         assert_eq!(out, "state = \"stopped\"\n");
     }
@@ -303,7 +441,14 @@ mod tests {
             codec_name: Some("flac".to_string()),
             classical: Default::default(),
         };
-        let r = PlaybackStateReport::from_mpd(status, Some(song), false);
+        let r = PlaybackStateReport::from_mpd(
+            status,
+            Some(song),
+            PublisherIntent {
+                muted: false,
+                shuffle_mode: crate::album_shuffle::ShuffleMode::Off,
+            },
+        );
         let out = r.serialise();
 
         // Main table, in declared order.
@@ -337,7 +482,14 @@ mod tests {
             crossfade_seconds: 0,
             updating_db: None,
         };
-        let r = PlaybackStateReport::from_mpd(status, None, false);
+        let r = PlaybackStateReport::from_mpd(
+            status,
+            None,
+            PublisherIntent {
+                muted: false,
+                shuffle_mode: crate::album_shuffle::ShuffleMode::Off,
+            },
+        );
         let out = r.serialise();
         assert!(!out.contains("[current_song]"));
         assert!(out.contains("state = \"paused\""));
@@ -368,7 +520,14 @@ mod tests {
             codec_name: Some("flac".to_string()),
             classical: Default::default(),
         };
-        let r = PlaybackStateReport::from_mpd(status, Some(song), false);
+        let r = PlaybackStateReport::from_mpd(
+            status,
+            Some(song),
+            PublisherIntent {
+                muted: false,
+                shuffle_mode: crate::album_shuffle::ShuffleMode::Off,
+            },
+        );
         let out = r.serialise();
         assert!(out.contains("file_path = \"some/file.flac\""));
         assert!(!out.contains("title ="));
@@ -484,7 +643,14 @@ mod tests {
             codec_name: Some("flac".to_string()),
             classical: Default::default(),
         };
-        let r = PlaybackStateReport::from_mpd(status, Some(song), false);
+        let r = PlaybackStateReport::from_mpd(
+            status,
+            Some(song),
+            PublisherIntent {
+                muted: false,
+                shuffle_mode: crate::album_shuffle::ShuffleMode::Off,
+            },
+        );
         let out = r.serialise();
         // Every byte is valid UTF-8 (String guarantees this);
         // every line ends with '\n'.

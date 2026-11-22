@@ -49,8 +49,10 @@ pub(crate) enum PlaybackCommand {
     SetMute(bool),
     /// Set MPD `repeat` mode (queue-repeat).
     SetRepeat(bool),
-    /// Set MPD `random` mode (operator-facing name: shuffle).
-    SetShuffle(bool),
+    /// How shuffle picks what plays next: off, by track, or by
+    /// album. Track shuffle is MPD's own `random`; album order is
+    /// written into the queue, because MPD has no album mode.
+    SetShuffle(crate::album_shuffle::ShuffleMode),
     /// Set MPD `single` mode (stop after current song; with
     /// repeat enabled, becomes single-track loop).
     SetSingle(bool),

@@ -91,6 +91,21 @@ identified by `composition_endpoints()`:
   current implementation; future commits widen the worker
   to additional substrates.
 
+## The zone EQ claim
+
+`eq_only` is the one pipe and runs one cascade of 10 bands. The
+bands it sounds come from one of two inputs: the operator's EQ on
+`audio.options.settings` (`eq_engaged`, `eq_bands`), or the
+delivery plugin's `evo.audio.zones` / `eq_claim` subject. The
+claim is `{ v: 1, claimed: false }` or `{ v: 1, claimed: true,
+zone_id, engaged: true, bands }` with exactly 10 bands. While the
+claim is true the cascade sounds that zone's bands and treats the
+EQ as engaged; the options EQ stays stored as it is and does not
+supply the coefficients for that stretch. When the claim drops, or
+the subject is missing or malformed, the options EQ sounds again.
+A zone's bands are applied in no mode but `eq_only`. This plugin
+does not read `zones.toml`.
+
 ## Route changes
 
 The plugin registers a `RouteChangeCallback` on `load`. On

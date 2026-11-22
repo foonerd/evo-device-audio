@@ -1853,6 +1853,35 @@ mod tests {
     }
 
     #[test]
+    fn the_mutating_verbs_gate_at_write_audio_admin_in_both_manifests() {
+        // A step-up declaration would demand a step-up session on
+        // every call and put a password card on DAC selection at
+        // the open household level.
+        use evo_plugin_sdk::manifest::VerbCapability;
+        let oop = Manifest::from_toml(include_str!("../manifest.oop.toml"))
+            .expect("manifest.oop.toml parses");
+        for m in [manifest(), oop] {
+            let resp = m.capabilities.respondent.expect("respondent");
+            for verb in [
+                "hardware.audio.select_dac",
+                "hardware.audio.clear_dac",
+                "hardware.audio.dsp.set_control",
+                "hardware.audio.modder.register_overlay",
+                "hardware.audio.modder.remove_overlay",
+            ] {
+                assert!(
+                    matches!(
+                        resp.verb_capabilities.get(verb),
+                        Some(VerbCapability::Write { scope }) if scope == "audio_admin"
+                    ),
+                    "{verb}: {:?}",
+                    resp.verb_capabilities.get(verb)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn embedded_catalogue_parses() {
         let parsed = parse_evo_catalog(EMBEDDED_EVO_CATALOG_TOML)
             .expect("embedded evo-catalog.toml parses");

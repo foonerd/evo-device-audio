@@ -1,0 +1,30 @@
+schema_version: "1.0"
+plugin: org.evoframework.system.info
+owner: evo-device-audio
+isolation: oop
+has_os_dependencies: false
+
+# Two read verbs on the `system.info` shelf. The plugin reads host
+# files and the installer's record and writes nothing. A file it
+# cannot read answers null for its field; the verb still answers.
+
+capability_intent:
+  - id: host_facts_read
+    need: read `/proc/sys/kernel/hostname`, `/etc/os-release`, `/proc/sys/kernel/osrelease`, `/proc/device-tree/model`, `/sys/class/dmi/id/sys_vendor`, `/sys/class/dmi/id/product_name`, `/proc/cpuinfo`, `/proc/meminfo` and `/proc/uptime` to answer `get_system_info`, and call `uname(2)` for the machine name. All are world-readable; nothing is written.
+    access_path: filesystem/system
+    failure_mode: the field whose source is missing or unreadable answers null; the verb still answers.
+  - id: installed_record_read
+    need: read `/var/lib/evo/installed.toml`, the installer's record of the installed release, to answer `release`, `architecture` and `built_at_utc` in `get_system_version`. Nothing is written.
+    access_path: filesystem/system
+    failure_mode: a missing or unparseable file, or a missing key, answers null for that field; `build` still answers.
+
+required_binaries: []
+required_kernel_modules: []
+required_system_services: []
+
+verification:
+  commands:
+    - "test -r /proc/cpuinfo"
+  expected:
+    - procfs is mounted and readable
+host_provisioning: {}

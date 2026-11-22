@@ -1,30 +1,21 @@
 # First-boot composition only. Bake and publish the installer
-# tarball. Not everyday CI and not the in-product updater
-# (that inventories plugin-bundle and core-binaries). Fires on
-# the public audio tag (the cut attribute). Ordinary main
-# pushes do not run this job.
+# tarball. Not everyday CI and not the in-product updater.
+#
+# Pieces first. This job is dispatched by cut.yml after piece
+# slots exist, or by hand via workflow_dispatch. A naked tag
+# push must NOT fire this job — that race baked empty/wrong
+# tarballs and flooded CI.
 #
 # ubuntu-latest: this repository is public. Do not send this
 # train to the self-hosted pool.
 #
-# Pieces first, then this job. Compose from published slots
-# (piece-pins.toml). Does not cargo/npm/cross UI, kiosk, boot,
-# steward, or plugins. Three triples including armv7.
-#
-# The tarball is a GitHub Release asset, not a git blob.
-# GitHub rejects files over 100 MB; these tarballs are ~110 MB.
-# Testers already curl releases/latest/download. Git on
-# artefacts holds only bundles/distribution/<version>.toml.
-# Creates GitHub Release <tag> with --latest=false and does
-# not modify GitHub Release v0.1.13. Testers curl Latest; the
-# operator marks the remint release Latest after this job is
-# green so they stop installing the previous cut's tarball.
+# Compose from published slots (piece-pins.toml). Does not
+# cargo/npm/cross UI, kiosk, boot, steward, or plugins.
+# Three triples including armv7. Does not move Latest.
+# Does not modify GitHub Release v0.1.13.
 name: publish-distribution-bundle
 
 "on":
-  push:
-    tags:
-      - "v*.*.*"
   workflow_dispatch:
     inputs:
       tag:
@@ -108,6 +99,7 @@ jobs:
           # does not; that was exit 126 on compose.
           git -C evo-device-audio checkout "${{ github.sha }}" -- \
             scripts/release/publish-distribution-bundle.sh \
+            scripts/release/wait-for-piece-slots.sh \
             scripts/release/write-distribution-pointer.sh \
             scripts/release/compose-distribution-from-pieces.sh \
             scripts/release/piece-pins.toml \
@@ -115,6 +107,7 @@ jobs:
             scripts/release/stage-audio-dist-tree.sh
           for f in \
             scripts/release/publish-distribution-bundle.sh \
+            scripts/release/wait-for-piece-slots.sh \
             scripts/release/write-distribution-pointer.sh \
             scripts/release/compose-distribution-from-pieces.sh \
             scripts/release/pack-signed-tree.sh \

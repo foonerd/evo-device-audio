@@ -1,0 +1,8 @@
+# Narrow NOPASSWD grant for the distribution timezone wrapper.
+# The wrapper is root-owned, installed mode 0755, and validates
+# its single IANA zone argument against the host's zone database
+# before it runs /usr/bin/timedatectl set-timezone.
+
+Cmnd_Alias EVO_SET_TIMEZONE = /usr/local/bin/evo-set-timezone
+
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_SET_TIMEZONE

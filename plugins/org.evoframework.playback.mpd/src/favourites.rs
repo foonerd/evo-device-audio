@@ -96,6 +96,9 @@ pub(crate) struct FavouritesContext {
     membership: Arc<Mutex<HashSet<String>>>,
     /// Mirror of the last published wire envelope.
     envelope_mirror: Arc<Mutex<Option<serde_json::Value>>>,
+    /// Scan-time local artwork hashes carried on list rows as
+    /// `artwork_hash`. See [`crate::artwork_hash`].
+    pub(crate) artwork_hashes: crate::artwork_hash::ArtworkHashIndex,
 }
 
 impl FavouritesContext {
@@ -112,7 +115,18 @@ impl FavouritesContext {
             favourites_name,
             membership: Arc::new(Mutex::new(HashSet::new())),
             envelope_mirror: Arc::new(Mutex::new(None)),
+            artwork_hashes: Default::default(),
         }
+    }
+
+    /// Share the scan-time artwork hash index. Without this the
+    /// context carries an empty one and no row has `artwork_hash`.
+    pub(crate) fn with_artwork_hashes(
+        mut self,
+        index: crate::artwork_hash::ArtworkHashIndex,
+    ) -> Self {
+        self.artwork_hashes = index;
+        self
     }
 }
 
@@ -192,7 +206,7 @@ pub(crate) async fn refresh_favourites(
             &ctx.registry,
         )
         .await;
-        items.push(json!({
+        let mut row = json!({
             "position":        entry.position,
             "uri":             entry.file_path,
             "source_id":       source_id,
@@ -227,7 +241,12 @@ pub(crate) async fn refresh_favourites(
             "recording_date":  entry.classical.recording_date,
             "label":           entry.classical.label,
             "medium":          entry.classical.medium,
-        }));
+        });
+        crate::artwork_hash::attach(
+            &mut row,
+            ctx.artwork_hashes.hash_for_path(&entry.file_path),
+        );
+        items.push(row);
     }
     let envelope = json!({
         "v":     FAVOURITES_PAYLOAD_VERSION,

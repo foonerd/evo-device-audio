@@ -538,6 +538,39 @@ pub async fn ensure_ap_vif_present(
     Ok(())
 }
 
+/// Put an existing vif back into AP mode.
+///
+/// A vif created `type __ap` does not stay that way if anything
+/// else claims it first: NetworkManager hands a wifi device to
+/// wpa_supplicant, which sets it up as a station, and the type
+/// reads `managed` from then on — including after NetworkManager
+/// has given up on it. Marking the device unmanaged stops the
+/// claim but does not undo it, so the type has to be re-asserted.
+///
+/// `iw` refuses a type change on an interface that is up. The
+/// caller marks the device unmanaged first, which takes the link
+/// down with it; a refusal here is left to the caller, which
+/// declines to raise rather than retrying.
+pub async fn set_ap_vif_iftype(
+    exec: &dyn PrivilegedExec,
+    iw_path: &str,
+    ap_if: &str,
+    timeout: Duration,
+) -> Result<(), PluginError> {
+    let ap = ap_if.trim();
+    if ap.is_empty() {
+        return Ok(());
+    }
+    tracing::info!(
+        plugin = crate::PLUGIN_NAME,
+        ap_if = ap,
+        "iw: re-asserting ap vif type __ap"
+    );
+    iw_output(exec, iw_path, &["dev", ap, "set", "type", "__ap"], timeout)
+        .await?;
+    Ok(())
+}
+
 /// Remove the AP vif if it exists. Idempotent.
 pub async fn ensure_ap_vif_absent(
     exec: &dyn PrivilegedExec,

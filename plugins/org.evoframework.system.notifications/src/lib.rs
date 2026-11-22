@@ -291,4 +291,30 @@ mod tests {
         assert_eq!(m.target.shelf, "system.notifications");
         assert_eq!(m.target.shape, 1);
     }
+
+    #[test]
+    fn the_policy_verbs_gate_at_write_system_admin_in_both_manifests() {
+        // A step-up declaration would demand a step-up session on
+        // every call and put a password card on these settings at
+        // the open household level.
+        use evo_plugin_sdk::manifest::VerbCapability;
+        let oop = Manifest::from_toml(include_str!("../manifest.oop.toml"))
+            .expect("manifest.oop.toml parses");
+        for m in [manifest(), oop] {
+            let resp = m.capabilities.respondent.expect("respondent");
+            for verb in [
+                "system.notifications.set_base_mode",
+                "system.notifications.set_quiet_hours",
+            ] {
+                assert!(
+                    matches!(
+                        resp.verb_capabilities.get(verb),
+                        Some(VerbCapability::Write { scope }) if scope == "system_admin"
+                    ),
+                    "{verb}: {:?}",
+                    resp.verb_capabilities.get(verb)
+                );
+            }
+        }
+    }
 }

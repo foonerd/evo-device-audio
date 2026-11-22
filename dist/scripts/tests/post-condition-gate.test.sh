@@ -47,8 +47,13 @@ FAIL=0
 # shellcheck disable=SC2034
 healthy_env() {
     ACTIVE_STATE="active"
-    PLUGINS_ADMITTED=19
-    PLUGINS_EXPECTED=19
+    # Twenty-three: every entry on dist/scripts/lib/oop-plugins.sh,
+    # the twentieth org.evoframework.alarm, the twenty-first
+    # org.evoframework.system.info, the twenty-second
+    # org.evoframework.system.backup and the twenty-third
+    # org.evoframework.identity.locale.
+    PLUGINS_ADMITTED=23
+    PLUGINS_EXPECTED=23
     ADMISSION_FAILURES=0
     NOT_DECLARED=0
     JOURNAL_FAIL_COUNT=0
@@ -134,6 +139,23 @@ if grep -q 'start_operator_surface' "$INSTALLER" \
     PASS=$((PASS + 1))
 else
     echo "FAIL  installer does not restart evo-ui and evo-kiosk"
+    FAIL=$((FAIL + 1))
+fi
+
+# The healthy count above is the ship list, and the alarm, the
+# system info plugin, the backup plugin and the locale plugin are
+# on it.
+# shellcheck source=../lib/oop-plugins.sh
+source "$SCRIPT_DIR/../lib/oop-plugins.sh"
+if [[ "${#OOP_PLUGINS[@]}" -eq 23 ]] \
+    && printf '%s\n' "${OOP_PLUGINS[@]}" | grep -q '^org\.evoframework\.alarm:' \
+    && printf '%s\n' "${OOP_PLUGINS[@]}" | grep -q '^org\.evoframework\.system\.info:' \
+    && printf '%s\n' "${OOP_PLUGINS[@]}" | grep -q '^org\.evoframework\.system\.backup:' \
+    && printf '%s\n' "${OOP_PLUGINS[@]}" | grep -q '^org\.evoframework\.identity\.locale:'; then
+    echo "PASS  the ship list is 23 plugins, org.evoframework.alarm, org.evoframework.system.info, org.evoframework.system.backup and org.evoframework.identity.locale among them"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL  the ship list is ${#OOP_PLUGINS[@]} plugins, or org.evoframework.alarm, org.evoframework.system.info, org.evoframework.system.backup or org.evoframework.identity.locale is not on it"
     FAIL=$((FAIL + 1))
 fi
 

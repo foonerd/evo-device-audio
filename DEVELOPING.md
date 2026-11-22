@@ -81,7 +81,8 @@ Pieces first, then the first-boot tarball. Bake composes from `scripts/release/p
 Targets for per-arch pieces: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `armv7-unknown-linux-gnueabihf`. Sign with the audio commons key (`PLUGIN_SIGNING_KEY_PEM`). Do not invent a second UI key. Overlay a live UI shell with `evo-install.sh --piece evo-ui-shell --version <ver>`.
 
 `pieces/` on artefacts is leftover stub catalogue. Promote ignores it.
--   **publish-distribution-bundle** - on public tag push `v*.*.*` (and `workflow_dispatch`). First-boot composition: steward, all OOP wires, UI shell, `evo-ui-runtime`, kiosk layer, boot layer. The tarball is ~110 MB; GitHub rejects git blobs over 100 MB, so the bytes live as GitHub Release assets on [evo-device-audio-artefacts](https://github.com/foonerd/evo-device-audio-artefacts), not as git objects. Testers already curl `releases/latest/download`. The bake creates GitHub Release `<tag>` with `--latest=false` and commits only a thin pointer `bundles/distribution/<cargo-version>.toml` (+ `.sig`) on artefacts `main`. Do not `git add` the tarball. Mark the remint release Latest only after this job is green. UI and kiosk have no piece channel yet — without this bake, testers keep the previous cut's tarball.
+-   **cut** - `workflow_dispatch` with **tag only**. Public half of `cut(V)`: mint pieces (audio `all` + kiosk + `evo-ui`), wait for every pin/plugin slot, then bake. Dispatched by `cut-release.sh` after the eng→public squash. See `repos/runbook.md` §5.
+-   **publish-distribution-bundle** - `workflow_dispatch` only (no naked tag-push). First-boot composition from published slots. Pieces first — `wait-for-piece-slots.sh` gates compose. Creates GitHub Release `<tag>` with `--latest=false`. Does not move Latest. Mark Latest only after accept.
 -   **promote** - manual. Moves a channel pointer (`dev` / `test` / `prod`) to a piece version that is already published. No rebuild. Piece is `evo-device-audio` or a plugin from `dist/scripts/lib/oop-plugins.sh`.
 -   **secret-smoke** - manual. Proves the artefacts token and the signing key without publishing.
 
@@ -763,6 +764,39 @@ At the release-cut, the SDK pin flips back to a `git+tag` form, the path-dep wor
 2.  Update `[workspace.dependencies].evo-plugin-sdk` in this repo's `Cargo.toml`: bump `tag = "..."` and `version = "..."` to match.
 3.  Rerun `cargo build --workspace` and `cargo test --workspace`.
 4.  Commit with a message naming the new evo-core version and any public-surface changes the bump forced.
+
+## The cut number
+
+`CUT_VERSION` at the repository root holds the number of the cut
+being made — `0.1.13.0`, `0.1.13.1`, `0.1.14`. One line, no `v`
+prefix.
+
+There is one operation, `cut(V)`, and the operator names `V`.
+Cutting `0.1.13.1` after `0.1.13.0` is not a bump; it is the next
+cut. Cutting `0.1.13.0` again is `cut(0.1.13.0)`.
+
+Cargo versions are three components, so `0.1.13.0` cannot live in
+`Cargo.toml`. The workspace version stays three components for
+crate resolution and nothing downstream keys on it. Before this
+file existed everything read that version instead, so the fourth
+component of the tag never reached a slot path: a second
+`cut(0.1.13.0)` staged into the `0.1.13` slot the first had
+filled, was skipped as already published, and the run went green
+having stored nothing.
+
+Piece slot paths read this file and fail when it is missing or
+malformed rather than falling back to the crate version. The
+fallback is what made the fourth component decorative. The
+installer tarball name stays the three-component Cargo version
+(`evo-device-audio-<arch>-0.1.13.tar.gz`). A later cut that must
+change that filename changes `EVO_BUNDLE_VERSION` in the same
+sitting. Do not commit `0.1.13.0` into this file on the
+`v0.1.13.1` branch. Write the number when that cut is the one
+being made.
+
+It is a product file, so the eng-to-public squash carries it. The
+publishing workflows are not carried by that squash; they live on
+the public branch and are edited there.
 
 ## License
 

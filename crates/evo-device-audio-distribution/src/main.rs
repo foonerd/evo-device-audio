@@ -689,6 +689,7 @@ fn audio_distribution_https_setup() -> evo::HttpsSetup {
                         ),
                         state_dir: ctx.state_dir,
                         resolved_notifier: Some(notifier),
+                        enrichment: Default::default(),
                     },
                 )?;
                 Ok(router)

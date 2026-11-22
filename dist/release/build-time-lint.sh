@@ -224,6 +224,13 @@ lint_sudoers_binaries() {
         # path, same shape as the captive-probe pair.
         "/usr/local/bin/evo-rtc-wake"
         "/bin/evo-rtc-wake"
+        # Timezone wrapper installed by bootstrap.sh from
+        # dist/bin/evo-set-timezone to /usr/local/bin/evo-set-timezone,
+        # same shape as the RTC pair; the drop-in comment names the
+        # timedatectl it runs.
+        "/usr/local/bin/evo-set-timezone"
+        "/bin/evo-set-timezone"
+        "/usr/bin/timedatectl"
         "/usr/bin/curl"
         "/usr/local"
     )

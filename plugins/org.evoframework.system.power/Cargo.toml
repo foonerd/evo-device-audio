@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Framework-reserved system.power plugin. Stocks the system.power shelf with reboot_device and power_off_device verbs gated at the framework dispatcher's per-verb capability gate (step_up:system_admin). Invokes systemctl reboot|poweroff via a narrow EVO_SYSTEM_POWER sudoers grant."
+description = "Framework-reserved system.power plugin. Stocks the system.power shelf with reboot_device and power_off_device verbs gated at the framework dispatcher's per-verb capability gate (write:system_admin). Invokes systemctl reboot|poweroff via a narrow EVO_SYSTEM_POWER sudoers grant."
 
 [lib]
 path = "src/lib.rs"

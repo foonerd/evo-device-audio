@@ -495,4 +495,32 @@ mod tests {
         assert_eq!(m.target.shelf, "networking.shares");
         assert_eq!(m.target.shape, 1);
     }
+
+    #[test]
+    fn the_mutating_verbs_gate_at_write_network_admin_in_both_manifests() {
+        // A step-up declaration would demand a step-up session on
+        // every call and put a password card on these writes at the
+        // open household level. Both manifests: the bundle ships
+        // manifest.oop.toml.
+        use evo_plugin_sdk::manifest::VerbCapability;
+        let oop = Manifest::from_toml(include_str!("../manifest.oop.toml"))
+            .expect("manifest.oop.toml parses");
+        for m in [manifest(), oop] {
+            let resp = m.capabilities.respondent.expect("respondent");
+            for verb in [
+                "network.smb_server.apply",
+                "network.smb_server.user_add",
+                "network.smb_server.user_revoke",
+            ] {
+                assert!(
+                    matches!(
+                        resp.verb_capabilities.get(verb),
+                        Some(VerbCapability::Write { scope }) if scope == "network_admin"
+                    ),
+                    "{verb}: {:?}",
+                    resp.verb_capabilities.get(verb)
+                );
+            }
+        }
+    }
 }

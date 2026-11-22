@@ -43,6 +43,7 @@ request_types = [
     "queue.remove_queue_item",
     "queue.move_queue_item",
     "queue.clear_queue",
+    "queue.restore_last_queue",
     "queue.load_playlist_to_queue",
     "queue.append_playlist_to_queue",
     "queue.save_queue_as_playlist",
@@ -65,6 +66,9 @@ request_types = [
     "playlist.remove_from_playlist",
     "playlist.move_in_playlist",
     "playlist.save_selection",
+    "playlist.import_file",
+    "playlist.export_file",
+    "playlist.duplicate",
 ]
 
 [[stockings]]
@@ -104,6 +108,11 @@ request_types = [
     "library.browse_by_year",
     "library.get_triage",
     "library.reconcile_triage",
+    "library.recently_played",
+    "library.most_played",
+    "library.forget_track",
+    "library.forget_album",
+    "library.suggest",
 ]
 
 [kind]
@@ -241,6 +250,7 @@ request_types = [
     "queue.remove_queue_item",
     "queue.move_queue_item",
     "queue.clear_queue",
+    "queue.restore_last_queue",
     "queue.load_playlist_to_queue",
     "queue.append_playlist_to_queue",
     "queue.save_queue_as_playlist",
@@ -257,6 +267,9 @@ request_types = [
     "playlist.remove_from_playlist",
     "playlist.move_in_playlist",
     "playlist.save_selection",
+    "playlist.import_file",
+    "playlist.export_file",
+    "playlist.duplicate",
     # audio.favourites.v1 shelf verbs
     "favourites.list_favourites",
     "favourites.is_favourite",
@@ -284,6 +297,11 @@ request_types = [
     "library.browse_by_year",
     "library.get_triage",
     "library.reconcile_triage",
+    "library.recently_played",
+    "library.most_played",
+    "library.forget_track",
+    "library.forget_album",
+    "library.suggest",
 ]
 # USB Remove waits here for detach + MPD prune. See
 # manifest.toml for the 2 s → 30 s reason.

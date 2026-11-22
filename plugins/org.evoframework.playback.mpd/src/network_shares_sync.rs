@@ -54,8 +54,7 @@ use tokio::sync::Notify;
 
 use crate::source_registry::{
     default_probe_cadence_for, default_scan_policy_for, probe_source,
-    should_start_online_scan, ScanPolicy, SourceKind, SourceRecord,
-    SourceRegistry, SourceState, PROBE_BUDGET,
+    SourceKind, SourceRecord, SourceRegistry, SourceState, PROBE_BUDGET,
 };
 
 const PLUGIN_NAME: &str = "org.evoframework.playback.mpd";
@@ -502,84 +501,23 @@ async fn admit_attached_store(
     start_online_scan_if_due(retract, &id, became_online).await;
 }
 
-/// Kick `library.update_source` when an attached store becomes
-/// Online (`on_online`) or when it is Online and has never been
-/// scanned. Same verb as operator Rescan. Fire and warn:
-/// admission has already landed.
+/// Hand a share's observation to the library's scan door. The
+/// door waits for the scan gate, so no NAS index starts before
+/// MPD has settled after load. Fire and warn: admission has
+/// already landed.
 async fn start_online_scan_if_due(
     retract: &RetractHandles,
     source_id: &str,
     became_online: bool,
 ) {
-    let Some(record) = retract.library.registry.get(source_id).await else {
-        return;
-    };
-    let due = if became_online {
-        matches!(record.state, SourceState::Online)
-            && matches!(
-                record.scan_policy,
-                ScanPolicy::EagerIncremental {
-                    on_online: true,
-                    ..
-                }
-            )
-    } else {
-        should_start_online_scan(&record)
-    };
-    if !due {
-        return;
-    }
-    let mut conn = match crate::mpd::MpdConnection::connect_with_timeouts(
-        retract.endpoint.clone(),
-        retract.timeouts,
-    )
-    .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                plugin = PLUGIN_NAME,
-                source_id = %source_id,
-                error = %e,
-                "shares-sync: no MPD connection to start the first \
-                 index; operator Rescan remains"
-            );
-            return;
-        }
-    };
-    let payload = crate::library::UpdateSourcePayload {
-        v: crate::library::LIBRARY_PAYLOAD_VERSION,
-        source_id: source_id.to_string(),
-        force_rescan: false,
-    };
-    if let Err(e) = crate::library::handle_update_source(
+    crate::scan_door::start_scan_if_due(
         &retract.library,
-        &mut conn,
-        payload,
+        &retract.endpoint,
+        retract.timeouts,
+        source_id,
+        crate::scan_door::ScanTrigger::observed_now(became_online, false),
     )
-    .await
-    {
-        tracing::warn!(
-            plugin = PLUGIN_NAME,
-            source_id = %source_id,
-            error = %e,
-            "shares-sync: first online scan did not start; \
-             operator Rescan remains"
-        );
-        return;
-    }
-    // Stamp last_scan so a later configured-shares tick does not
-    // start a second update while the first is still walking.
-    // Scan-progress overwrites this with the completion time.
-    let _ = retract
-        .library
-        .registry
-        .update_track_counts(
-            source_id,
-            record.track_count,
-            record.track_count_available,
-        )
-        .await;
+    .await;
 }
 
 /// Translate one share entry from the envelope into a
@@ -831,6 +769,7 @@ mod tests {
             skip,
             None,
             crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
         );
         let retract = RetractHandles {
             library,
@@ -1198,6 +1137,7 @@ mod tests {
 
     #[tokio::test]
     async fn admitting_a_reachable_share_starts_the_first_index() {
+        let _watcher = crate::scan_progress::exclusive_watcher().await;
         // Operator invert: Browse NFS Online, index 0 until a
         // hand Rescan. Online + on_online must issue the same
         // update PATH Rescan uses.
@@ -1239,6 +1179,7 @@ mod tests {
             skip,
             None,
             crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
         );
         let retract = RetractHandles {
             library,
@@ -1275,7 +1216,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_share_admitted_before_settle_starts_exactly_one_index_after_it()
+    {
+        let _watcher = crate::scan_progress::exclusive_watcher().await;
+        // The NAS kick waits on the library's scan gate like every
+        // other: nothing reaches MPD while it may still restart,
+        // then exactly one index starts.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let music = tempfile::tempdir().unwrap();
+        let mount = music.path().join("NAS").join("NFS");
+        std::fs::create_dir_all(&mount).unwrap();
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let behaviour = || ConnBehaviour::StoredPlaylists {
+            commands: Arc::clone(&commands),
+            playlists: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            library: Vec::new(),
+            queue: Vec::new(),
+        };
+        // A second connection is there to catch a second index.
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![behaviour(), behaviour()]).await;
+        let registry = SourceRegistry::new();
+        let ann = Arc::new(RecordingAnn::default());
+        let gate = crate::scan_door::ScanGate::waiting(
+            endpoint.clone(),
+            short_timeouts(),
+        );
+        let library = crate::library::LibraryContext::new(
+            music.path().to_path_buf(),
+            registry.clone(),
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            None,
+        )
+        .with_scan_gate(gate.clone());
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let queue = crate::queue::QueueContext::new(
+            music.path().to_path_buf(),
+            registry.clone(),
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+            crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
+        );
+        let retract = RetractHandles {
+            library,
+            queue,
+            endpoint,
+            timeouts: short_timeouts(),
+        };
+        let mut env = wire_share_envelope();
+        env["shares"][0]["mount_root"] =
+            serde_json::Value::String(mount.display().to_string());
+        let updates = || {
+            commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.starts_with("update"))
+                .count()
+        };
+
+        let admit = {
+            let registry = registry.clone();
+            let retract = retract.clone();
+            let env = env.clone();
+            tokio::spawn(async move {
+                apply_envelope(&registry, &retract, &env).await;
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let rec = registry
+            .get("nas-82befb0b-740a-4e65-bae2-5c29e81a6a58")
+            .await
+            .expect("admitted before settle");
+        assert_eq!(
+            rec.state.discriminant(),
+            SourceState::Online.discriminant(),
+        );
+        assert_eq!(updates(), 0, "no index before settle");
+        assert!(!admit.is_finished(), "the kick waits for settle");
+
+        gate.open();
+        admit.await.unwrap();
+        assert_eq!(updates(), 1, "exactly one index after settle");
+        apply_envelope(&registry, &retract, &env).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(updates(), 1, "a republish starts no second index");
+    }
+
+    #[tokio::test]
+    async fn a_share_door_index_settles_the_count_mpd_holds_for_its_path() {
+        // A share's first index goes through the same door, so it
+        // gets the same watcher: MPD's count for the share's path
+        // lands on the row when the job ends.
+        let _watcher = crate::scan_progress::exclusive_watcher().await;
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let music = tempfile::tempdir().unwrap();
+        let mount = music.path().join("NAS").join("NFS");
+        std::fs::create_dir_all(&mount).unwrap();
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let job_done = || ConnBehaviour::PrunesAfterUpdate {
+            internal: Vec::new(),
+            usb: vec![
+                "NAS/NFS/one.flac".to_string(),
+                "NAS/NFS/two.flac".to_string(),
+            ],
+            in_flight_polls: 0,
+        };
+        // The kick, then the watcher's poll and its count.
+        let (endpoint, _mock) = spawn_mock_mpd(vec![
+            ConnBehaviour::StoredPlaylists {
+                commands: Arc::clone(&commands),
+                playlists: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+                library: Vec::new(),
+                queue: Vec::new(),
+            },
+            job_done(),
+            job_done(),
+        ])
+        .await;
+        let registry = SourceRegistry::new();
+        let ann = Arc::new(RecordingAnn::default());
+        let library = crate::library::LibraryContext::new(
+            music.path().to_path_buf(),
+            registry.clone(),
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            None,
+        );
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let queue = crate::queue::QueueContext::new(
+            music.path().to_path_buf(),
+            registry.clone(),
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+            crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
+        );
+        let retract = RetractHandles {
+            library,
+            queue,
+            endpoint,
+            timeouts: short_timeouts(),
+        };
+        let mut env = wire_share_envelope();
+        env["shares"][0]["mount_root"] =
+            serde_json::Value::String(mount.display().to_string());
+
+        apply_envelope(&registry, &retract, &env).await;
+
+        let id = "nas-82befb0b-740a-4e65-bae2-5c29e81a6a58";
+        let mut settled = None;
+        for _ in 0..500 {
+            let rec = registry.get(id).await.expect("admitted");
+            if rec.track_count == 2 {
+                settled = Some(rec);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let rec = settled.expect("the watcher settles the count");
+        assert_eq!(rec.track_count_available, 2);
+        assert!(rec.last_scan_at_ms.is_some());
+        let updates = commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.starts_with("update"))
+            .count();
+        assert_eq!(updates, 1, "one index");
+    }
+
+    #[tokio::test]
     async fn a_later_tick_after_the_mount_lands_goes_online_and_indexes() {
+        let _watcher = crate::scan_progress::exclusive_watcher().await;
         // Operator invert: Add publishes configured before the
         // OS mount exists. First tick is Offline / Wake. The
         // Mounted tick must re-probe, go Online, and start the
@@ -1317,6 +1448,7 @@ mod tests {
             skip,
             None,
             crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
         );
         let retract = RetractHandles {
             library,

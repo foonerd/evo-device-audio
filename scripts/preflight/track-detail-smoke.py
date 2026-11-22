@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# /// script
+# dependencies = ["websockets>=10"]
+# ///
 """Deploy gate: track_detail full-source smoke.
 
 Rig-side smoke that fails a deploy the moment a rig's
@@ -15,6 +18,10 @@ Invocation
 ----------
 
     scripts/preflight/track-detail-smoke.py <TARGET_HOST> <TARGET_USER>
+
+Needs `websockets>=10`, declared in the script header above.
+deploy-distribution.sh refuses before it touches the target when
+its python3 cannot import it.
 
 Exit codes
 ----------

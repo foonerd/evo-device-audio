@@ -130,11 +130,14 @@ require_file "${steward_src}"
 mkdir -p "${STAGE}/bin"
 install -m 0755 "${steward_src}" "${STAGE}/bin/evo-device-audio"
 
-# Plugins (already signed)
+# Plugins (already signed). The slot key is the cut number,
+# not the version inside manifest.oop.toml.
+CUT_VER="$(tr -d ' \t\r\n' < "${REPO_ROOT}/CUT_VERSION" 2>/dev/null || true)"
+[[ -n "${CUT_VER}" ]] || die "CUT_VERSION is missing or empty; plugin slots are keyed on the cut number"
+[[ "${CUT_VER}" != v* ]] || die "CUT_VERSION must not carry a leading v (read: ${CUT_VER})"
 for entry in "${OOP_PLUGINS[@]}"; do
     IFS=':' read -r p_name _ _ _ <<< "${entry}"
-    p_ver="$(awk -F'"' '/^version *=/{print $2; exit}' "${REPO_ROOT}/plugins/${p_name}/manifest.oop.toml")"
-    [[ -n "${p_ver}" ]] || die "no version in plugins/${p_name}/manifest.oop.toml"
+    p_ver="${CUT_VER}"
     tgz="${ARTEFACTS}/bundles/${p_name}/${TARGET}/${p_name}-${p_ver}-${TARGET}.tar.gz"
     require_file "${tgz}"
     tmp="$(mktemp -d -t evo-plug-XXXXXX)"
@@ -204,6 +207,10 @@ log "kiosk program ${TARGET} present ($(wc -c < "${KIOSK_PROGRAM}") bytes)"
     "composed tree has no dist/bin/evo-rtc-wake; bootstrap Step 1h exits 2"
 [[ -f "${STAGE}/dist/sudoers.d/evo-rtc-wake.in" ]] || die \
     "composed tree has no dist/sudoers.d/evo-rtc-wake.in; bootstrap Step 1h exits 2"
+[[ -x "${STAGE}/dist/bin/evo-set-timezone" ]] || die \
+    "composed tree has no dist/bin/evo-set-timezone; bootstrap Step 1h.t exits 2"
+[[ -f "${STAGE}/dist/sudoers.d/evo-set-timezone.in" ]] || die \
+    "composed tree has no dist/sudoers.d/evo-set-timezone.in; bootstrap Step 1h.t exits 2"
 if grep -qE 'chown[[:space:]]+-R[[:space:]]+"\$SERVICE_USER:\$SERVICE_USER"[[:space:]]+/var/lib/evo' \
         "${STAGE}/dist/scripts/bootstrap.sh"; then
     die "composed bootstrap still recursively chowns /var/lib/evo"
@@ -213,12 +220,15 @@ grep -q 'chown_tree_same_fs /var/lib/evo' "${STAGE}/dist/scripts/bootstrap.sh" \
 grep -q 'chown_tenant_state_trees' "${STAGE}/dist/scripts/bootstrap.sh" \
     || die "composed bootstrap does not tenant-own kiosk state trees after layer installers"
 log "evo.service present ($(wc -c < "${STAGE}/dist/systemd/evo.service") bytes)"
-log "install surface overlaid (bootstrap, chown lib, rtc-wake)"
+log "install surface overlaid (bootstrap, chown lib, rtc-wake, set-timezone)"
 
 {
     echo "schema_version = 1"
     echo "bundle_kind = \"evo-device-audio\""
     echo "version = \"${CARGO_VERSION}\""
+    # The release the installer keeps on the box: the cut, never
+    # the Cargo version above.
+    echo "release = \"${CUT_VER}\""
     echo "architecture = \"${TARGET}\""
     echo "composed_from_pieces = true"
     echo "built_at_utc = \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""

@@ -82,21 +82,22 @@ response_budget_ms = 15000
 # lists networks without elevation; discovery reconfigures
 # nothing.
 #
-# Write-class verbs — the paired-operator connect path.
-# `intent.set` / `intent.apply` (join a network) and
-# `captive.start` / `captive.submit` / `captive.complete` (walk
-# the portal on a network already being joined) gate at
-# `write:network_admin`. Connecting to Wi-Fi is the most basic
-# network operation on every consumer device; no peer forces a
-# fresh admin re-auth on every join. A paired operator holds
-# `write` continuously; anonymous sessions lack it and are
-# refused.
+# Write-class verbs — every mutating verb gates at
+# `write:network_admin`: `intent.set` / `intent.apply` (join a
+# network), `wifi.disconnect`, `wifi.forget`, `captive.start` /
+# `captive.submit` / `captive.complete` (walk the portal on a
+# network already being joined), `captive.session.start`,
+# `security.harden` (rewrite secret-at-rest configuration), and
+# `flight_mode.set` / `radio.set` (radio kills). Connecting to
+# Wi-Fi is the most basic network operation on every consumer
+# device; no peer forces a fresh admin re-auth on every join. A
+# pair or kiosk bearer holds the scope, and so does a LAN caller
+# without a bearer while the household policy polices the LAN. A
+# public-origin caller without a bearer does not, and is refused.
 #
-# Step-up verbs — destructive posture changes that DO warrant
-# a fresh operator-presence proof: `flight_mode.set` (kills
-# every wireless family device-wide), `radio.set` (per-family
-# radio kill), `security.harden` (rewrites secret-at-rest
-# configuration).
+# The household policy is the one door on top: while it protects
+# network_admin, each of these verbs needs the owner's step-up
+# session on the call.
 [capabilities.respondent.verb_capabilities]
 "network.nm.intent.set" = { kind = "write", scope = "network_admin" }
 "network.nm.intent.apply" = { kind = "write", scope = "network_admin" }
@@ -109,6 +110,6 @@ response_budget_ms = 15000
 # upstream.fetch + session.close; session.start is the sole
 # capability-gated entry point.
 "network.nm.captive.session.start" = { kind = "write", scope = "network_admin" }
-"network.nm.security.harden" = { kind = "step_up", scope = "network_admin" }
-"network.nm.flight_mode.set" = { kind = "step_up", scope = "network_admin" }
-"network.nm.radio.set" = { kind = "step_up", scope = "network_admin" }
+"network.nm.security.harden" = { kind = "write", scope = "network_admin" }
+"network.nm.flight_mode.set" = { kind = "write", scope = "network_admin" }
+"network.nm.radio.set" = { kind = "write", scope = "network_admin" }

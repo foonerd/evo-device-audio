@@ -82,6 +82,32 @@ drive output-device selection.
 """
 
 [[racks.shelves]]
+name = "zones"
+shape = 1
+description = """
+A zone is a name over one or more logical outputs. It stores \
+its own EQ. evo.audio.zones / eq_claim tells the one eq_only \
+cascade which zone's bands to use. A scene is a name and a \
+snapshot of every zone: scene.save, scene.list, scene.recall, \
+scene.remove. A zone is not an ALSA device. It moves no mixer \
+and no drop-in. A logical output sits in one zone at most, and \
+cannot be removed while a zone holds it.
+"""
+
+[[racks.shelves]]
+name = "alarm"
+shape = 1
+description = """
+One alarm that wakes the device and plays a playlist. Stocked \
+by org.evoframework.alarm: alarm.set names the weekdays, a \
+local HH:MM and a playlist, and replaces the alarm; \
+alarm.clear takes it away. The alarm is one appointment on \
+the framework appointment ledger whose fire loads that \
+playlist into the queue and plays it. It is not the sleep \
+timer.
+"""
+
+[[racks.shelves]]
 name = "options"
 shape = 2
 description = """
@@ -374,7 +400,7 @@ charter = """
 Host-level system management surface. One shelf per \
 system concern; the power shelf carries operator-gestured \
 reboot / power-off verbs gated by the framework's per-verb \
-capability gate at step_up:system_admin. Additional shelves \
+capability gate at write:system_admin. Additional shelves \
 (time, storage, updates) attach as their plugins land.
 """
 
@@ -384,10 +410,11 @@ shape = 1
 description = """
 Host power-management respondent: answers `reboot_device` and \
 `power_off_device` for the operator's gestured shutdown \
-requests. Both verbs are step_up gated at the framework \
-dispatcher (scope `system_admin`); the principal must hold the \
-write scope AND an active step-up auth session before the verb \
-reaches the plugin. Reference implementation invokes \
+requests. Both verbs gate at the framework dispatcher at \
+`write:system_admin`; the principal must hold the scope, and, \
+while the household policy protects it, the owner's step-up \
+session on the call, before the verb reaches the plugin. \
+Reference implementation invokes \
 `systemctl reboot|poweroff` through a narrow EVO_SYSTEM_POWER \
 sudoers grant; vendor distributions that need different \
 shutdown semantics (hardware watchdog, alternate init system) \
@@ -445,9 +472,59 @@ conditions re-emit, transient conditions are gone). Vendor \
 distributions that need a different notification back-end \
 (desktop-environment integration, mobile push, siren) ship a \
 vendor-namespace replacement under the same verb shape. Mode + \
-quiet-hours verbs are step-up-gated against `system_admin`; \
+quiet-hours verbs gate at `write:system_admin`; \
 list_active / send / cancel are anonymous — send-time \
 attribution comes from the payload's `source_plugin` field.
+"""
+
+[[racks.shelves]]
+name = "info"
+shape = 1
+description = """
+What the device is and what it runs. Stocked by \
+org.evoframework.system.info: get_system_info reads the \
+host's name, operating system, kernel, architecture, model, \
+processor, memory and uptime; get_system_version reads the \
+installed release from the installer's record and answers \
+the build. Both are reads gated at scope `system`, and a fact \
+the device does not provide answers null.
+"""
+
+[[racks.shelves]]
+name = "backup"
+shape = 1
+description = """
+One backup of the operator's configuration. Stocked by \
+org.evoframework.system.backup: export_backup reads config \
+(logical outputs and zones), playlists and settings from the \
+plugins that own them, and import_backup puts them back \
+through the same owners, removing nothing and reporting what \
+an owner refuses. Both gate at `write:system_admin`. \
+Music files and share passwords are never in a backup.
+"""
+
+[[racks.shelves]]
+name = "locale"
+shape = 1
+description = """
+The operator's language and the device's timezone. Stocked by \
+org.evoframework.identity.locale: language.set sets the \
+language from settings at any time after first boot and \
+answers the language in force. Only a language the glass has \
+a catalogue for applies, `en` today; any other tag is not \
+applied and the answer is the language still in force. Before \
+any set the language is `en`. No password is asked. \
+timezone.set sets the device's zone and answers the zone in \
+force, an IANA name; a zone the host does not hold, and \
+`Factory`, are not applied. After an apply it waits more than \
+a second, then has the pending alarm rescheduled on the new \
+zone before it answers. A failed apply or a refused \
+reschedule is an error naming the zone in force. It is a \
+write at `system_admin`, not step-up. timezone.get answers the \
+zone in force, and timezone.list the IANA names a set would \
+apply, without `Factory`; a read that fails is an error, never \
+a zone not in force or an empty or partial list. Neither \
+carries a write grant.
 """
 
 # Subject types the audio playback warden announces on
@@ -729,6 +806,13 @@ name = "audio_multiroom_local_role"
 # `schemas/org.evoframework/audio/delivery.v2.toml`.
 [[subjects]]
 name = "audio_delivery_outputs"
+
+# Which zone's EQ the one eq_only cascade hears, published by
+# the delivery plugin on evo.audio.zones / eq_claim. The two
+# payload shapes are declared on the audio.zones shelf
+# (zones.v1.toml); this is the name only.
+[[subjects]]
+name = "audio_zone_eq_claim"
 
 # Subject types the hardware.audio-config plugin announces
 # at admission. capabilities carries the resolved DAC class

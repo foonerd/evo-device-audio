@@ -60,11 +60,30 @@ pub(crate) struct AsfPicture {
     pub(crate) data: Vec<u8>,
 }
 
+/// Read at most [`MAX_HEADER_BYTES`] from the start of `path`.
+///
+/// Every field this module reads lives in the ASF header object,
+/// which the parsers already cap at [`MAX_HEADER_BYTES`]. Reading the
+/// whole file to look at its first bytes is not harmless: this runs
+/// for every file lofty declines, and on a share that includes every
+/// video file, each one pulled across the network in full and held
+/// open for the duration. That kept a removed share busy for as long
+/// as the library walked it.
+fn read_header_bytes(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_HEADER_BYTES as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(bytes)
+}
+
 /// Read the first `WM/Picture` from `path`, returning `None`
 /// when the file is not ASF, the header is malformed, or no
 /// picture descriptor is present.
 pub(crate) fn read_embedded_picture(path: &Path) -> Option<AsfPicture> {
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = read_header_bytes(path)?;
     if !starts_with_asf_header(&bytes) {
         return None;
     }
@@ -94,7 +113,7 @@ pub(crate) fn read_embedded_picture(path: &Path) -> Option<AsfPicture> {
 /// Description); falls back to the Content Description
 /// Object's "Author" field. Album comes from `WM/AlbumTitle`.
 pub(crate) fn read_identity(path: &Path) -> Option<(String, String)> {
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = read_header_bytes(path)?;
     if !starts_with_asf_header(&bytes) {
         return None;
     }
@@ -347,6 +366,29 @@ mod tests {
         std::fs::write(&p, b"this is not an ASF file").unwrap();
         assert!(read_embedded_picture(&p).is_none());
         assert!(read_identity(&p).is_none());
+    }
+
+    /// A file declined by lofty is not read past the header the
+    /// parsers can use, however large it is.
+    #[test]
+    fn a_large_file_is_read_only_to_the_header_cap() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("big.avi");
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len((MAX_HEADER_BYTES as u64) * 4).unwrap();
+        let bytes = read_header_bytes(&p).unwrap();
+        assert_eq!(bytes.len(), MAX_HEADER_BYTES);
+        assert!(read_embedded_picture(&p).is_none());
+        assert!(read_identity(&p).is_none());
+    }
+
+    #[test]
+    fn a_small_file_is_read_whole() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("small.wma");
+        std::fs::write(&p, b"0123456789").unwrap();
+        assert_eq!(read_header_bytes(&p).unwrap(), b"0123456789");
+        assert!(read_header_bytes(&d.path().join("absent")).is_none());
     }
 
     #[test]

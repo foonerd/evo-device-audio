@@ -126,6 +126,9 @@ pub(crate) struct PlaylistContext {
             dyn evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher,
         >,
     >,
+    /// Scan-time local artwork hashes carried on list rows as
+    /// `artwork_hash`. See [`crate::artwork_hash`].
+    pub(crate) artwork_hashes: crate::artwork_hash::ArtworkHashIndex,
 }
 
 impl PlaylistContext {
@@ -148,7 +151,18 @@ impl PlaylistContext {
             mirror: Arc::new(Mutex::new(None)),
             item_count_cache: Arc::new(Mutex::new(HashMap::new())),
             shelf_dispatcher,
+            artwork_hashes: Default::default(),
         }
+    }
+
+    /// Share the scan-time artwork hash index. Without this the
+    /// context carries an empty one and no row has `artwork_hash`.
+    pub(crate) fn with_artwork_hashes(
+        mut self,
+        index: crate::artwork_hash::ArtworkHashIndex,
+    ) -> Self {
+        self.artwork_hashes = index;
+        self
     }
 }
 
@@ -358,7 +372,7 @@ async fn build_get_playlist_envelope(
             &ctx.registry,
         )
         .await;
-        rendered.push(json!({
+        let mut row = json!({
             "position":        entry.position,
             "uri":             entry.file_path,
             "source_id":       source_id,
@@ -386,7 +400,12 @@ async fn build_get_playlist_envelope(
             "recording_date":  entry.classical.recording_date,
             "label":           entry.classical.label,
             "medium":          entry.classical.medium,
-        }));
+        });
+        crate::artwork_hash::attach(
+            &mut row,
+            ctx.artwork_hashes.hash_for_path(&entry.file_path),
+        );
+        rendered.push(row);
     }
     json!({
         "v":          PLAYLIST_PAYLOAD_VERSION,

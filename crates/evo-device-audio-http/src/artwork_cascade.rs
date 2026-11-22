@@ -35,9 +35,16 @@ use evo_plugin_sdk::contract::AssetCache;
 use serde_json::{json, Value};
 
 use crate::artwork_admission::{Admission, AdmissionError};
+use crate::artwork_enrichment::{
+    EnrichKey, EnrichRequest, EnrichmentSink, PROVENANCE_BACKGROUND_ENRICHING,
+};
 use crate::artwork_negative_cache::NegativeCache;
 use crate::artwork_resolve_coalescer::{
     ArtworkResolveCoalescer, CoalesceError,
+};
+use crate::artwork_tier::{
+    CascadeMode, PENDING_ENRICH_PREFIX,
+    PROVENANCE_LOCAL_EXHAUSTED_PENDING_ENRICH,
 };
 use evo_projection_core::WireOpId;
 use evo_runtime_http::dispatcher::Dispatcher;
@@ -237,6 +244,11 @@ pub struct ArtworkCascade {
     /// Optional sink told when a resolve lands. See
     /// [`ArtworkResolvedNotifier`].
     resolved_notifier: Option<Arc<dyn ArtworkResolvedNotifier>>,
+    /// Where a paint miss asks for the network tier to be run
+    /// later. `None` leaves the paint answering "pending" with
+    /// nobody coming — only a test or a deployment that wants no
+    /// network art configures that.
+    enrichment: Option<Arc<dyn EnrichmentSink>>,
 }
 
 impl ArtworkCascade {
@@ -272,6 +284,25 @@ impl ArtworkCascade {
             resolve_index,
             asset_cache,
             resolved_notifier: None,
+            enrichment: None,
+        })
+    }
+
+    /// Wire the background enrichment queue. A paint that misses
+    /// the local tier requests enrichment here.
+    pub fn with_enrichment(
+        self: Arc<Self>,
+        queue: Arc<crate::artwork_enrichment::EnrichmentQueue>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            dispatcher: Arc::clone(&self.dispatcher),
+            coalescer: Arc::clone(&self.coalescer),
+            admission: Arc::clone(&self.admission),
+            negative_cache: Arc::clone(&self.negative_cache),
+            resolve_index: self.resolve_index.clone(),
+            asset_cache: self.asset_cache.clone(),
+            resolved_notifier: self.resolved_notifier.clone(),
+            enrichment: Some(queue as Arc<dyn EnrichmentSink>),
         })
     }
 
@@ -292,6 +323,7 @@ impl ArtworkCascade {
             resolve_index: self.resolve_index.clone(),
             asset_cache: self.asset_cache.clone(),
             resolved_notifier: Some(notifier),
+            enrichment: self.enrichment.clone(),
         })
     }
 
@@ -708,6 +740,15 @@ impl ArtworkCascade {
                 );
             }
         }
+        // A landed positive supersedes any "pending enrichment"
+        // memo for the target. The negative pre-check in
+        // `resolve` runs before the index, so a surviving memo
+        // would keep answering 404 for a picture that exists.
+        self.negative_cache.forget(&(
+            scheme.to_string(),
+            value.to_string(),
+            size.to_string(),
+        ));
         // Tell anyone already looking at this target that it now
         // has bytes.
         //
@@ -733,6 +774,87 @@ impl ArtworkCascade {
     /// — e.g., `tiny` → `small`). Returns [`CascadeOutcome`]
     /// with a fully classified terminal state.
     pub async fn resolve(
+        &self,
+        principal: &Principal,
+        scheme: &str,
+        value: &str,
+        size: &str,
+    ) -> CascadeOutcome {
+        let outcome = self.resolve_paint(principal, scheme, value, size).await;
+        self.request_enrichment_if_pending(
+            principal, scheme, value, size, outcome,
+        )
+    }
+
+    /// A paint that ended "local tier exhausted, network tier
+    /// pending" asks for the network tier to be run off the clock,
+    /// and says so in its provenance. Every other outcome passes
+    /// through untouched.
+    fn request_enrichment_if_pending(
+        &self,
+        principal: &Principal,
+        scheme: &str,
+        value: &str,
+        size: &str,
+        outcome: CascadeOutcome,
+    ) -> CascadeOutcome {
+        let CascadeOutcome::NotFound {
+            provider_id,
+            detail,
+        } = outcome
+        else {
+            return outcome;
+        };
+        let pending = provider_id.as_deref()
+            == Some(PROVENANCE_LOCAL_EXHAUSTED_PENDING_ENRICH)
+            || provider_id.as_deref() == Some(PROVENANCE_BACKGROUND_ENRICHING);
+        let Some(sink) = self.enrichment.as_ref().filter(|_| pending) else {
+            return CascadeOutcome::NotFound {
+                provider_id,
+                detail,
+            };
+        };
+        let key: EnrichKey =
+            (scheme.to_string(), value.to_string(), size.to_string());
+        let provider_id = match sink.request(principal, &key) {
+            EnrichRequest::Queued | EnrichRequest::Coalesced => {
+                Some(PROVENANCE_BACKGROUND_ENRICHING.to_string())
+            }
+            EnrichRequest::Full => {
+                tracing::warn!(
+                    scheme = %scheme, value = %value, size = %size,
+                    "artwork enrichment queue is full; target left to a \
+                     later paint"
+                );
+                Some(PROVENANCE_LOCAL_EXHAUSTED_PENDING_ENRICH.to_string())
+            }
+        };
+        CascadeOutcome::NotFound {
+            provider_id,
+            detail,
+        }
+    }
+
+    /// The enrichment path gave up on `(scheme, value, size)`
+    /// after its retry schedule. Memoise the transient so a
+    /// revisit inside the window does not restart the cycle.
+    pub(crate) fn memoise_enrichment_gave_up(
+        &self,
+        scheme: &str,
+        value: &str,
+        size: &str,
+        detail: &str,
+    ) {
+        self.negative_cache.put_with_ttl(
+            (scheme.to_string(), value.to_string(), size.to_string()),
+            "unavailable",
+            detail.to_string(),
+            None,
+            TRANSIENT_MEMO_TTL,
+        );
+    }
+
+    async fn resolve_paint(
         &self,
         principal: &Principal,
         scheme: &str,
@@ -918,6 +1040,7 @@ impl ArtworkCascade {
             .coalescer
             .resolve_or_coalesce(scheme, value, size, move || async move {
                 run_cascade(
+                    CascadeMode::Paint,
                     dispatcher,
                     admission,
                     principal_clone,
@@ -966,6 +1089,51 @@ impl ArtworkCascade {
                 self.memoise_transient_if_needed(&outcome, scheme, value, size);
                 outcome
             }
+        }
+    }
+
+    /// Run the FULL cascade — local tier, then the network tier —
+    /// off the paint clock.
+    ///
+    /// The enrichment path's entry point. It does not consult the
+    /// negative memo (the pending entry is why it is running) and
+    /// does not go through the paint coalescer: the caller owns
+    /// job-level coalescing and bounding. A positive populates
+    /// the resolve-index, evicts the pending memo and announces
+    /// `artwork_resolved`; a provider-confirmed absence writes
+    /// the day-scale negative inside the cascade; a transient
+    /// outcome writes nothing, so the caller can retry.
+    pub async fn enrich(
+        &self,
+        principal: &Principal,
+        scheme: &str,
+        value: &str,
+        size: &str,
+    ) -> CascadeOutcome {
+        let negative_key =
+            (scheme.to_string(), value.to_string(), size.to_string());
+        let result = run_cascade(
+            CascadeMode::Enrich,
+            Arc::clone(&self.dispatcher),
+            Arc::clone(&self.admission),
+            principal.clone(),
+            scheme.to_string(),
+            value.to_string(),
+            size.to_string(),
+            Arc::clone(&self.negative_cache),
+            negative_key,
+        )
+        .await;
+        match result {
+            Ok((content_hash, provider_id)) => {
+                self.remember_positive(scheme, value, size, &content_hash)
+                    .await;
+                CascadeOutcome::Resolved {
+                    content_hash,
+                    provider_id,
+                }
+            }
+            Err(reason) => classify_fetcher_error(reason),
         }
     }
 
@@ -1030,6 +1198,47 @@ impl ArtworkCascade {
 const TRANSIENT_MEMO_TTL: std::time::Duration =
     std::time::Duration::from_secs(5 * 60);
 
+/// TTL for the "local tier exhausted, network tier pending
+/// enrichment" memo. Shorter than the day-scale verdict because
+/// it is not one: enrichment is expected to replace it with a
+/// positive (which evicts it) or a confirmed absence (which
+/// overwrites it) within moments. It exists so a re-visit during
+/// that window answers from memory instead of re-reading the
+/// local tier for every tile.
+const PENDING_ENRICH_MEMO_TTL: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// The paint-path refusal of a network-tier verb.
+///
+/// `None` when `mode` may dispatch `request_type`. Otherwise
+/// writes the short pending memo and returns the fetcher error
+/// that classifies to a fast NotFound with
+/// `local_exhausted_pending_enrich` provenance. Every network
+/// dispatch in [`run_cascade`] passes through here first; there
+/// is no other way to reach one.
+fn defer_network_on_paint(
+    mode: CascadeMode,
+    request_type: &str,
+    negative_cache: &NegativeCache,
+    negative_key: &(String, String, String),
+) -> Option<String> {
+    if mode.permits(request_type) {
+        return None;
+    }
+    let detail = format!(
+        "{PENDING_ENRICH_PREFIX} local tier exhausted; {request_type} is \
+         deferred to background enrichment"
+    );
+    negative_cache.put_with_ttl(
+        negative_key.clone(),
+        "pending_enrich",
+        detail.clone(),
+        Some(PROVENANCE_LOCAL_EXHAUSTED_PENDING_ENRICH.to_string()),
+        PENDING_ENRICH_MEMO_TTL,
+    );
+    Some(detail)
+}
+
 // -----------------------------------------------------------
 // Internal helpers
 // -----------------------------------------------------------
@@ -1072,6 +1281,7 @@ async fn admit_online(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_cascade(
+    mode: CascadeMode,
     dispatcher: Arc<dyn Dispatcher>,
     admission: Arc<Admission>,
     principal: Principal,
@@ -1110,6 +1320,14 @@ async fn run_cascade(
             "request_type": "artwork.resolve_artist_online",
             "payload_b64": &artist_payload_b64,
         });
+        if let Some(pending) = defer_network_on_paint(
+            mode,
+            "artwork.resolve_artist_online",
+            &negative_cache,
+            &negative_key,
+        ) {
+            return Err(pending);
+        }
         let op_id = WireOpId::new("request")
             .map_err(|e| format!("wire-op id construction failed: {e}"))?;
         let permit = admit_online(&admission, &scheme_owned).await?;
@@ -1255,6 +1473,18 @@ async fn run_cascade(
             )
         };
 
+    // The network tier. On a paint this is refused: the local tier
+    // is exhausted, the answer is a fast "not yet", and the full
+    // cascade runs on the enrichment path instead.
+    if let Some(pending) = defer_network_on_paint(
+        mode,
+        online_request_type,
+        &negative_cache,
+        &negative_key,
+    ) {
+        return Err(pending);
+    }
+
     let online_payload = json!({
         "v": 1,
         "target": {"scheme": online_target_scheme, "value": &online_target_value},
@@ -1332,6 +1562,17 @@ async fn run_cascade(
 fn classify_fetcher_error(reason: String) -> CascadeOutcome {
     if reason.starts_with("artwork resolve admission deadline") {
         CascadeOutcome::AdmissionDeadline { detail: reason }
+    } else if reason.starts_with(PENDING_ENRICH_PREFIX) {
+        // Local tier exhausted; the network tier was deliberately
+        // not asked. A fast not-found that says why, so the
+        // caller can tell "nothing here yet" from "nothing
+        // anywhere".
+        CascadeOutcome::NotFound {
+            provider_id: Some(
+                PROVENANCE_LOCAL_EXHAUSTED_PENDING_ENRICH.to_string(),
+            ),
+            detail: reason,
+        }
     } else if reason.starts_with("artwork upstream unavailable:") {
         // Upstream (online tier providers) was reachable-but-
         // transient. Distinct from NotFound so the caller can
@@ -1549,5 +1790,201 @@ mod resolved_notifier_tests {
         let c = ArtworkCascade::new(Arc::new(NullDispatcher), None, None);
         c.remember_positive("artist-name", "Someone", "large", HASH)
             .await;
+    }
+}
+
+#[cfg(test)]
+mod paint_path_tests {
+    use super::*;
+    use crate::artwork_tier::NETWORK_TIER_REQUEST_TYPES;
+    use std::sync::Mutex;
+
+    const HASH: &str =
+        "4444444444444444444444444444444444444444444444444444444444444444";
+
+    /// Answers each artwork verb from a script and records every
+    /// request type it was asked for, in order.
+    struct Scripted {
+        calls: Mutex<Vec<String>>,
+        local: Value,
+        online: Value,
+    }
+
+    impl Scripted {
+        fn new(local: Value, online: Value) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                local,
+                online,
+            })
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Dispatcher for Scripted {
+        async fn dispatch(
+            &self,
+            _op_id: &WireOpId,
+            payload: Value,
+            _principal: &Principal,
+        ) -> Result<Value, evo_runtime_http::dispatcher::DispatchError>
+        {
+            use base64::Engine;
+            let rt = payload["request_type"].as_str().unwrap().to_string();
+            self.calls.lock().unwrap().push(rt.clone());
+            let body = if crate::artwork_tier::is_network_tier(&rt) {
+                self.online.clone()
+            } else {
+                self.local.clone()
+            };
+            Ok(json!({
+                "payload_b64": base64::engine::general_purpose::STANDARD
+                    .encode(body.to_string().as_bytes()),
+            }))
+        }
+    }
+
+    fn local_miss_with_identity() -> Value {
+        json!({
+            "status": "not_found",
+            "detail": "no sidecar; no embedded picture",
+            "provider_id": "local_sidecar",
+            "identity": {"artist": "Adele", "album": "21"},
+        })
+    }
+
+    fn online_hit() -> Value {
+        json!({"status": "ok", "content_hash": HASH, "provider_id": "itunes"})
+    }
+
+    fn principal() -> Principal {
+        Principal::new("t", evo_auth_bearer::CapabilitySet::default())
+    }
+
+    fn assert_pending(outcome: &CascadeOutcome) {
+        match outcome {
+            CascadeOutcome::NotFound { provider_id, .. } => assert_eq!(
+                provider_id.as_deref(),
+                Some(PROVENANCE_LOCAL_EXHAUSTED_PENDING_ENRICH)
+            ),
+            other => panic!("expected a pending not-found, got {other:?}"),
+        }
+    }
+
+    /// The row's first property. A paint whose local tier is
+    /// exhausted answers a fast not-found and never reaches a
+    /// network verb. RED if the paint path dispatches the online
+    /// tier — the 47-second stall.
+    #[tokio::test]
+    async fn a_paint_never_dispatches_the_network_tier() {
+        let d = Scripted::new(local_miss_with_identity(), online_hit());
+        let c = ArtworkCascade::new(d.clone(), None, None);
+        let out = c
+            .resolve(&principal(), "mpd-path", "a/b.flac", "small")
+            .await;
+        assert_pending(&out);
+        let calls = d.calls();
+        assert_eq!(calls, vec!["artwork.resolve".to_string()]);
+        for rt in NETWORK_TIER_REQUEST_TYPES {
+            assert!(
+                !calls.iter().any(|c| c == rt),
+                "{rt} dispatched on a paint"
+            );
+        }
+    }
+
+    /// An artist-name target used to go local, then straight to
+    /// the artist online verb. Same refusal.
+    #[tokio::test]
+    async fn an_artist_paint_never_dispatches_the_network_tier() {
+        let d = Scripted::new(json!({"status": "not_found"}), online_hit());
+        let c = ArtworkCascade::new(d.clone(), None, None);
+        let out = c
+            .resolve(&principal(), "artist-name", "Adele", "small")
+            .await;
+        assert_pending(&out);
+        assert_eq!(d.calls(), vec!["artwork.resolve".to_string()]);
+    }
+
+    /// `artist-mbid` has no local tier; it used to dispatch the
+    /// online verb directly. Now it dispatches nothing.
+    #[tokio::test]
+    async fn an_mbid_paint_dispatches_nothing() {
+        let d = Scripted::new(json!({}), online_hit());
+        let c = ArtworkCascade::new(d.clone(), None, None);
+        let out = c
+            .resolve(&principal(), "artist-mbid", "mbid-1", "small")
+            .await;
+        assert_pending(&out);
+        assert!(d.calls().is_empty(), "{:?}", d.calls());
+    }
+
+    /// Second property: the revisit answers from memory, with the
+    /// provenance, and does not re-read the local tier.
+    #[tokio::test]
+    async fn a_revisit_does_not_redispatch_the_local_tier() {
+        let d = Scripted::new(local_miss_with_identity(), online_hit());
+        let c = ArtworkCascade::new(d.clone(), None, None);
+        let p = principal();
+        assert_pending(&c.resolve(&p, "mpd-path", "a/b.flac", "small").await);
+        assert_pending(&c.resolve(&p, "mpd-path", "a/b.flac", "small").await);
+        assert_eq!(d.calls().len(), 1, "{:?}", d.calls());
+    }
+
+    /// The enrichment path still runs the whole cascade. The
+    /// network tier was moved off the paint, not removed.
+    #[tokio::test]
+    async fn enrichment_runs_the_full_cascade_and_lands_the_art() {
+        let d = Scripted::new(local_miss_with_identity(), online_hit());
+        let dir = tempfile::TempDir::new().unwrap();
+        let index =
+            Arc::new(crate::artwork_resolve_index::ArtworkResolveIndex::new(
+                dir.path().to_path_buf(),
+            ));
+        let c = ArtworkCascade::new(d.clone(), None, Some(index));
+        let p = principal();
+        // Paint first: pending memo written.
+        assert_pending(&c.resolve(&p, "mpd-path", "a/b.flac", "small").await);
+        let out = c.enrich(&p, "mpd-path", "a/b.flac", "small").await;
+        match out {
+            CascadeOutcome::Resolved { content_hash, .. } => {
+                assert_eq!(content_hash, HASH)
+            }
+            other => panic!("enrich did not resolve: {other:?}"),
+        }
+        assert_eq!(
+            d.calls(),
+            vec![
+                "artwork.resolve".to_string(),
+                "artwork.resolve".to_string(),
+                "artwork.resolve_online".to_string(),
+            ]
+        );
+        // The landed positive evicts the pending memo: the next
+        // paint is served from the index, not the stale 404.
+        match c.resolve(&p, "mpd-path", "a/b.flac", "small").await {
+            CascadeOutcome::Resolved { content_hash, .. } => {
+                assert_eq!(content_hash, HASH)
+            }
+            other => panic!("pending memo masked the landed art: {other:?}"),
+        }
+    }
+
+    /// A transient failure during enrichment writes neither
+    /// cache, so the caller can retry.
+    #[tokio::test]
+    async fn a_transient_enrichment_failure_writes_no_cache() {
+        let d = Scripted::new(
+            local_miss_with_identity(),
+            json!({"status": "unavailable", "detail": "503"}),
+        );
+        let c = ArtworkCascade::new(d.clone(), None, None);
+        let p = principal();
+        let out = c.enrich(&p, "mpd-path", "a/b.flac", "small").await;
+        assert!(matches!(out, CascadeOutcome::Transient { .. }), "{out:?}");
+        assert!(c.negative_cache.is_empty());
     }
 }

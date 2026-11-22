@@ -106,6 +106,22 @@ fn watcher_gate() -> &'static tokio::sync::Mutex<()> {
     G.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+/// For a test that starts a watcher, held for the test's whole
+/// body.
+///
+/// The watcher is one per process and the test harness runs tests
+/// in parallel. While this is held no other such test runs, and a
+/// watcher a finished test left behind has already let go of the
+/// gate, so a watcher this test starts is the one that runs.
+#[cfg(test)]
+pub(crate) async fn exclusive_watcher() -> tokio::sync::MutexGuard<'static, ()>
+{
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let serial = SERIAL.lock().await;
+    drop(watcher_gate().lock().await);
+    serial
+}
+
 /// Epoch milliseconds — wall-clock; `SystemTime` cannot fail
 /// in practice.
 fn now_ms() -> u64 {

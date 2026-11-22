@@ -4029,6 +4029,19 @@ impl NmInner {
     async fn ensure_ap_vif_present(&self, sta_if: &str, ap_if: &str) -> bool {
         let exec = self.effective_iw_exec();
         let timeout = Duration::from_millis(self.config.iw_timeout_ms);
+
+        // Take the vif off NetworkManager before anything else
+        // touches it.
+        //
+        // A vif that survived an earlier apply is the one NM has
+        // already claimed, and it is still claimed now. Holding
+        // first means the read below, and the profile bind after
+        // it, happen on a device NM has let go of — rather than
+        // racing a claim we then try to undo. When the vif does
+        // not exist yet this is a no-op and costs one refused
+        // nmcli call.
+        self.hold_nm_off_ap_vif(ap_if).await;
+
         match wifi_phy::ensure_ap_vif_present(
             exec.as_ref(),
             &self.config.iw_path,
@@ -4038,7 +4051,17 @@ impl NmInner {
         )
         .await
         {
-            Ok(()) => true,
+            Ok(()) => {
+                // A vif created just now is new to NetworkManager,
+                // which sees the netlink event and claims it. That
+                // gap cannot be closed with nmcli — the device has
+                // to exist before it can be named — so it is shut
+                // as fast as a call allows, and the type repair
+                // below cleans up a claim that won the race.
+                self.hold_nm_off_ap_vif(ap_if).await;
+                self.reassert_ap_vif_type(ap_if).await;
+                true
+            }
             Err(e) => {
                 tracing::warn!(
                     plugin = PLUGIN_NAME,
@@ -4049,6 +4072,113 @@ impl NmInner {
                 );
                 false
             }
+        }
+    }
+
+    /// Keep NetworkManager off a freshly-created access-point vif
+    /// until its profile is ready to bind.
+    ///
+    /// The vif is created `type __ap`, but NetworkManager takes
+    /// any wifi device it manages and has wpa_supplicant set it
+    /// up — as a station, to scan — which flips the type to
+    /// `managed`. On a phy whose interface combination allows one
+    /// station and one access point, that second `managed`
+    /// interface is refused by the kernel, and the refusal reaches
+    /// the log as "device or resource busy".
+    ///
+    /// Holding the device unmanaged closes that window: NM is what
+    /// hands an interface to wpa_supplicant, so a device it does
+    /// not manage is never set up. [`Self::ensure_wifi_ap`] hands
+    /// it back immediately before the profile is raised.
+    ///
+    /// Best-effort by design. A failure here is not fatal — the
+    /// type gate before the raise is what actually refuses, and it
+    /// reads the interface rather than trusting this call.
+    /// Put the vif back into AP mode when something else has left
+    /// it a station.
+    ///
+    /// Holding NetworkManager off stops the next claim; it does
+    /// not undo the last one. A vif that NetworkManager took —
+    /// and that wpa_supplicant then failed to set up, because a
+    /// second station on that phy is refused as "device or
+    /// resource busy" — keeps `type managed` afterwards. Left
+    /// alone it stays wrong for the life of the interface and
+    /// every apply declines at the gate.
+    ///
+    /// Called only with the device already unmanaged, so the link
+    /// is down and `iw` will accept the change. A refusal is
+    /// recorded and nothing is retried: the type gate before the
+    /// raise reads the interface again and declines if this did
+    /// not take.
+    async fn reassert_ap_vif_type(&self, ap_if: &str) {
+        let name = ap_if.trim();
+        if name.is_empty() {
+            return;
+        }
+        match self.iw_iftype(name).await {
+            Some(ty) if ty.eq_ignore_ascii_case("ap") => return,
+            _ => {}
+        }
+        let exec = self.effective_iw_exec();
+        let timeout = Duration::from_millis(self.config.iw_timeout_ms);
+        if let Err(e) = wifi_phy::set_ap_vif_iftype(
+            exec.as_ref(),
+            &self.config.iw_path,
+            name,
+            timeout,
+        )
+        .await
+        {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                ap_if = name,
+                error = %e,
+                "could not re-assert the AP vif type; the type gate \
+                 before the raise still applies"
+            );
+        }
+    }
+
+    /// Hand a confirmed access-point vif back to NetworkManager so
+    /// its profile can bind. The counterpart to
+    /// [`Self::hold_nm_off_ap_vif`]; called only once the type has
+    /// been read as AP, immediately before the raise.
+    async fn release_nm_onto_ap_vif(
+        &self,
+        ap_if: &str,
+        steps: &mut Vec<String>,
+    ) {
+        let name = ap_if.trim();
+        if name.is_empty() {
+            return;
+        }
+        if let Err(e) = self
+            .nmcli_output(&["device", "set", name, "managed", "yes"])
+            .await
+        {
+            steps.push(format!(
+                "warning: {name} is type AP but could not be handed back to \
+                 NetworkManager ({e}); the hotspot raise may not bind"
+            ));
+        }
+    }
+
+    async fn hold_nm_off_ap_vif(&self, ap_if: &str) {
+        let name = ap_if.trim();
+        if name.is_empty() {
+            return;
+        }
+        if let Err(e) = self
+            .nmcli_output(&["device", "set", name, "managed", "no"])
+            .await
+        {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                ap_if = name,
+                error = %e,
+                "could not hold NetworkManager off the AP vif; the type \
+                 gate before the raise still applies"
+            );
         }
     }
 
@@ -4969,6 +5099,36 @@ impl NmInner {
         parse_iw_dev_info(&raw).iftype.eq_ignore_ascii_case("ap")
     }
 
+    /// The interface type `iw` reports for `ifname` — `AP`,
+    /// `managed`, `monitor` — or `None` when `iw` gave no answer.
+    ///
+    /// [`Self::interface_is_beaconing`] answers a yes/no question
+    /// and folds every other reading into "no". The access-point
+    /// gate needs the reading itself, because what the vif turned
+    /// into is the whole diagnosis: a vif created `type __ap` that
+    /// reads back `managed` was taken by something else.
+    async fn iw_iftype(&self, ifname: &str) -> Option<String> {
+        let name = ifname.trim();
+        if name.is_empty() {
+            return None;
+        }
+        let timeout = Duration::from_millis(self.config.iw_timeout_ms);
+        let iw_exec = self.effective_iw_exec();
+        let raw = wifi_phy::iw_output(
+            iw_exec.as_ref(),
+            &self.config.iw_path,
+            &["dev", name, "info"],
+            timeout,
+        )
+        .await
+        .ok()?;
+        let ty = parse_iw_dev_info(&raw).iftype;
+        if ty.trim().is_empty() {
+            return None;
+        }
+        Some(ty)
+    }
+
     async fn wifi_scan(
         &self,
         ifname: Option<&str>,
@@ -5374,6 +5534,48 @@ impl NmInner {
         activated == 0 || written.as_secs() > activated
     }
 
+    /// Is the wired interface up and held by something that is
+    /// not NetworkManager?
+    ///
+    /// Both halves have to be true. An unmanaged device with no
+    /// carrier is a cable that genuinely is not working, and the
+    /// ordinary path should still run for it. An unmanaged device
+    /// that is carrying traffic is somebody else's — ifupdown and
+    /// dhcpcd, on a Debian host whose `[ifupdown] managed=false`
+    /// leaves the stanza in `/etc/network/interfaces` in charge.
+    ///
+    /// Both facts come from NetworkManager in one call, including
+    /// for a device it does not manage. Reading the carrier from
+    /// sysfs instead would tie this to a path no test can stand up
+    /// and would make the answer depend on the machine running it.
+    ///
+    /// Anything unreadable answers `false`, which leaves the
+    /// ordinary path in place. This exists to suppress a pointless
+    /// activation, not to become a new way to skip one.
+    async fn ethernet_is_served_outside_nm(&self, ifname: &str) -> bool {
+        let name = ifname.trim();
+        if name.is_empty() {
+            return false;
+        }
+        let Ok(raw) = self
+            .nmcli_output(&[
+                "-g",
+                "GENERAL.STATE,WIRED-PROPERTIES.CARRIER",
+                "device",
+                "show",
+                name,
+            ])
+            .await
+        else {
+            return false;
+        };
+        let mut lines = raw.lines().map(str::trim);
+        let state = lines.next().unwrap_or("");
+        let carrier = lines.next().unwrap_or("");
+        state.to_ascii_lowercase().contains("unmanaged")
+            && carrier.eq_ignore_ascii_case("on")
+    }
+
     async fn ensure_ethernet(
         &self,
         intent: &NetworkIntent,
@@ -5418,6 +5620,28 @@ impl NmInner {
                  ethernet profile"
                     .to_string(),
             );
+            return Ok(());
+        }
+        // A cable somebody else is already holding.
+        //
+        // Debian's `[ifupdown] managed=false`, beside an
+        // `iface <eth> inet dhcp` stanza, leaves the wired
+        // interface to ifupdown and dhcpcd. NetworkManager reports
+        // the device unmanaged and will not bind a profile to it,
+        // so activating one can only fail — and the failure is
+        // noise, because the interface it names is carrying
+        // traffic already. On a host reached over that cable it is
+        // also the operator's way in.
+        //
+        // Recorded and stepped over, not repaired: whose cable
+        // this is belongs to a provisioning decision, not to an
+        // apply.
+        if self.ethernet_is_served_outside_nm(&ifname).await {
+            steps.push(format!(
+                "{ifname} is carrying the network under another manager \
+                 and NetworkManager reports it unmanaged; \
+                 {NM_CON_ETHERNET} left alone"
+            ));
             return Ok(());
         }
         let props = Self::nm_ipv4_args(
@@ -5757,9 +5981,20 @@ impl NmInner {
         Ok(())
     }
 
+    /// Raise the hotspot, on `ifname` when the caller knows which
+    /// device the profile belongs to.
+    ///
+    /// Without the device pinned, `nmcli connection up` picks one
+    /// itself. A vif that NetworkManager has not finished taking
+    /// is not a candidate, so it reaches for the other wifi device
+    /// on the box — the station — which then refuses the profile
+    /// as "mismatching interface name". Naming the device here
+    /// selects the profile's own interface for this activation; it
+    /// writes nothing and moves nothing.
     async fn connection_up_hotspot_with_retries(
         &self,
         con_name: &str,
+        ifname: Option<&str>,
         steps: &mut Vec<String>,
     ) -> HotspotBringUp {
         const HOTSPOT_BRINGUP_ATTEMPTS: u32 = 4;
@@ -5770,10 +6005,11 @@ impl NmInner {
         }
         let mut last_err = String::new();
         for attempt in 1..=HOTSPOT_BRINGUP_ATTEMPTS {
-            match self
-                .nmcli_spawn_output(&["connection", "up", con_name])
-                .await
-            {
+            let mut argv: Vec<&str> = vec!["connection", "up", con_name];
+            if let Some(dev) = ifname.map(str::trim).filter(|d| !d.is_empty()) {
+                argv.extend(["ifname", dev]);
+            }
+            match self.nmcli_spawn_output(&argv).await {
                 Ok(out) if out.status.success() => {
                     if attempt > 1 {
                         steps.push(format!(
@@ -5795,6 +6031,20 @@ impl NmInner {
                     last_err = stderr.trim().to_string();
                     if is_phy_exclusive_failure(&stderr) {
                         return HotspotBringUp::PhyExclusive;
+                    }
+                    // NetworkManager refusing this profile on
+                    // this device is not a transient — whether it
+                    // reached for the wrong radio or the right one
+                    // is out of its reach. Retrying asks the same
+                    // question of the same refusal, and on a
+                    // shared phy each attempt is another shove at
+                    // the station.
+                    if is_unretryable_device_refusal(&stderr) {
+                        steps.push(format!(
+                            "{con_name} was refused on the device it \
+                             names ({last_err}); not retried"
+                        ));
+                        return HotspotBringUp::Failed;
                     }
                 }
                 Err(e) => {
@@ -6068,15 +6318,270 @@ impl NmInner {
         Ok(())
     }
 
+    /// Set the saved country again at load.
+    ///
+    /// `iw reg set` lasts only until the next boot. The operator's
+    /// country was applied when it was saved, and nothing set it
+    /// again: a restart came back on whatever regulatory domain the
+    /// operating system boots with, while the saved intent, and the
+    /// glass reading it, still named the operator's choice.
+    ///
+    /// Runs before the saved access point is raised, so the access
+    /// point comes up under the country it is meant to obey. An
+    /// intent with no country leaves the operating system's domain
+    /// as it is; a code `iw` refuses is a recorded step, and the
+    /// load continues.
+    async fn set_saved_country_at_load(
+        &self,
+        intent: &NetworkIntent,
+    ) -> Vec<String> {
+        let mut steps: Vec<String> = Vec::new();
+        self.apply_regdomain(&intent.radio_policy, &mut steps).await;
+        steps
+    }
+
+    /// Bring the saved hotspot back up at load.
+    ///
+    /// NetworkManager used to do this. The saved profile carries
+    /// autoconnect, so when the access-point vif appeared NM
+    /// activated it without anyone asking. Marking that vif
+    /// unmanaged — which is what stops NM claiming it as a station
+    /// and wedging it on "device or resource busy" — also stops
+    /// the autoconnect that raised it. A restart then left the
+    /// access point down with nothing to bring it back, and on a
+    /// headless player with no cable that access point is the only
+    /// way in.
+    ///
+    /// The saved profile is raised exactly as it stands. Its
+    /// interface is read off the profile rather than chosen here,
+    /// so nothing is retargeted onto the station radio, and its
+    /// security is neither read nor rewritten.
+    ///
+    /// Best-effort: every exit is a recorded step and the load
+    /// continues. A device whose hotspot did not come up still
+    /// serves whatever else it has.
+    async fn raise_saved_hotspot_at_load(
+        &self,
+        intent: &NetworkIntent,
+    ) -> Vec<String> {
+        let mut steps: Vec<String> = Vec::new();
+        if !intent.fallback.hotspot_enabled {
+            return steps;
+        }
+        if intent.radio_policy.flight_mode {
+            steps.push(
+                "load: flight mode is on; the saved hotspot is not raised"
+                    .to_string(),
+            );
+            return steps;
+        }
+        let hs_name = Self::hotspot_connection_name(intent);
+        if hs_name.trim().is_empty() {
+            return steps;
+        }
+        // A profile that is not there is not this path's to write.
+        // The apply owns creating one; this only restores what the
+        // operator already has.
+        if self
+            .nm_profile_field(&hs_name, "connection.id")
+            .await
+            .is_none()
+        {
+            steps.push(format!(
+                "load: no saved hotspot profile {hs_name}; nothing to raise"
+            ));
+            return steps;
+        }
+        let Some(ap_ifname) = self
+            .nm_profile_field(&hs_name, "connection.interface-name")
+            .await
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        else {
+            // An unpinned profile would be raised on whatever
+            // NetworkManager picks. Guessing one here is how an
+            // access point lands on the station radio.
+            steps.push(format!(
+                "load: saved hotspot {hs_name} names no interface; not \
+                 raising it on a guess"
+            ));
+            return steps;
+        };
+
+        let sta_ifname = self
+            .resolve_wifi_sta_ifname(Some(intent.wifi.ifname.as_str()))
+            .await
+            .unwrap_or_default();
+        let ap_on_own_vif = !sta_ifname.is_empty() && ap_ifname != sta_ifname;
+        if ap_on_own_vif {
+            // The vif does not survive a reboot, and after a
+            // restart it may be there but claimed. This creates it
+            // when absent, takes it off NetworkManager, and puts a
+            // station-typed vif back into AP mode.
+            if !self.ensure_ap_vif_present(&sta_ifname, &ap_ifname).await {
+                steps.push(format!(
+                    "load: could not make the access point vif {ap_ifname} \
+                     present; saved hotspot {hs_name} not raised"
+                ));
+                return steps;
+            }
+        }
+        if let Err(e) = self
+            .gate_ap_vif_type(&ap_ifname, ap_on_own_vif, &hs_name, &mut steps)
+            .await
+        {
+            steps.push(format!("load: {e}"));
+            return steps;
+        }
+        match self
+            .connection_up_hotspot_with_retries(
+                &hs_name,
+                Some(ap_ifname.as_str()),
+                &mut steps,
+            )
+            .await
+        {
+            HotspotBringUp::Up => steps.push(format!(
+                "load: raised the saved hotspot {hs_name} on {ap_ifname}"
+            )),
+            HotspotBringUp::PhyExclusive => steps.push(format!(
+                "load: this radio will not carry {hs_name} beside what is \
+                 already on it"
+            )),
+            HotspotBringUp::Failed => steps
+                .push(format!("load: saved hotspot {hs_name} did not come up")),
+        }
+        steps
+    }
+
+    /// The access point may not be raised on a station.
+    ///
+    /// When the hotspot has its own virtual interface, that vif
+    /// was created `type __ap`. If it reads back anything else,
+    /// NetworkManager claimed it before the profile bound and
+    /// wpa_supplicant set it up as a station. Raising on it would
+    /// put a second `managed` interface on a phy that allows one,
+    /// and the kernel's refusal — "device or resource busy" —
+    /// would be retried until NetworkManager gave up.
+    ///
+    /// So the type is read, and a wrong type stops the raise
+    /// instead of feeding it. The vif is not re-typed here and the
+    /// saved profile is not retargeted onto the station radio:
+    /// this reports what it found and leaves the repair to a path
+    /// that is allowed to make it.
+    ///
+    /// Every path that raises the hotspot goes through this — the
+    /// apply, and the raise at load — so there is one gate rather
+    /// than one per caller.
+    async fn gate_ap_vif_type(
+        &self,
+        ifname: &str,
+        ap_on_own_vif: bool,
+        hotspot_name: &str,
+        steps: &mut Vec<String>,
+    ) -> Result<(), PluginError> {
+        // The access point may not be raised on a station.
+        //
+        // When the hotspot has its own virtual interface, that vif
+        // was created `type __ap`. If it reads back anything else,
+        // NetworkManager claimed it before the profile bound and
+        // wpa_supplicant set it up as a station. Raising here would
+        // put a second `managed` interface on a phy that allows
+        // one, and the kernel's refusal — "device or resource
+        // busy" — would be retried until NetworkManager gave up.
+        //
+        // So the type is read, and a wrong type stops the raise
+        // instead of feeding it. The vif is not re-typed and the
+        // saved profile is not retargeted onto the station radio:
+        // this reports what it found and leaves the repair to a
+        // path that is allowed to make it.
+        if ap_on_own_vif && !ifname.is_empty() {
+            match self.iw_iftype(ifname).await {
+                Some(ty) if ty.eq_ignore_ascii_case("ap") => {}
+                Some(ty) => {
+                    steps.push(format!(
+                        "hotspot {hotspot_name} not raised: {ifname} is \
+                         type {ty}, not AP — NetworkManager claimed the \
+                         vif before the profile bound"
+                    ));
+                    return Err(PluginError::Permanent(format!(
+                        "access point vif {ifname} is type {ty}, not AP; \
+                         refusing to raise the hotspot on a station \
+                         interface"
+                    )));
+                }
+                None => {
+                    steps.push(format!(
+                        "hotspot {hotspot_name} not raised: could not read \
+                         the interface type of {ifname}; the access point \
+                         is only raised on a confirmed AP interface"
+                    ));
+                    return Err(PluginError::Transient(format!(
+                        "could not read the interface type of access point \
+                         vif {ifname}"
+                    )));
+                }
+            }
+            // Confirmed AP. Hand it back so the profile can bind;
+            // the window this reopens is the activation itself.
+            self.release_nm_onto_ap_vif(ifname, steps).await;
+            // Nothing is waited for here. On this radio the vif
+            // reaches `disconnected` as a *result* of the
+            // activation, not before it, so a readiness gate on
+            // that state is a gate that never opens — five
+            // seconds of silence and then a refusal. The device is
+            // named on the activation instead, which is what stops
+            // NetworkManager offering the profile to the station.
+        }
+
+        Ok(())
+    }
+
+    /// Write the hotspot profile and raise it on `wifi_ifname`.
+    ///
+    /// `ap_on_own_vif` is `true` when the access point has its own
+    /// virtual interface on the station's phy — the both-at-once
+    /// shape, and the only one where the vif can be claimed out
+    /// from under the profile before it binds. It is passed in
+    /// rather than inferred from interface names: a one-role
+    /// access point occupies the station radio itself, which reads
+    /// `managed` until NetworkManager activates the AP profile on
+    /// it, so gating that on a prior AP type would refuse every
+    /// one-role raise.
     async fn ensure_wifi_ap(
         &self,
         wifi_ifname: &str,
         wifi: &WifiIntent,
         ap_psk: Option<&str>,
         hotspot_name: &str,
+        ap_on_own_vif: bool,
         steps: &mut Vec<String>,
     ) -> Result<(), PluginError> {
         let ifname = wifi_ifname.trim();
+        // No interface to put an access point on.
+        //
+        // A device with no AP-capable radio resolves no AP
+        // interface, and the profile write below would ask nmcli
+        // for `ifname ""`. nmcli refuses that, the refusal became
+        // a Permanent error, and the error took the whole apply
+        // with it — so the operator turning the access point on
+        // got 400 Bad Request and could not record the preference
+        // at all.
+        //
+        // Their preference is theirs to hold whether or not this
+        // box can honour it today: the intent is saved before the
+        // apply runs, a radio may arrive later, and the same
+        // settings travel to other hardware. So this records what
+        // it found and lets the rest of the apply finish, exactly
+        // as the empty-SSID case below already does.
+        if ifname.is_empty() {
+            steps.push(format!(
+                "hotspot {hotspot_name} enabled but this device has no \
+                 interface that can carry an access point; nothing raised \
+                 and the preference is kept"
+            ));
+            return Ok(());
+        }
         // Empty `ap_ssid` under an enabled hotspot is soft-recovered
         // to `default_ap_ssid()` (a per-unit MAC-derived SSID).
         // Prior behaviour was a hard permanent error which cascaded
@@ -6264,8 +6769,15 @@ impl NmInner {
             steps.push(format!("added hotspot profile {hotspot_name}"));
         }
 
+        self.gate_ap_vif_type(ifname, ap_on_own_vif, hotspot_name, steps)
+            .await?;
+
         match self
-            .connection_up_hotspot_with_retries(hotspot_name, steps)
+            .connection_up_hotspot_with_retries(
+                hotspot_name,
+                Some(ifname),
+                steps,
+            )
             .await
         {
             HotspotBringUp::Up => {}
@@ -6296,6 +6808,7 @@ impl NmInner {
         wifi: &WifiIntent,
         ap_psk: Option<&str>,
         fallback: &FallbackIntent,
+        ap_on_own_vif: bool,
         steps: &mut Vec<String>,
     ) -> Result<(), PluginError> {
         if !fallback.hotspot_enabled {
@@ -6308,8 +6821,15 @@ impl NmInner {
             fallback: fallback.clone(),
             radio_policy: RadioPolicy::default(),
         });
-        self.ensure_wifi_ap(wifi_ifname, wifi, ap_psk, &hs_name, steps)
-            .await
+        self.ensure_wifi_ap(
+            wifi_ifname,
+            wifi,
+            ap_psk,
+            &hs_name,
+            ap_on_own_vif,
+            steps,
+        )
+        .await
     }
 
     async fn resolved_ethernet_ifname(
@@ -6848,7 +7368,15 @@ impl NmInner {
         hs_name: &str,
         steps: &mut Vec<String>,
     ) -> Result<bool, PluginError> {
+        // No name, nothing to raise. Silence here reads in the
+        // log as recovery having run and decided nothing, which is
+        // the one thing the operator cannot act on.
         if hs_name.trim().is_empty() {
+            steps.push(
+                "critical: no hotspot connection name is configured; \
+                 no access point raised"
+                    .to_string(),
+            );
             return Ok(false);
         }
         // `fallback.hotspot_enabled == false` is the operator
@@ -6875,7 +7403,20 @@ impl NmInner {
         // down without eth in intent" cases. Now: raise when the
         // supervisor said Offline AND no declared uplink is
         // serving.
+        //
+        // Declining here is the common case and the correct one:
+        // a device that is reachable does not need an access point
+        // forced onto it. But a decline that says nothing is
+        // indistinguishable in the log from recovery failing, and
+        // the supervisor reaching this point at all means something
+        // scored the device Offline. Naming the uplink that is
+        // serving is what tells those two apart.
         if !self.no_serviceable_uplink(intent).await? {
+            steps.push(
+                "critical: a declared uplink is still serving; no access \
+                 point raised"
+                    .to_string(),
+            );
             return Ok(false);
         }
 
@@ -6990,7 +7531,7 @@ impl NmInner {
             raise_name
         ));
         Ok(matches!(
-            self.connection_up_hotspot_with_retries(&raise_name, steps)
+            self.connection_up_hotspot_with_retries(&raise_name, None, steps)
                 .await,
             HotspotBringUp::Up
         ))
@@ -7753,6 +8294,7 @@ impl NmInner {
                                 &wifi_for_ap,
                                 ap_psk,
                                 &intent.fallback,
+                                concurrent_vif,
                                 &mut steps,
                             )
                             .await
@@ -7821,6 +8363,7 @@ impl NmInner {
                     &intent.wifi,
                     ap_psk,
                     hs_name.as_str(),
+                    false,
                     &mut steps,
                 )
                 .await?;
@@ -8130,6 +8673,24 @@ impl Plugin for NetworkPlugin {
                 .store(intent.radio_policy.flight_mode, Relaxed);
             self.wifi_preference_enabled
                 .store(intent.radio_policy.wifi_enabled_pref, Relaxed);
+            // The saved country does not outlive a boot on its own.
+            // Set it again before the access point comes up.
+            for step in self.inner.set_saved_country_at_load(&intent).await {
+                if step.starts_with("warning:") {
+                    tracing::warn!(plugin = PLUGIN_NAME, step = %step, "load: country");
+                } else {
+                    tracing::info!(plugin = PLUGIN_NAME, step = %step, "load: country");
+                }
+            }
+            // The saved access point comes back by itself or it
+            // does not come back at all — nothing else on the box
+            // raises it now that its vif is unmanaged. Runs before
+            // the supervisor starts so a device that has no other
+            // way in is reachable by the time anything is watching
+            // it.
+            for step in self.inner.raise_saved_hotspot_at_load(&intent).await {
+                tracing::info!(plugin = PLUGIN_NAME, step = %step, "load: hotspot");
+            }
             self.spawn_supervisor().await;
             if let Some(rx) = self.supervisor_view_rx.clone() {
                 self.spawn_supervisor_emitter(rx);
@@ -9339,6 +9900,28 @@ fn is_phy_exclusive_failure(stderr: &str) -> bool {
         && (s.contains("flags (up)") || s.contains("set interface"))
 }
 
+/// NetworkManager will not activate this profile on this device,
+/// and asking again will not change that.
+///
+/// Three wordings, one meaning. Two say the device it reached for
+/// is not the one the profile names — "mismatching interface
+/// name" and "not compatible with device" — which on a box whose
+/// only other wifi device is the station means it reached for the
+/// station. The third says the device the profile *does* name has
+/// been placed beyond NetworkManager's reach: "because device is
+/// strictly unmanaged", which is what a `keyfile.unmanaged-devices`
+/// rule produces and what no hand-back can lift.
+///
+/// None of them is transient. Each retry asks the same question
+/// of the same refusal, and on a shared phy every attempt is
+/// another shove at the radio the operator is using.
+fn is_unretryable_device_refusal(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("mismatching interface name")
+        || s.contains("not compatible with device")
+        || s.contains("strictly unmanaged")
+}
+
 fn first_ethernet_device(devices: &[DeviceRow]) -> Option<String> {
     devices
         .iter()
@@ -10054,6 +10637,8 @@ async fn probe_observations(
 ) -> supervisor::SupervisorObservations {
     let nm_connectivity =
         probe_nm_connectivity(nmcli_exec, nmcli_path, nmcli_timeout).await;
+    let nm_managed_uplink =
+        probe_nm_managed_uplink(nmcli_exec, nmcli_path, nmcli_timeout).await;
     let (probe_http_code, probe_effective_url) = match (probe_kind, probe_url) {
         (supervisor::ProbeKind::Off, _) | (_, None) => (None, None),
         (_, Some(url)) => {
@@ -10069,7 +10654,62 @@ async fn probe_observations(
         probe_effective_url,
         ethernet_carrier_up,
         wifi_associated,
+        nm_managed_uplink,
     }
+}
+
+/// Does NetworkManager hold an uplink of its own?
+///
+/// `nmcli general connectivity` reports on the devices NM manages.
+/// Where another manager owns the working interface — Debian's
+/// `[ifupdown] managed=false` leaves an `iface … inet dhcp` cable
+/// to dhcpcd, and NM reports the device `unmanaged` — NM has
+/// nothing to score and answers `none`. Without this probe the
+/// supervisor reads that `none` as "the host is unreachable" while
+/// the host is in fact routing.
+///
+/// Loopback is excluded deliberately: NM reports `lo` as connected
+/// on every host, so counting it would make this true everywhere
+/// and the distinction worthless.
+///
+/// Any failure answers `false`. That is consistent rather than
+/// merely safe: a dispatch that fails here fails in
+/// [`probe_nm_connectivity`] too, leaving `nm_connectivity` at
+/// `None`, which never reaches the `none` arm this flag guards.
+async fn probe_nm_managed_uplink(
+    exec: &dyn PrivilegedExec,
+    nmcli_path: &str,
+    timeout: Duration,
+) -> bool {
+    let Ok(out) = exec
+        .dispatch(
+            nmcli_path,
+            &["-t", "-f", "TYPE,STATE", "device", "status"],
+            timeout,
+        )
+        .await
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    raw.lines().any(nm_device_row_is_managed_uplink)
+}
+
+/// One `nmcli -t -f TYPE,STATE device status` row: `wifi:connected`,
+/// `ethernet:unmanaged`, `loopback:connected (externally)`.
+///
+/// `connected` is matched as a prefix because NM qualifies it —
+/// `connected (externally)`, `connected (site only)` — and every
+/// such qualification still means NM is holding that device.
+fn nm_device_row_is_managed_uplink(row: &str) -> bool {
+    let mut fields = row.split(':');
+    let ty = fields.next().unwrap_or("").trim();
+    let state = fields.next().unwrap_or("").trim();
+    !ty.eq_ignore_ascii_case("loopback")
+        && state.to_ascii_lowercase().starts_with("connected")
 }
 
 async fn probe_nm_connectivity(
@@ -10582,6 +11222,36 @@ hotspot_fallback = true
         let (code, url) = parse_http_probe_metrics("not-a-code");
         assert_eq!(code, None);
         assert!(url.is_none());
+    }
+
+    /// `nmcli -t -f TYPE,STATE device status` on a host where
+    /// another manager owns the cable. Loopback reads
+    /// `connected (externally)` on every host; counting it would
+    /// make `nm_managed_uplink` true everywhere and leave the
+    /// `none` arm exactly as it was.
+    #[test]
+    fn nm_managed_uplink_ignores_loopback_and_unmanaged_devices() {
+        let nm_holds_no_uplink = [
+            "loopback:connected (externally)",
+            "wifi:disconnected",
+            "wifi-p2p:disconnected",
+            "wifi:unavailable",
+            "ethernet:unmanaged",
+        ];
+        assert!(
+            !nm_holds_no_uplink
+                .iter()
+                .copied()
+                .any(nm_device_row_is_managed_uplink),
+            "NM holds no uplink here — only loopback is connected"
+        );
+
+        // The same host once NM is actually carrying the cable.
+        assert!(nm_device_row_is_managed_uplink("ethernet:connected"));
+        // NM qualifies the state and still holds the device.
+        assert!(nm_device_row_is_managed_uplink(
+            "ethernet:connected (site only)"
+        ));
     }
 
     #[test]
@@ -11763,6 +12433,14 @@ exit 0\n",
         p.inner_mut().config = PluginConfig::defaults();
         p.inner_mut().config.nmcli_path =
             nmcli_path.to_string_lossy().to_string();
+        // No `iw` on the box under test. Without this the apply
+        // reads the build host's own radio, picks whatever
+        // interface it finds, and this test — which is about a
+        // saved station and its secret surviving — starts
+        // depending on whether the machine running it has a
+        // Wi-Fi card. The neighbouring fixtures do the same.
+        p.inner_mut().config.iw_path =
+            dir.path().join("no-such-iw").to_string_lossy().into_owned();
 
         let psk_path = p.sta_psk_path().expect("sta_psk_path");
         std::fs::write(&psk_path, "supersecret").expect("write PSK");
@@ -12010,6 +12688,7 @@ exit 0\n",
             .inner_mut()
             .connection_up_hotspot_with_retries(
                 "evo-network-hotspot",
+                None,
                 &mut steps,
             )
             .await;
@@ -12071,6 +12750,7 @@ exit 0\n",
             .inner_mut()
             .connection_up_hotspot_with_retries(
                 "evo-network-hotspot",
+                None,
                 &mut steps,
             )
             .await;
@@ -14540,6 +15220,150 @@ exit 0\n",
         p
     }
 
+    /// Recovery declining is not the same as recovery failing, and
+    /// a step list cannot say which if the decline says nothing.
+    ///
+    /// Reaching this function at all means the supervisor scored
+    /// the device Offline for longer than its grace. Coming back
+    /// with `raised=false` and an empty list reads as "recovery
+    /// ran and nothing happened" — which is the one outcome an
+    /// operator cannot act on, because it is indistinguishable
+    /// from the access point having failed to come up.
+    #[tokio::test]
+    async fn recovery_says_why_it_declined_with_no_hotspot_name() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", false);
+        let p = recovery_plugin(dir.path(), &nmcli);
+
+        let mut intent = NetworkIntent::default();
+        intent.fallback.hotspot_enabled = true;
+
+        let mut steps = Vec::new();
+        let raised = p
+            .try_critical_open_hotspot_recovery(&intent, "   ", &mut steps)
+            .await
+            .expect("recovery");
+
+        assert!(!raised, "nothing can be raised without a name");
+        assert!(!steps.is_empty(), "a decline must not be silent: {steps:?}");
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.contains("critical:") && s.contains("name")),
+            "the decline must name its reason: {steps:?}"
+        );
+    }
+
+    /// The common decline, and the correct one: this device is
+    /// reachable, so recovery does not force an access point onto
+    /// it. It still has to say so — a cable that is up and a
+    /// recovery that broke look identical in an empty list.
+    #[tokio::test]
+    async fn recovery_says_why_it_declined_with_an_uplink_still_serving() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        // A wifi device NetworkManager reports connected is a
+        // serviceable uplink. Ethernet stays out of the intent so
+        // the answer comes from the mock rather than from whatever
+        // interfaces the machine running this happens to have.
+        let nmcli = recovery_nmcli_mock(dir.path(), "connected", false);
+        let p = recovery_plugin(dir.path(), &nmcli);
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+        intent.fallback.hotspot_enabled = true;
+
+        let mut steps = Vec::new();
+        let raised = p
+            .try_critical_open_hotspot_recovery(
+                &intent,
+                "evo-network-hotspot",
+                &mut steps,
+            )
+            .await
+            .expect("recovery");
+
+        assert!(!raised, "a served device must not be forced an AP");
+        assert!(!steps.is_empty(), "a decline must not be silent: {steps:?}");
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.contains("critical:") && s.contains("serving")),
+            "the decline must name its reason: {steps:?}"
+        );
+        // Declining means declining. Nothing is raised and the
+        // saved profile is not touched on the way past.
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            !calls.contains("connection up")
+                && !calls.contains("connection modify"),
+            "a decline must raise and rewrite nothing: {calls}"
+        );
+    }
+
+    /// The operator can turn the access point on even where no
+    /// radio can carry one.
+    ///
+    /// A device with no AP-capable interface resolves no AP
+    /// interface, and the profile write asked nmcli for
+    /// `ifname ""`. nmcli refuses that, the refusal was a
+    /// Permanent error, and it took the whole apply with it — so
+    /// the gesture came back 400 Bad Request and the preference
+    /// could not be recorded at all.
+    ///
+    /// The preference is the operator's to hold whether or not
+    /// this box can honour it today. The apply records what it
+    /// found and finishes.
+    #[tokio::test]
+    async fn an_access_point_with_no_interface_is_recorded_not_refused() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", false);
+        let p = recovery_plugin(dir.path(), &nmcli);
+
+        let wifi = WifiIntent {
+            ap_ssid: "evo-4466".to_string(),
+            ..WifiIntent::default()
+        };
+        let fallback = FallbackIntent {
+            hotspot_enabled: true,
+            ..FallbackIntent::default()
+        };
+
+        let mut steps = Vec::new();
+        let got = p
+            .ensure_hotspot_profile(
+                "", &wifi, None, &fallback, false, &mut steps,
+            )
+            .await;
+
+        assert!(
+            got.is_ok(),
+            "no AP interface must not fail the apply: {got:?}"
+        );
+        assert!(
+            steps.iter().any(|s| s.contains(
+                "no \
+                 interface that can carry an access point"
+            ) || (s.contains("no")
+                && s.contains("access point"))),
+            "the apply must say what it found: {steps:?}"
+        );
+
+        // And nothing was written. A profile bound to an empty
+        // interface is the thing nmcli refused.
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            !calls.contains("connection add")
+                && !calls.contains("connection up"),
+            "no profile may be written for an interface that does not \
+             exist: {calls}"
+        );
+    }
+
     /// A beaconing radio is not a way in.
     ///
     /// NetworkManager reports a device carrying an access point
@@ -14727,6 +15551,780 @@ exit 0\n",
     /// access point would leave that device dark with a usable
     /// radio sitting idle — so the question is whether any radio
     /// can, not whether all of them can.
+    /// Drive `ensure_hotspot_profile` with the access point on its
+    /// own vif and `iw` reporting `iftype` for that vif. Returns
+    /// the result and everything nmcli was asked to do.
+    async fn raise_hotspot_with_ap_vif_iftype(
+        iftype: &str,
+    ) -> (Result<(), PluginError>, Vec<String>, String) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", true);
+        let iw = iw_mock(dir.path(), iftype, "evo-4466");
+
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+
+        // The station holds wlan0; the access point has its own
+        // vif. This is the both-at-once shape, and the only shape
+        // where the vif can be claimed out from under the profile.
+        let wifi = WifiIntent {
+            ifname: "wlan0".to_string(),
+            ap_ssid: "evo-4466".to_string(),
+            ..WifiIntent::default()
+        };
+        let fallback = FallbackIntent {
+            hotspot_enabled: true,
+            ..FallbackIntent::default()
+        };
+
+        let mut steps = Vec::new();
+        let got = p
+            .ensure_hotspot_profile(
+                "ap0", &wifi, None, &fallback, true, &mut steps,
+            )
+            .await;
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        (got, steps, calls)
+    }
+
+    /// The raise has to be wired into `load`, not merely exist.
+    ///
+    /// The defect this row fixes was not a broken raise — it was
+    /// no raise at all: a restart read the intent, started the
+    /// supervisor, and left the access point down. The tests
+    /// either side of this one call
+    /// `raise_saved_hotspot_at_load` directly and stay green
+    /// whether or not anything ever calls it, and `load` cannot be
+    /// driven from here without a whole `LoadContext` and a live
+    /// supervisor. So the wiring is pinned where it lives.
+    #[test]
+    fn load_raises_the_saved_hotspot() {
+        let src = include_str!("lib.rs");
+        let load_at = src
+            .find("    fn load<'a>(")
+            .expect("the plugin must have a load");
+        // `load` runs to the next item at impl depth.
+        let body_end = src[load_at + 1..]
+            .find("\n    fn ")
+            .map(|i| load_at + 1 + i)
+            .unwrap_or(src.len());
+        let body = &src[load_at..body_end];
+        assert!(
+            body.contains("raise_saved_hotspot_at_load(&intent)"),
+            "load must raise the saved hotspot: nothing else does now \
+             that the access point's vif is unmanaged and \
+             NetworkManager no longer autoconnects it"
+        );
+    }
+
+    /// The saved country has to be set again by `load`, after the
+    /// intent is read and before the access point is raised or the
+    /// supervisor starts.
+    ///
+    /// `iw reg set` does not outlive a boot, and nothing else sets
+    /// the country again: a restart came back on the operating
+    /// system's domain while the intent still named the operator's.
+    /// `load` cannot be driven from here, so the wiring and its
+    /// order are pinned where they live, as for the hotspot raise.
+    #[test]
+    fn load_sets_the_saved_country_before_the_hotspot_and_the_supervisor() {
+        let src = include_str!("lib.rs");
+        let load_at = src
+            .find("    fn load<'a>(")
+            .expect("the plugin must have a load");
+        let body_end = src[load_at + 1..]
+            .find("\n    fn ")
+            .map(|i| load_at + 1 + i)
+            .unwrap_or(src.len());
+        let body = &src[load_at..body_end];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("load must call {needle}"))
+        };
+        let intent = at("self.load_intent().await?");
+        let country = at("set_saved_country_at_load(&intent)");
+        let hotspot = at("raise_saved_hotspot_at_load(&intent)");
+        let supervisor = at("self.spawn_supervisor().await");
+        assert!(
+            intent < country,
+            "the country is the saved one, so it is set after the intent is read"
+        );
+        assert!(
+            country < hotspot,
+            "the access point must come up under the saved country"
+        );
+        assert!(
+            hotspot < supervisor,
+            "nothing may watch the device before its country and access point are set"
+        );
+    }
+
+    /// A restart sets the saved country, once, even where the
+    /// operating system boots on another one.
+    #[tokio::test]
+    async fn a_restart_sets_the_saved_country_once() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (nmcli, iw) = load_raise_mocks(dir.path(), "ap0");
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+
+        // The operating system boots on another country; the
+        // operator saved US.
+        let intent = NetworkIntent {
+            radio_policy: RadioPolicy {
+                country: "us".to_string(),
+                ..RadioPolicy::default()
+            },
+            ..NetworkIntent::default()
+        };
+
+        let steps = p.set_saved_country_at_load(&intent).await;
+        let calls = std::fs::read_to_string(dir.path().join("calls.log"))
+            .unwrap_or_default();
+        let sets: Vec<&str> = calls
+            .lines()
+            .filter(|l| l.starts_with("iw reg set"))
+            .collect();
+
+        assert_eq!(
+            sets,
+            vec!["iw reg set US"],
+            "the saved country is set exactly once, upper-cased: {calls}"
+        );
+        assert!(
+            !calls.lines().any(|l| l.starts_with("nmcli")),
+            "setting the country touches no connection: {calls}"
+        );
+        assert_eq!(steps, vec!["regulatory domain set to US".to_string()]);
+    }
+
+    /// An intent with no country leaves the operating system's
+    /// domain as it is: nothing is set at load.
+    #[tokio::test]
+    async fn a_restart_with_no_saved_country_leaves_the_domain_alone() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (nmcli, iw) = load_raise_mocks(dir.path(), "ap0");
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+
+        let steps =
+            p.set_saved_country_at_load(&NetworkIntent::default()).await;
+        let calls = std::fs::read_to_string(dir.path().join("calls.log"))
+            .unwrap_or_default();
+
+        assert!(calls.is_empty(), "no country, no call: {calls}");
+        assert!(steps.is_empty(), "no country, no step: {steps:?}");
+    }
+
+    /// A rig for the raise at load: an `nmcli` that knows one
+    /// saved hotspot pinned to `ap0`, and an `iw` that starts the
+    /// vif as a station and turns it into an access point only
+    /// when something actually re-types it. Both append to one log.
+    fn load_raise_mocks(dir: &Path, ap_iface: &str) -> (PathBuf, PathBuf) {
+        let log = dir.join("calls.log");
+        let state = dir.join("ap-iftype");
+        let nmcli = dir.join("nmcli-load.sh");
+        std::fs::write(
+            &nmcli,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"nmcli $*\" >> \"{log}\"\n\
+case \"$*\" in\n\
+  \"-g connection.id connection show evo-network-hotspot\")\n\
+      echo evo-network-hotspot ;;\n\
+  \"-g connection.interface-name connection show evo-network-hotspot\")\n\
+      echo {ap_iface} ;;\n\
+esac\n\
+exit 0\n",
+                log = log.display(),
+                ap_iface = ap_iface,
+            ),
+        )
+        .expect("write nmcli mock");
+        let iw = dir.join("iw-load.sh");
+        std::fs::write(
+            &iw,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"iw $*\" >> \"{log}\"\n\
+[ -f \"{state}\" ] || echo managed > \"{state}\"\n\
+if [ \"$1\" = \"dev\" ] && [ \"$3\" = \"set\" ] && [ \"$4\" = \"type\" ]; then\n\
+  echo AP > \"{state}\"; exit 0\n\
+fi\n\
+TY=\"$(cat \"{state}\")\"\n\
+if [ \"$1\" = \"dev\" ] && [ -z \"$2\" ]; then\n\
+  printf 'phy#0\\n\\tInterface wlan0\\n\\t\\tifindex 3\\n\\t\\ttype managed\\n\\tInterface {ap_iface}\\n\\t\\tifindex 4\\n\\t\\ttype %s\\n' \"$TY\"\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = \"dev\" ] && [ \"$3\" = \"info\" ]; then\n\
+  printf 'Interface %s\\n\\tifindex 8\\n\\taddr aa:11:22:33:44:66\\n\\ttype %s\\n' \"$2\" \"$TY\"\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+                log = log.display(),
+                state = state.display(),
+                ap_iface = ap_iface,
+            ),
+        )
+        .expect("write iw mock");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for f in [&nmcli, &iw] {
+                std::fs::set_permissions(
+                    f,
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .expect("chmod mock");
+            }
+        }
+        (nmcli, iw)
+    }
+
+    /// A restart brings the saved access point back.
+    ///
+    /// NetworkManager used to raise it: the profile autoconnects
+    /// and NM activated it when the vif appeared. Marking that vif
+    /// unmanaged — which is what stops NM claiming it as a station
+    /// and wedging it busy — also stops that autoconnect. Without
+    /// a raise at load a restart leaves the access point down with
+    /// nothing to bring it back, which on a headless player with
+    /// no cable is the only way in.
+    #[tokio::test]
+    async fn a_restart_raises_the_saved_hotspot_on_its_own_vif() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (nmcli, iw) = load_raise_mocks(dir.path(), "ap0");
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+
+        let intent = NetworkIntent {
+            wifi: WifiIntent {
+                ifname: "wlan0".to_string(),
+                ap_ssid: "evo-4466".to_string(),
+                ..WifiIntent::default()
+            },
+            fallback: FallbackIntent {
+                hotspot_enabled: true,
+                ..FallbackIntent::default()
+            },
+            ..NetworkIntent::default()
+        };
+
+        let steps = p.raise_saved_hotspot_at_load(&intent).await;
+        let calls = std::fs::read_to_string(dir.path().join("calls.log"))
+            .unwrap_or_default();
+
+        assert!(
+            calls.contains("nmcli connection up evo-network-hotspot"),
+            "the saved hotspot must be raised at load: {calls}"
+        );
+        assert!(
+            steps.iter().any(|s| s.contains("raised the saved hotspot")),
+            "the raise must be recorded: {steps:?}"
+        );
+        // Raised as it stands. The interface came off the profile,
+        // so the access point is not moved onto the station radio,
+        // and the profile's security is neither read nor written.
+        assert!(
+            !calls.contains("connection modify"),
+            "the saved profile must not be rewritten at load: {calls}"
+        );
+        assert!(
+            !calls.contains("wifi-sec"),
+            "the profile's security must not be touched at load: {calls}"
+        );
+        assert!(
+            !calls.contains("wlan0 managed") && !calls.contains("up wlan0"),
+            "the hotspot must not be retargeted onto the station: {calls}"
+        );
+    }
+
+    /// The vif is found a station after a restart, and is put back
+    /// into AP mode before the profile binds — not raised on a
+    /// station, and not left down either.
+    #[tokio::test]
+    async fn a_restart_retypes_a_claimed_vif_before_raising() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (nmcli, iw) = load_raise_mocks(dir.path(), "ap0");
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+
+        let intent = NetworkIntent {
+            wifi: WifiIntent {
+                ifname: "wlan0".to_string(),
+                ap_ssid: "evo-4466".to_string(),
+                ..WifiIntent::default()
+            },
+            fallback: FallbackIntent {
+                hotspot_enabled: true,
+                ..FallbackIntent::default()
+            },
+            ..NetworkIntent::default()
+        };
+        let _ = p.raise_saved_hotspot_at_load(&intent).await;
+
+        let calls: Vec<String> =
+            std::fs::read_to_string(dir.path().join("calls.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect();
+        let idx = |needle: &str| {
+            calls
+                .iter()
+                .position(|c| c.starts_with(needle))
+                .unwrap_or_else(|| panic!("missing {needle}: {calls:?}"))
+        };
+        let hold = idx("nmcli device set ap0 managed no");
+        let retype = idx("iw dev ap0 set type __ap");
+        let back = idx("nmcli device set ap0 managed yes");
+        let up = idx("nmcli connection up evo-network-hotspot");
+        assert!(
+            hold < retype && retype < back && back < up,
+            "order must be hold, retype, hand back, raise: {calls:?}"
+        );
+        // And the raise follows the hand-back directly. This
+        // radio reaches `disconnected` as a result of the
+        // activation, not before it, so anything that waits on
+        // the device state here is a wait that never ends.
+        assert_eq!(
+            up,
+            back + 1,
+            "nothing may come between the hand-back and the raise: \
+             {calls:?}"
+        );
+        // The activation names the device the profile names. Left
+        // to choose, NetworkManager reaches for the station and
+        // refuses its own profile as a mismatched interface.
+        assert_eq!(
+            calls[up], "nmcli connection up evo-network-hotspot ifname ap0",
+            "the raise must name ap0: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("wlp0s20f3")
+                || c.contains("up evo-network-hotspot ifname wlan0")),
+            "the hotspot must never be offered to the station: {calls:?}"
+        );
+    }
+
+    /// A device the hand-back cannot reach is not a retry either.
+    ///
+    /// `keyfile.unmanaged-devices` puts a device beyond
+    /// NetworkManager's own API: the hand-back reports success and
+    /// the activation is still refused, "because device is
+    /// strictly unmanaged". Asking four times does not lift it.
+    #[tokio::test]
+    async fn a_strictly_unmanaged_refusal_is_not_retried() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = dir.path().join("calls.log");
+        let nmcli = dir.path().join("nmcli-strict.sh");
+        std::fs::write(
+            &nmcli,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"nmcli $*\" >> \"{log}\"\n\
+case \"$*\" in\n\
+  \"connection up\"*)\n\
+      echo \"Error: Connection 'evo-network-hotspot' is not available on device ap0 because device is strictly unmanaged\" >&2\n\
+      exit 4 ;;\n\
+esac\n\
+exit 0\n",
+                log = log.display()
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        let mut steps = Vec::new();
+        let verdict = p
+            .inner_mut()
+            .connection_up_hotspot_with_retries(
+                "evo-network-hotspot",
+                Some("ap0"),
+                &mut steps,
+            )
+            .await;
+
+        assert_eq!(verdict, HotspotBringUp::Failed);
+        let ups = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("connection up"))
+            .count();
+        assert_eq!(ups, 1, "a strictly unmanaged device is asked once");
+        assert!(
+            steps.iter().any(|s| s.contains("not retried")),
+            "the refusal must say why it stopped: {steps:?}"
+        );
+    }
+
+    /// A mismatch on the station radio is not a retry.
+    ///
+    /// When the access-point vif is not a candidate,
+    /// NetworkManager reaches for the other wifi device on the box
+    /// and then refuses its own profile — "device wlp… not
+    /// available because profile is not compatible with device
+    /// (mismatching interface name)". Asking three more times asks
+    /// the same wrong radio, and on a shared phy each attempt is
+    /// another shove at the station the operator is using.
+    #[tokio::test]
+    async fn a_device_mismatch_is_not_retried() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = dir.path().join("calls.log");
+        let nmcli = dir.path().join("nmcli-mismatch.sh");
+        std::fs::write(
+            &nmcli,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"nmcli $*\" >> \"{log}\"\n\
+case \"$*\" in\n\
+  \"connection up\"*)\n\
+      echo 'Error: Connection activation failed: device wlp0s20f3 not available because profile is not compatible with device (mismatching interface name).' >&2\n\
+      exit 4 ;;\n\
+esac\n\
+exit 0\n",
+                log = log.display()
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        let mut steps = Vec::new();
+        let verdict = p
+            .inner_mut()
+            .connection_up_hotspot_with_retries(
+                "evo-network-hotspot",
+                Some("ap0"),
+                &mut steps,
+            )
+            .await;
+
+        assert_eq!(verdict, HotspotBringUp::Failed);
+        let ups = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("connection up"))
+            .count();
+        assert_eq!(
+            ups, 1,
+            "a mismatched device must be asked once, not four times"
+        );
+        assert!(
+            steps.iter().any(|s| s.contains("not retried")),
+            "the refusal must say why it stopped: {steps:?}"
+        );
+    }
+
+    /// Flight mode is still flight mode at load.
+    #[tokio::test]
+    async fn a_restart_in_flight_mode_raises_nothing() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (nmcli, iw) = load_raise_mocks(dir.path(), "ap0");
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+
+        let intent = NetworkIntent {
+            wifi: WifiIntent {
+                ifname: "wlan0".to_string(),
+                ap_ssid: "evo-4466".to_string(),
+                ..WifiIntent::default()
+            },
+            fallback: FallbackIntent {
+                hotspot_enabled: true,
+                ..FallbackIntent::default()
+            },
+            radio_policy: RadioPolicy {
+                flight_mode: true,
+                ..RadioPolicy::default()
+            },
+            ..NetworkIntent::default()
+        };
+        let _ = p.raise_saved_hotspot_at_load(&intent).await;
+        let calls = std::fs::read_to_string(dir.path().join("calls.log"))
+            .unwrap_or_default();
+        assert!(
+            !calls.contains("connection up"),
+            "flight mode must raise nothing: {calls}"
+        );
+    }
+
+    /// An `nmcli` and an `iw` that append to one log, so the order
+    /// of calls across the two is visible. `ap_present` puts `ap0`
+    /// in the `iw dev` listing; `iftype` is what every `info` read
+    /// reports.
+    fn ordered_ap_vif_mocks(
+        dir: &Path,
+        iftype: &str,
+        ap_present: bool,
+    ) -> (PathBuf, PathBuf) {
+        let log = dir.join("calls.log");
+        let nmcli = dir.join("nmcli-ordered.sh");
+        std::fs::write(
+            &nmcli,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"nmcli $*\" >> \"{log}\"\n\
+exit 0\n",
+                log = log.display()
+            ),
+        )
+        .expect("write nmcli mock");
+        let iw = dir.join("iw-ordered.sh");
+        let ap_line = if ap_present {
+            format!(
+                "\\tInterface ap0\\n\\t\\tifindex 4\\n\\t\\ttype {iftype}\\n"
+            )
+        } else {
+            String::new()
+        };
+        std::fs::write(
+            &iw,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"iw $*\" >> \"{log}\"\n\
+if [ \"$1\" = \"dev\" ] && [ -z \"$2\" ]; then\n\
+  printf 'phy#0\\n\\tInterface wlan0\\n\\t\\tifindex 3\\n\\t\\ttype managed\\n{ap_line}'\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = \"dev\" ] && [ \"$3\" = \"info\" ]; then\n\
+  printf 'Interface %s\\n\\tifindex 8\\n\\taddr aa:11:22:33:44:66\\n\\ttype {iftype}\\n' \"$2\"\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+                log = log.display(),
+                ap_line = ap_line,
+                iftype = iftype,
+            ),
+        )
+        .expect("write iw mock");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for f in [&nmcli, &iw] {
+                std::fs::set_permissions(
+                    f,
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .expect("chmod mock");
+            }
+        }
+        (nmcli, iw)
+    }
+
+    async fn ensure_ap_vif_calls(
+        iftype: &str,
+        ap_present: bool,
+    ) -> Vec<String> {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (nmcli, iw) = ordered_ap_vif_mocks(dir.path(), iftype, ap_present);
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+        assert!(p.ensure_ap_vif_present("wlan0", "ap0").await);
+        std::fs::read_to_string(dir.path().join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Nothing touches the vif before NetworkManager is let go of
+    /// it.
+    ///
+    /// A vif left over from an earlier apply is one NetworkManager
+    /// already holds. Reading its type, re-typing it, or binding a
+    /// profile to it while NM still holds it is racing a claim
+    /// instead of ending it — and a hold that lands afterwards
+    /// marks an already-broken interface unmanaged, which is what
+    /// the field showed. The hold is the first thing that
+    /// addresses `ap0`, or this is red.
+    #[tokio::test]
+    async fn the_ap_vif_is_taken_off_networkmanager_before_anything_reads_it() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let calls = ensure_ap_vif_calls("managed", true).await;
+
+        let first_ap0 = calls
+            .iter()
+            .position(|c| c.contains("ap0"))
+            .expect("something must address ap0");
+        assert_eq!(
+            calls[first_ap0], "nmcli device set ap0 managed no",
+            "the hold must come before anything else touches the vif; \
+             call order was {calls:?}"
+        );
+        // And specifically before the type is read. A reading
+        // taken while NetworkManager still holds the vif is a
+        // reading of a race, not of the interface.
+        let read = calls
+            .iter()
+            .position(|c| c == "iw dev ap0 info")
+            .expect("the type must be read");
+        assert!(
+            first_ap0 < read,
+            "the type must be read only after the hold: {calls:?}"
+        );
+    }
+
+    /// Holding NetworkManager off stops the next claim. It does
+    /// not undo the last one: a vif NM already took keeps
+    /// `type managed` after NM gives up on it, and stays wrong for
+    /// the life of the interface. It is re-typed — and only once
+    /// NM has been let go of it, because `iw` will not retype an
+    /// interface that is up.
+    #[tokio::test]
+    async fn an_ap_vif_left_a_station_is_retyped_after_the_hold() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let calls = ensure_ap_vif_calls("managed", true).await;
+
+        let hold = calls
+            .iter()
+            .position(|c| c == "nmcli device set ap0 managed no")
+            .expect("the vif must be taken off NetworkManager");
+        let retype = calls
+            .iter()
+            .position(|c| c == "iw dev ap0 set type __ap")
+            .expect("a station vif must be put back into AP mode");
+        assert!(
+            hold < retype,
+            "the retype must follow the hold, not race it: {calls:?}"
+        );
+    }
+
+    /// The counterweight: a vif that is already an access point is
+    /// left alone. Without this the row could be "passed" by
+    /// re-typing on every apply, which tears down a working
+    /// access point each time.
+    #[tokio::test]
+    async fn an_ap_vif_already_in_ap_mode_is_not_retyped() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let calls = ensure_ap_vif_calls("AP", true).await;
+        assert!(
+            !calls.iter().any(|c| c == "iw dev ap0 set type __ap"),
+            "an AP vif must not be re-typed: {calls:?}"
+        );
+    }
+
+    /// The window is closed at the moment the vif appears.
+    ///
+    /// Creating the vif `type __ap` is not enough on its own:
+    /// NetworkManager takes any wifi device it manages and has
+    /// wpa_supplicant set it up as a station, which is what flips
+    /// the type. NM is what hands an interface to wpa_supplicant,
+    /// so a device NM does not manage is never set up — and the
+    /// device is marked unmanaged here, not later, because "later"
+    /// is the whole window.
+    #[tokio::test]
+    async fn networkmanager_is_held_off_the_ap_vif_as_soon_as_it_exists() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", true);
+        let iw = iw_mock(dir.path(), "AP", "evo-4466");
+
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+
+        assert!(
+            p.ensure_ap_vif_present("wlan0", "ap0").await,
+            "the vif must be reported present"
+        );
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.contains("device set ap0 managed no"),
+            "NetworkManager must be held off the vif at creation: {calls}"
+        );
+    }
+
+    /// The access point is not raised on a station.
+    ///
+    /// `ap0` is created `type __ap`. NetworkManager takes any wifi
+    /// device it manages and has wpa_supplicant set it up as a
+    /// station, which flips the type to `managed`. The phy allows
+    /// one station and one AP, so a second `managed` interface is
+    /// refused by the kernel as "device or resource busy" — and
+    /// raising the hotspot on it is what turns one refusal into a
+    /// retry loop that ends with NetworkManager giving up.
+    #[tokio::test]
+    async fn hotspot_is_not_raised_when_the_ap_vif_is_still_a_station() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let (got, steps, calls) =
+            raise_hotspot_with_ap_vif_iftype("managed").await;
+
+        assert!(
+            matches!(got, Err(PluginError::Permanent(_))),
+            "a station vif must stop the raise permanently, got {got:?}"
+        );
+        assert!(
+            !calls.contains("connection up"),
+            "the raise must not be attempted on a station vif: {calls}"
+        );
+        assert!(
+            steps.iter().any(|s| s.contains("not raised")
+                && s.contains("ap0")
+                && s.contains("managed")),
+            "the reason must be recorded for the operator: {steps:?}"
+        );
+        // The repair is not this path's to make. The profile is
+        // still written to point at the vif it belongs on — what
+        // must not happen is a retarget onto the station radio to
+        // get an access point up by another route.
+        assert!(
+            !calls.contains("connection.interface-name wlan0"),
+            "the hotspot must not be retargeted onto the station \
+             radio: {calls}"
+        );
+        assert!(
+            !calls.contains("device set ap0 managed yes"),
+            "a station vif is not handed back to NetworkManager: {calls}"
+        );
+    }
+
+    /// The counterweight: a vif that really is an access point is
+    /// handed back to NetworkManager and raised. Without this the
+    /// row could be "passed" by never raising a hotspot at all.
+    #[tokio::test]
+    async fn hotspot_is_raised_when_the_ap_vif_is_an_access_point() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let (got, _steps, calls) = raise_hotspot_with_ap_vif_iftype("AP").await;
+
+        assert!(got.is_ok(), "an AP vif must raise, got {got:?}");
+        assert!(
+            calls.contains("device set ap0 managed yes"),
+            "a confirmed AP vif is handed back before the raise: {calls}"
+        );
+        assert!(
+            calls.contains("connection up"),
+            "the hotspot must actually be raised on an AP vif: {calls}"
+        );
+    }
+
     #[tokio::test]
     async fn one_ap_capable_radio_beside_a_station_only_one_still_raises() {
         let _exec_lock = MOCK_EXEC_LOCK.lock().await;
@@ -15373,6 +16971,112 @@ exit 0\n",
         intent
     }
 
+    /// An `nmcli` that answers the device-state and carrier probe
+    /// for `eth0` and logs everything it is asked.
+    fn wired_state_nmcli_mock(
+        dir: &Path,
+        state: &str,
+        carrier: &str,
+    ) -> PathBuf {
+        let log = dir.join("nmcli.log");
+        let path = dir.join("nmcli-wired.sh");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+case \"$*\" in\n\
+  \"-g GENERAL.STATE,WIRED-PROPERTIES.CARRIER device show eth0\")\n\
+      printf '{state}\\n{carrier}\\n' ;;\n\
+esac\n\
+exit 0\n",
+                log = log.display(),
+                state = state,
+                carrier = carrier,
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        path
+    }
+
+    async fn ethernet_calls(
+        state: &str,
+        carrier: &str,
+    ) -> (Vec<String>, String) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = wired_state_nmcli_mock(dir.path(), state, carrier);
+        let p = satisfies_plugin(dir.path(), &nmcli);
+        let mut steps = Vec::new();
+        p.ensure_ethernet(&dhcp_ethernet_intent(), &mut steps)
+            .await
+            .expect("ensure_ethernet");
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        (steps, calls)
+    }
+
+    /// A cable somebody else is already holding is not activated.
+    ///
+    /// `[ifupdown] managed=false` beside an `iface <eth> inet dhcp`
+    /// stanza leaves the wired interface to ifupdown and dhcpcd.
+    /// NetworkManager reports the device unmanaged and will not
+    /// bind a profile to it, so the activation can only fail —
+    /// while the interface it names is carrying traffic, and on a
+    /// host reached over that cable is the operator's way in.
+    #[tokio::test]
+    async fn an_unmanaged_cable_that_is_up_is_recorded_not_activated() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let (steps, calls) = ethernet_calls("10 (unmanaged)", "on").await;
+
+        assert!(
+            !calls.contains("connection up evo-network-ethernet"),
+            "a cable NetworkManager does not manage must not be \
+             activated: {calls}"
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.contains("eth0") && s.contains("another manager")),
+            "the interface must be recorded: {steps:?}"
+        );
+        // Recorded and stepped over. Whose cable this is belongs to
+        // a provisioning decision, not to an apply.
+        assert!(
+            !calls.contains("connection modify")
+                && !calls.contains("connection add"),
+            "the profile must be left alone: {calls}"
+        );
+    }
+
+    /// Unmanaged with no carrier is a cable that genuinely is not
+    /// working. That is not this, and the ordinary path still runs
+    /// — otherwise the skip becomes a way to never configure
+    /// ethernet at all.
+    #[tokio::test]
+    async fn an_unmanaged_cable_with_no_carrier_still_takes_the_normal_path() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let (_steps, calls) = ethernet_calls("10 (unmanaged)", "off").await;
+        assert!(
+            calls.contains("connection up evo-network-ethernet"),
+            "a dead cable still goes through the usual path: {calls}"
+        );
+    }
+
+    /// And a cable NetworkManager does manage is activated as it
+    /// always was, carrier or no.
+    #[tokio::test]
+    async fn a_managed_cable_is_still_activated() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let (_steps, calls) = ethernet_calls("30 (disconnected)", "on").await;
+        assert!(
+            calls.contains("connection up evo-network-ethernet"),
+            "a managed cable is still activated: {calls}"
+        );
+    }
+
     /// A wired link that is already up and already carries exactly
     /// this configuration must not be raised again.
     ///
@@ -15526,6 +17230,7 @@ exit 0\n",
             &open_ap_intent(),
             None,
             "evo-network-hotspot",
+            false,
             &mut steps,
         )
         .await
@@ -15583,6 +17288,7 @@ exit 0\n",
             &open_ap_intent(),
             None,
             "evo-network-hotspot",
+            false,
             &mut steps,
         )
         .await
@@ -15624,6 +17330,7 @@ exit 0\n",
             &open_ap_intent(),
             None,
             "evo-network-hotspot",
+            false,
             &mut steps,
         )
         .await
@@ -15674,6 +17381,7 @@ exit 0\n",
             &open_ap_intent(),
             Some("a-new-passphrase"),
             "evo-network-hotspot",
+            false,
             &mut steps,
         )
         .await
@@ -15713,5 +17421,41 @@ exit 0\n",
             compose_session_url("sid", "/guest/s/default/", "t=1"),
             "/api/v1/network/captive/session/sid/guest/s/default/"
         );
+    }
+
+    #[test]
+    fn the_mutating_verbs_gate_at_write_network_admin_in_both_manifests() {
+        // A step-up declaration would demand a step-up session on
+        // every call and put a password card on these writes at the
+        // open household level. Both manifests: the bundle ships
+        // manifest.oop.toml.
+        use evo_plugin_sdk::manifest::VerbCapability;
+        let oop = Manifest::from_toml(include_str!("../manifest.oop.toml"))
+            .expect("manifest.oop.toml parses");
+        for m in [manifest(), oop] {
+            let resp = m.capabilities.respondent.expect("respondent");
+            for verb in [
+                "network.nm.intent.set",
+                "network.nm.intent.apply",
+                "network.nm.wifi.disconnect",
+                "network.nm.wifi.forget",
+                "network.nm.captive.start",
+                "network.nm.captive.submit",
+                "network.nm.captive.complete",
+                "network.nm.captive.session.start",
+                "network.nm.security.harden",
+                "network.nm.flight_mode.set",
+                "network.nm.radio.set",
+            ] {
+                assert!(
+                    matches!(
+                        resp.verb_capabilities.get(verb),
+                        Some(VerbCapability::Write { scope }) if scope == "network_admin"
+                    ),
+                    "{verb}: {:?}",
+                    resp.verb_capabilities.get(verb)
+                );
+            }
+        }
     }
 }

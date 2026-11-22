@@ -17,6 +17,8 @@
 #   dist/scripts/lib/          (chown-tree + the parsers bootstrap sources)
 #   dist/bin/evo-rtc-wake
 #   dist/sudoers.d/evo-rtc-wake.in
+#   dist/bin/evo-set-timezone
+#   dist/sudoers.d/evo-set-timezone.in
 #   dist/systemd/evo.service
 # Other sudoers templates stay the piece so a kiosk-privilege
 # expansion cannot ride this row.
@@ -46,6 +48,8 @@ need "${REPO_ROOT}/dist/scripts/lib/chown-tree-same-fs.sh"
 need "${REPO_ROOT}/dist/scripts/lib/chown-tenant-state-trees.sh"
 need "${REPO_ROOT}/dist/bin/evo-rtc-wake"
 need "${REPO_ROOT}/dist/sudoers.d/evo-rtc-wake.in"
+need "${REPO_ROOT}/dist/bin/evo-set-timezone"
+need "${REPO_ROOT}/dist/sudoers.d/evo-set-timezone.in"
 need "${REPO_ROOT}/dist/systemd/evo.service"
 
 mkdir -p "${DEST_DIST}/scripts/lib" \
@@ -60,5 +64,9 @@ install -m 0755 "${REPO_ROOT}/dist/bin/evo-rtc-wake" \
     "${DEST_DIST}/bin/evo-rtc-wake"
 install -m 0644 "${REPO_ROOT}/dist/sudoers.d/evo-rtc-wake.in" \
     "${DEST_DIST}/sudoers.d/evo-rtc-wake.in"
+install -m 0755 "${REPO_ROOT}/dist/bin/evo-set-timezone" \
+    "${DEST_DIST}/bin/evo-set-timezone"
+install -m 0644 "${REPO_ROOT}/dist/sudoers.d/evo-set-timezone.in" \
+    "${DEST_DIST}/sudoers.d/evo-set-timezone.in"
 install -m 0644 "${REPO_ROOT}/dist/systemd/evo.service" \
     "${DEST_DIST}/systemd/evo.service"

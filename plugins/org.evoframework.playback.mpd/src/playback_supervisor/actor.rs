@@ -72,7 +72,7 @@ use crate::mpd::{
 use crate::PLUGIN_NAME;
 
 use super::command::{PlaybackCommand, PlaybackError};
-use super::report::PlaybackStateReport;
+use super::report::{IntentCells, PlaybackStateReport, PublisherIntent};
 use super::subject_emitter::SubjectEmitter;
 
 // ----- tuning constants -----
@@ -293,6 +293,10 @@ pub(crate) struct SupervisorSpawn {
     /// Operator mute. Shared with the ambient observer and
     /// the queue shelf.
     pub(crate) mute: crate::mute_cell::MuteCell,
+    /// The shuffle mode the operator asked for. MPD cannot
+    /// report an album mode, so every now-playing publisher
+    /// reads it from here instead of guessing.
+    pub(crate) shuffle: crate::album_shuffle::ShuffleModeCell,
 }
 
 pub(crate) async fn spawn(
@@ -301,7 +305,7 @@ pub(crate) async fn spawn(
     custody_handle: CustodyHandle,
     reporter: Arc<dyn CustodyStateReporter>,
     subject_emitter: SubjectEmitter,
-    audio_protocol_settings_rx: watch::Receiver<AudioProtocolSettings>,
+    audio_protocol_settings_rx: watch::Receiver<Option<AudioProtocolSettings>>,
     io: SupervisorSpawn,
 ) -> Result<SupervisorHandle, PlaybackError> {
     tracing::info!(
@@ -321,15 +325,17 @@ pub(crate) async fn spawn(
             .map_err(classify_connect_error)?;
 
     // Apply the operator's MPD-protocol settings to the freshly
-    // opened command connection before the initial report. The
-    // settings are persisted across MPD restarts within a single
-    // server session but reset to defaults when MPD itself
-    // restarts; applying on every supervisor spawn restores them
-    // deterministically. Best-effort: if MPD refuses the verb
-    // (e.g. older server without `crossfade` support — unlikely
-    // on a modern build), the apply is logged and skipped, the
+    // opened command connection before the initial report, as
+    // the custody starts. With no settings delivered yet this is
+    // the audiophile-grade defaults. Every MPD session and every
+    // later change is the protocol-settings applier's: it runs
+    // whether or not a custody is live, and it sends again when
+    // MPD has dropped the connection. Best-effort here: if MPD
+    // refuses the verb, the apply is logged and skipped, the
     // session still proceeds.
-    let initial_protocol_settings = *audio_protocol_settings_rx.borrow();
+    let initial_protocol_settings = audio_protocol_settings_rx
+        .borrow()
+        .unwrap_or(AudioProtocolSettings::audiophile_default());
     apply_audio_protocol_settings(&mut cmd_conn, initial_protocol_settings)
         .await;
 
@@ -359,7 +365,11 @@ pub(crate) async fn spawn(
         &subject_emitter,
         &mut file_tracker,
         io.music_directory.as_deref(),
-        io.mute.is_muted(),
+        IntentCells {
+            mute: &io.mute,
+            shuffle: &io.shuffle,
+        }
+        .read(),
     )
     .await?;
 
@@ -388,14 +398,11 @@ pub(crate) async fn spawn(
         file_tracker,
         music_directory: io.music_directory,
         muted: io.mute,
+        shuffle_mode: io.shuffle,
         pre_mute_volume: initial_pre_mute_volume,
     };
-    let task_handle = tokio::spawn(task_state.run(
-        command_rx,
-        shutdown_rx,
-        idle_rx,
-        audio_protocol_settings_rx,
-    ));
+    let task_handle =
+        tokio::spawn(task_state.run(command_rx, shutdown_rx, idle_rx));
 
     Ok(SupervisorHandle {
         command_tx,
@@ -410,6 +417,96 @@ pub(crate) async fn spawn(
 /// the engineering bar's "no silent failure" rule (the warning
 /// is observable) without making MPD-version-skew a session-
 /// abort condition.
+/// Write the chosen album order into the queue.
+///
+/// The choice is made by a pure, seeded planner — the only place
+/// that order is decided: [`crate::album_shuffle::album_shuffle_plan`]
+/// for albums, [`crate::similar_shuffle::similar_shuffle_plan`] for
+/// similar, the latter walking on from the track that is playing.
+/// This carries it out: `moveid` per song, in ascending target
+/// position, so each lands where no later move disturbs it.
+///
+/// Best-effort per move. A queue that changed under us (the
+/// operator removing a track mid-shuffle) makes one move fail, and
+/// the ones already applied are still a valid queue — every song is
+/// still present and the order chosen so far is in place. Refusing
+/// the whole gesture because the eleventh move raced would leave
+/// the operator with shuffle reported on and a queue in the old
+/// order.
+async fn write_queue_order(
+    cmd_conn: &mut MpdConnection,
+    mode: crate::album_shuffle::ShuffleMode,
+) {
+    let items = match cmd_conn.playlistinfo().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                mode = mode.as_str(),
+                error = %e,
+                "could not read the queue; the order was not written and \
+                 the queue plays as it stands"
+            );
+            return;
+        }
+    };
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    // What is playing is read once for both orders. MPD keeps the
+    // playing song through a reorder and plays on from it, so each
+    // order starts from it: similar walks on from the playing
+    // track, albums lead with the playing album. A status we
+    // cannot read is nothing playing, not a refusal: the order is
+    // still chosen, from a drawn start.
+    let playing = match mode {
+        crate::album_shuffle::ShuffleMode::Albums
+        | crate::album_shuffle::ShuffleMode::Similar => {
+            match cmd_conn.status().await {
+                Ok(s) => s.song_position,
+                Err(e) => {
+                    tracing::debug!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        "status unreadable; the order starts from a \
+                         drawn start rather than the playing track"
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let plan = match mode {
+        crate::album_shuffle::ShuffleMode::Albums => {
+            crate::album_shuffle::album_shuffle_plan_from(&items, playing, seed)
+        }
+        crate::album_shuffle::ShuffleMode::Similar => {
+            crate::similar_shuffle::similar_shuffle_plan(&items, playing, seed)
+        }
+        _ => return,
+    };
+    if plan.is_empty() {
+        // Nothing to choose between, or already in the chosen order.
+        return;
+    }
+    for mv in &plan {
+        if let Err(e) = cmd_conn.moveid(mv.id, mv.to_position).await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                mode = mode.as_str(),
+                id = mv.id,
+                to_position = mv.to_position,
+                error = %e,
+                "order partly written; the queue is consistent but not \
+                 fully reordered"
+            );
+            return;
+        }
+    }
+}
+
 async fn apply_audio_protocol_settings(
     cmd_conn: &mut MpdConnection,
     settings: AudioProtocolSettings,
@@ -434,6 +531,27 @@ async fn apply_audio_protocol_settings(
             error = %e,
             "set_single rejected; mpd's single-mode not applied \
              for this session"
+        );
+    }
+    // The operator's ReplayGain mode is what MPD plays: `off`
+    // leaves the file as mastered, `track` levels each track
+    // against its own tag, `album` levels the album as one. This
+    // is where the setting stops being a stored preference and
+    // starts changing what the listener hears.
+    //
+    // Not a volume command, and deliberately not sent as one: it
+    // scales the decoded stream and leaves the mixer and the
+    // operator's startup volume where they are.
+    if let Err(e) = cmd_conn
+        .set_replay_gain_mode(settings.replay_gain_mode)
+        .await
+    {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            replay_gain_mode = settings.replay_gain_mode,
+            error = %e,
+            "set_replay_gain_mode rejected; mpd keeps its previous \
+             ReplayGain mode for this session"
         );
     }
 }
@@ -583,6 +701,10 @@ struct SupervisorTask {
     /// Operator mute. Same cell the ambient observer and the
     /// queue shelf read when they publish now_playing.
     muted: crate::mute_cell::MuteCell,
+    /// The shuffle mode the operator asked for. Same cell every
+    /// now-playing publisher reads; MPD cannot report an album
+    /// mode, so none of them may guess.
+    shuffle_mode: crate::album_shuffle::ShuffleModeCell,
     /// Captured volume to restore on `set_mute(false)`. Updated
     /// every time the warden issues `set_mute(true)`: the actor
     /// reads MPD's current volume via `status()` before sending
@@ -594,19 +716,16 @@ struct SupervisorTask {
 
 impl SupervisorTask {
     /// The supervisor task body. Consumes `self` (the run is the
-    /// whole life of the task) and the four channel receivers,
+    /// whole life of the task) and the three channel receivers,
     /// and loops until shutdown or one of the channels closes.
-    /// The watch receiver carries operator-toggled MPD-protocol
-    /// settings (crossfade + single mode); on change, the task
-    /// applies them to the command connection through the same
-    /// canonical dispatch path that handles steward-issued
-    /// commands.
+    /// A change to the operator's MPD-protocol settings while the
+    /// custody is live is applied by the protocol-settings
+    /// applier, not here.
     async fn run(
         mut self,
         mut command_rx: mpsc::Receiver<SupervisorMessage>,
         mut shutdown_rx: oneshot::Receiver<()>,
         mut idle_rx: mpsc::Receiver<IdleEvent>,
-        mut audio_protocol_settings_rx: watch::Receiver<AudioProtocolSettings>,
     ) {
         tracing::info!(
             plugin = PLUGIN_NAME,
@@ -654,7 +773,11 @@ impl SupervisorTask {
                                     &self.subject_emitter,
                                     &mut self.file_tracker,
                                     self.music_directory.as_deref(),
-                                    self.muted.is_muted(),
+                                    IntentCells {
+                                        mute: &self.muted,
+                                        shuffle: &self.shuffle_mode,
+                                    }
+                                    .read(),
                                 ).await;
                             }
                         }
@@ -708,7 +831,11 @@ impl SupervisorTask {
                                 &mut self.cmd_conn,
                                 &self.endpoint,
                                 self.timeouts,
-                                self.muted.is_muted(),
+                                IntentCells {
+                                    mute: &self.muted,
+                                    shuffle: &self.shuffle_mode,
+                                }
+                                .read(),
                             ).await;
                             let _ = reply.send(result);
                         }
@@ -742,41 +869,12 @@ impl SupervisorTask {
                                 &self.subject_emitter,
                                 &mut self.file_tracker,
                                 self.music_directory.as_deref(),
-                                self.muted.is_muted(),
+                                IntentCells {
+                                    mute: &self.muted,
+                                    shuffle: &self.shuffle_mode,
+                                }
+                                .read(),
                             ).await;
-                        }
-                    }
-                }
-                changed = audio_protocol_settings_rx.changed() => {
-                    match changed {
-                        Ok(()) => {
-                            let settings = *audio_protocol_settings_rx.borrow();
-                            tracing::debug!(
-                                plugin = PLUGIN_NAME,
-                                handle = %self.custody_handle.id,
-                                crossfade_seconds = settings.crossfade_seconds,
-                                gapless = settings.gapless,
-                                "operator changed mpd-protocol settings; \
-                                 applying to live session"
-                            );
-                            apply_audio_protocol_settings(
-                                &mut self.cmd_conn,
-                                settings,
-                            ).await;
-                        }
-                        Err(_) => {
-                            tracing::debug!(
-                                plugin = PLUGIN_NAME,
-                                handle = %self.custody_handle.id,
-                                "audio_protocol_settings watch sender dropped; \
-                                 stopping settings-following arm"
-                            );
-                            // The watch sender on the plugin side has
-                            // dropped, which only happens when the
-                            // plugin itself is being torn down. The
-                            // supervisor will receive shutdown via the
-                            // dedicated channel shortly; stay in the
-                            // select loop on the other arms.
                         }
                     }
                 }
@@ -842,10 +940,10 @@ async fn handle_query(
     cmd_conn: &mut MpdConnection,
     endpoint: &MpdEndpoint,
     timeouts: ConnectTimeouts,
-    muted: bool,
+    intent: PublisherIntent,
 ) -> Result<PlaybackStateReport, PlaybackError> {
     // First attempt on the current connection.
-    match do_query(cmd_conn, muted).await {
+    match do_query(cmd_conn, intent).await {
         Ok(report) => return Ok(report),
         Err(e) if !error_calls_for_reconnect(&e) => {
             return Err(classify_command_error(e));
@@ -870,18 +968,18 @@ async fn handle_query(
     reconnect_cmd_conn(cmd_conn, endpoint, timeouts).await?;
 
     // Retry the query once on the fresh connection.
-    do_query(cmd_conn, muted)
+    do_query(cmd_conn, intent)
         .await
         .map_err(classify_command_error)
 }
 
 async fn do_query(
     cmd_conn: &mut MpdConnection,
-    muted: bool,
+    intent: PublisherIntent,
 ) -> Result<PlaybackStateReport, MpdError> {
     let status = cmd_conn.status().await?;
     let song = cmd_conn.current_song().await?;
-    Ok(PlaybackStateReport::from_mpd(status, song, muted))
+    Ok(PlaybackStateReport::from_mpd(status, song, intent))
 }
 
 /// Cycle MPD output 0 (`disableoutput` + `enableoutput`) with the
@@ -1060,10 +1158,19 @@ async fn dispatch_command(
         PlaybackCommand::SetRepeat(enabled) => {
             cmd_conn.set_repeat(enabled).await
         }
-        PlaybackCommand::SetShuffle(enabled) => {
-            // Operator-facing name `shuffle` maps to MPD's
-            // `random` mode primitive.
-            cmd_conn.set_random(enabled).await
+        PlaybackCommand::SetShuffle(mode) => {
+            // Track shuffle is MPD's own `random`. Album and
+            // similar order are not in the protocol, so they are
+            // written into the queue and MPD plays the queue in
+            // order: the physical order IS the playback order,
+            // which is how playback follows the choice without
+            // this plugin sitting in the path of every song
+            // boundary.
+            let res = cmd_conn.set_random(mode.mpd_random()).await;
+            if res.is_ok() && mode.orders_the_queue() {
+                write_queue_order(cmd_conn, mode).await;
+            }
+            res
         }
         PlaybackCommand::SetSingle(enabled) => {
             cmd_conn.set_single(enabled).await
@@ -1129,7 +1236,7 @@ async fn emit_initial_report(
     subject_emitter: &SubjectEmitter,
     file_tracker: &mut FileEmissionTracker,
     music_directory: Option<&std::path::Path>,
-    muted: bool,
+    intent: PublisherIntent,
 ) -> Result<(), PlaybackError> {
     let status = cmd_conn.status().await.map_err(classify_command_error)?;
     let song = cmd_conn
@@ -1140,7 +1247,7 @@ async fn emit_initial_report(
     // emitter can read the same song. MpdSong is cheap to clone
     // (a small fixed set of Option<String> plus a short String).
     let song_for_emitter = song.clone();
-    let report = PlaybackStateReport::from_mpd(status, song, muted);
+    let report = PlaybackStateReport::from_mpd(status, song, intent);
     let payload = report.serialise().into_bytes();
     if let Err(e) = reporter
         .report(custody_handle, payload, HealthStatus::Healthy)
@@ -1187,7 +1294,7 @@ async fn emit_best_effort_report(
     subject_emitter: &SubjectEmitter,
     file_tracker: &mut FileEmissionTracker,
     music_directory: Option<&std::path::Path>,
-    muted: bool,
+    intent: PublisherIntent,
 ) {
     let status = match cmd_conn.status().await {
         Ok(s) => s,
@@ -1243,7 +1350,7 @@ async fn emit_best_effort_report(
         }
     };
     let song_for_emitter = song.clone();
-    let report = PlaybackStateReport::from_mpd(status, song, muted);
+    let report = PlaybackStateReport::from_mpd(status, song, intent);
     let payload = report.serialise().into_bytes();
     if let Err(e) = reporter
         .report(custody_handle, payload, HealthStatus::Healthy)
@@ -1470,9 +1577,10 @@ mod tests {
     /// Returns a receiver bound to a sender that lives in a leaked
     /// channel — fine for tests, the sender ownership doesn't
     /// matter because the receiver only reads the default value.
-    fn null_protocol_settings_rx() -> watch::Receiver<AudioProtocolSettings> {
+    fn null_protocol_settings_rx(
+    ) -> watch::Receiver<Option<AudioProtocolSettings>> {
         let (tx, rx) =
-            watch::channel(AudioProtocolSettings::audiophile_default());
+            watch::channel(Some(AudioProtocolSettings::audiophile_default()));
         // Leak the sender so the receiver stays usable. Tests
         // don't poll for sender-drop here.
         Box::leak(Box::new(tx));
@@ -1516,6 +1624,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -1570,6 +1679,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -1607,6 +1717,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -1628,6 +1739,447 @@ mod tests {
         );
 
         handle.shutdown().await;
+    }
+
+    /// A protocol-settings receiver carrying one chosen mode.
+    fn protocol_settings_rx_with(
+        replay_gain_mode: &'static str,
+    ) -> watch::Receiver<Option<AudioProtocolSettings>> {
+        let (tx, rx) = watch::channel(Some(AudioProtocolSettings {
+            replay_gain_mode,
+            ..AudioProtocolSettings::audiophile_default()
+        }));
+        Box::leak(Box::new(tx));
+        rx
+    }
+
+    /// Album shuffle reaches MPD as a reordered queue, not as a
+    /// random walk.
+    ///
+    /// MPD has no album mode. Track shuffle is its `random`;
+    /// album order is written into the queue and MPD plays the
+    /// queue in order, so album mode wants `random 0` and a run
+    /// of `moveid`. Setting `random 1` for albums would hand the
+    /// chosen order straight back to MPD to scramble.
+    #[tokio::test]
+    async fn album_shuffle_reorders_the_queue_with_random_off() {
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) = spawn_mock_mpd(vec![
+            ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                // Interleaved so that no album order the planner
+                // can draw is the order the queue already has:
+                // the mock tags each row with its directory as
+                // the album, every album order is contiguous,
+                // and this is not. A move is always written.
+                items: vec![
+                    (11, "blue/1.flac".to_string()),
+                    (21, "red/1.flac".to_string()),
+                    (12, "blue/2.flac".to_string()),
+                    (22, "red/2.flac".to_string()),
+                ],
+                playing: None,
+            },
+            ConnBehaviour::HoldAfterWelcome,
+        ])
+        .await;
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let reporter_dyn: Arc<dyn CustodyStateReporter> = reporter.clone();
+        let handle = spawn(
+            endpoint,
+            short_timeouts(),
+            test_custody_handle(),
+            reporter_dyn,
+            SubjectEmitter::null(),
+            null_protocol_settings_rx(),
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        handle
+            .command(PlaybackCommand::SetShuffle(
+                crate::album_shuffle::ShuffleMode::Albums,
+            ))
+            .await
+            .expect("album shuffle");
+
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c == "random \"0\""),
+            "album order is the queue's, so MPD's random stays off: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|c| c != "random \"1\""),
+            "album mode must not hand the order back to MPD to \
+             scramble: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|c| c.starts_with("moveid ")),
+            "the chosen album order must be written into the queue: \
+             {seen:?}"
+        );
+        handle.shutdown().await;
+    }
+
+    /// Similar shuffle reaches MPD as a reordered queue that the
+    /// playing track leads, with random off.
+    ///
+    /// Playback follows the order because the order is the
+    /// queue. The playing track is placed first so what comes
+    /// next was chosen against it, and so the player is not
+    /// yanked onto another song by the reorder.
+    #[tokio::test]
+    async fn similar_shuffle_follows_on_from_the_playing_track() {
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) = spawn_mock_mpd(vec![
+            ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![
+                    (11, "blue/1.flac".to_string()),
+                    (12, "blue/2.flac".to_string()),
+                    (21, "red/1.flac".to_string()),
+                    (22, "red/2.flac".to_string()),
+                ],
+                // Position 2 is playing: id 21.
+                playing: Some(2),
+            },
+            ConnBehaviour::HoldAfterWelcome,
+        ])
+        .await;
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let reporter_dyn: Arc<dyn CustodyStateReporter> = reporter.clone();
+        let handle = spawn(
+            endpoint,
+            short_timeouts(),
+            test_custody_handle(),
+            reporter_dyn,
+            SubjectEmitter::null(),
+            null_protocol_settings_rx(),
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        handle
+            .command(PlaybackCommand::SetShuffle(
+                crate::album_shuffle::ShuffleMode::Similar,
+            ))
+            .await
+            .expect("similar shuffle");
+
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c == "random \"0\""),
+            "similar order is the queue's, so MPD's random stays off: \
+             {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|c| c != "random \"1\""),
+            "similar mode must not hand the order back to MPD to \
+             scramble: {seen:?}"
+        );
+        // Replay the moves the way MPD would and read the order.
+        let mut ids = vec![11u32, 12, 21, 22];
+        let mut moved = 0;
+        for c in &seen {
+            let Some(rest) = c.strip_prefix("moveid ") else {
+                continue;
+            };
+            let mut parts = rest.split('"').filter(|s| !s.trim().is_empty());
+            let id: u32 = parts.next().unwrap().parse().unwrap();
+            let to: usize = parts.next().unwrap().trim().parse().unwrap();
+            let from = ids.iter().position(|i| *i == id).unwrap();
+            let id = ids.remove(from);
+            ids.insert(to.min(ids.len()), id);
+            moved += 1;
+        }
+        assert!(moved > 0, "the chosen order must be written: {seen:?}");
+        assert_eq!(
+            ids[0], 21,
+            "the playing track leads the new order: {ids:?} from {seen:?}"
+        );
+        let mut all = ids.clone();
+        all.sort_unstable();
+        assert_eq!(all, vec![11, 12, 21, 22], "every track still queued");
+        handle.shutdown().await;
+    }
+
+    /// Album shuffle leads with the playing album. MPD plays on
+    /// from the playing song, so an album drawn ahead of it would
+    /// never be reached.
+    #[tokio::test]
+    async fn album_shuffle_leads_with_the_playing_album() {
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) = spawn_mock_mpd(vec![
+            ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![
+                    (11, "blue/1.flac".to_string()),
+                    (12, "blue/2.flac".to_string()),
+                    (21, "red/1.flac".to_string()),
+                    (22, "red/2.flac".to_string()),
+                    (31, "green/1.flac".to_string()),
+                    (32, "green/2.flac".to_string()),
+                ],
+                // Position 3 is playing: id 22, in Red.
+                playing: Some(3),
+            },
+            ConnBehaviour::HoldAfterWelcome,
+        ])
+        .await;
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let reporter_dyn: Arc<dyn CustodyStateReporter> = reporter.clone();
+        let handle = spawn(
+            endpoint,
+            short_timeouts(),
+            test_custody_handle(),
+            reporter_dyn,
+            SubjectEmitter::null(),
+            null_protocol_settings_rx(),
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        handle
+            .command(PlaybackCommand::SetShuffle(
+                crate::album_shuffle::ShuffleMode::Albums,
+            ))
+            .await
+            .expect("album shuffle");
+
+        let seen = commands.lock().unwrap().clone();
+        let mut ids = vec![11u32, 12, 21, 22, 31, 32];
+        for c in &seen {
+            let Some(rest) = c.strip_prefix("moveid ") else {
+                continue;
+            };
+            let mut parts = rest.split('"').filter(|s| !s.trim().is_empty());
+            let id: u32 = parts.next().unwrap().parse().unwrap();
+            let to: usize = parts.next().unwrap().trim().parse().unwrap();
+            let from = ids.iter().position(|i| *i == id).unwrap();
+            let id = ids.remove(from);
+            ids.insert(to.min(ids.len()), id);
+        }
+        assert_eq!(
+            &ids[..2],
+            &[21, 22],
+            "the playing album leads: {ids:?} from {seen:?}"
+        );
+        handle.shutdown().await;
+    }
+
+    /// Track shuffle is still MPD's own random, and writes no
+    /// moves. The fielded mode must not start rewriting queues.
+    #[tokio::test]
+    async fn track_shuffle_is_still_mpd_random_and_moves_nothing() {
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) = spawn_mock_mpd(vec![
+            ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![
+                    (11, "blue/1.flac".to_string()),
+                    (21, "red/1.flac".to_string()),
+                ],
+                playing: None,
+            },
+            ConnBehaviour::HoldAfterWelcome,
+        ])
+        .await;
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let reporter_dyn: Arc<dyn CustodyStateReporter> = reporter.clone();
+        let handle = spawn(
+            endpoint,
+            short_timeouts(),
+            test_custody_handle(),
+            reporter_dyn,
+            SubjectEmitter::null(),
+            null_protocol_settings_rx(),
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        handle
+            .command(PlaybackCommand::SetShuffle(
+                crate::album_shuffle::ShuffleMode::Tracks,
+            ))
+            .await
+            .expect("track shuffle");
+
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c == "random \"1\""),
+            "track shuffle is MPD's random: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|c| !c.starts_with("moveid ")),
+            "track shuffle must not reorder the operator's queue: {seen:?}"
+        );
+        handle.shutdown().await;
+    }
+
+    /// Album shuffle in force reaches the glass on the
+    /// now-playing subject, with MPD's flag still off.
+    ///
+    /// This is the whole carriage, end to end: the mode is read
+    /// from the cell the publisher holds, projected onto the
+    /// report, and rendered into the payload a subscriber
+    /// receives. The unit pins each cover one link of that and
+    /// stay green if a publisher reads a default cell instead of
+    /// the device's own, or if the projection drops the intent —
+    /// which is the original defect, the control losing album
+    /// across a refresh because the payload said "not shuffling".
+    #[tokio::test]
+    async fn the_now_playing_payload_says_albums_with_random_off() {
+        let (endpoint, _mock) = spawn_mock_mpd(vec![
+            ConnBehaviour::StandardWithSong {
+                file: "blue/1.flac".to_string(),
+                title: "One".to_string(),
+                artist: "Someone".to_string(),
+                album: "Blue".to_string(),
+            },
+            ConnBehaviour::HoldAfterWelcome,
+        ])
+        .await;
+
+        let (subjects, _relations, emitter) = capturing_emitter();
+        let reporter = Arc::new(CapturingReporter::default());
+        let reporter_dyn: Arc<dyn CustodyStateReporter> = reporter.clone();
+
+        // Album shuffle is already in force when the publisher
+        // starts — the operator set it, the plugin remembers it,
+        // and MPD's own flag is off because album order lives in
+        // the queue.
+        let shuffle = crate::album_shuffle::ShuffleModeCell::new();
+        shuffle.set(crate::album_shuffle::ShuffleMode::Albums);
+
+        let handle = spawn(
+            endpoint,
+            short_timeouts(),
+            test_custody_handle(),
+            reporter_dyn,
+            emitter,
+            null_protocol_settings_rx(),
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+                shuffle,
+            },
+        )
+        .await
+        .unwrap();
+
+        // The initial snapshot is published as the supervisor
+        // comes up; give it a moment to land.
+        let now_playing_payload = || {
+            (0..subjects.state_update_count()).find_map(|i| {
+                subjects.state_update_at(i).and_then(|(_, v)| {
+                    v.get("shuffle_mode").is_some().then_some(v)
+                })
+            })
+        };
+        for _ in 0..60 {
+            if now_playing_payload().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let v = now_playing_payload().unwrap_or_else(|| {
+            panic!(
+                "no now-playing payload carried a shuffle_mode at all; \
+                 {} update_state calls seen",
+                subjects.state_update_count()
+            )
+        });
+        assert_eq!(
+            v["shuffle_mode"], "albums",
+            "album shuffle in force must reach the glass: {v}"
+        );
+        assert_eq!(
+            v["shuffle"], false,
+            "and MPD's flag keeps its own meaning — album order is \
+             the queue's, so random is off: {v}"
+        );
+
+        handle.shutdown().await;
+    }
+
+    /// The operator's ReplayGain mode reaches MPD.
+    ///
+    /// The setting existed and changed nothing: no code path
+    /// carried it to the player, so choosing it was a stored
+    /// preference and no more. This is where it stops being that
+    /// and starts changing what the listener hears.
+    #[tokio::test]
+    async fn the_replay_gain_mode_is_applied_to_mpd() {
+        for mode in ["off", "track", "album"] {
+            let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (endpoint, _mock) = spawn_mock_mpd(vec![
+                ConnBehaviour::LiveQueue {
+                    commands: Arc::clone(&commands),
+                    items: vec![(11, "INTERNAL/a.flac".to_string())],
+                    playing: None,
+                },
+                ConnBehaviour::HoldAfterWelcome,
+            ])
+            .await;
+
+            let reporter = Arc::new(CapturingReporter::default());
+            let reporter_dyn: Arc<dyn CustodyStateReporter> = reporter.clone();
+            let handle = spawn(
+                endpoint,
+                short_timeouts(),
+                test_custody_handle(),
+                reporter_dyn,
+                SubjectEmitter::null(),
+                protocol_settings_rx_with(mode),
+                SupervisorSpawn {
+                    music_directory: None,
+                    mute: crate::mute_cell::MuteCell::new(),
+                    shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+            let seen = commands.lock().unwrap().clone();
+            assert!(
+                seen.iter()
+                    .any(|c| c == &format!("replay_gain_mode \"{mode}\"")),
+                "the chosen mode must reach MPD: wanted {mode}, saw {seen:?}"
+            );
+            // And it is not sent as a volume command. The mixer
+            // and the operator's startup volume stay where they
+            // are.
+            assert!(
+                seen.iter().all(|c| !c.starts_with("setvol")),
+                "ReplayGain must not move the volume: {seen:?}"
+            );
+            handle.shutdown().await;
+        }
     }
 
     #[tokio::test]
@@ -1661,6 +2213,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -1697,10 +2250,11 @@ mod tests {
     async fn command_ack_returns_playback_error_ack() {
         // Command-conn: 1 = crossfade (apply_audio_protocol_settings),
         //               2 = single    (apply_audio_protocol_settings),
-        //               3 = status    (initial report),
-        //               4 = currentsong (initial report),
-        //               5 = status    (start_or_resume_playback),
-        //               6 = play 0 -> ACK.
+        //               3 = replay_gain_mode (same),
+        //               4 = status    (initial report),
+        //               5 = currentsong (initial report),
+        //               6 = status    (start_or_resume_playback),
+        //               7 = play 0 -> ACK.
         let (endpoint, _mock) = spawn_mock_mpd(vec![
             ConnBehaviour::AckOnNth {
                 nth: 6,
@@ -1724,6 +2278,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -1746,13 +2301,14 @@ mod tests {
     async fn command_reconnects_after_transient_drop() {
         // First command-conn:  1 = crossfade (apply_audio_protocol_settings),
         //                      2 = single    (apply_audio_protocol_settings),
-        //                      3 = status    (initial report),
-        //                      4 = currentsong (initial report),
-        //                      5 = play -> close connection.
+        //                      3 = replay_gain_mode (same),
+        //                      4 = status    (initial report),
+        //                      5 = currentsong (initial report),
+        //                      6 = play -> close connection.
         // Second command-conn (reconnect): Standard -> OK on play.
         // Idle conn: hold.
         let (endpoint, _mock) = spawn_mock_mpd(vec![
-            ConnBehaviour::CloseOnNth { nth: 5 },
+            ConnBehaviour::CloseOnNth { nth: 6 },
             ConnBehaviour::HoldAfterWelcome,
             ConnBehaviour::Standard,
         ])
@@ -1771,6 +2327,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -1799,14 +2356,15 @@ mod tests {
         //   First command-conn:
         //     1 = crossfade (apply_audio_protocol_settings),
         //     2 = single    (apply_audio_protocol_settings),
-        //     3 = status    (initial report),
-        //     4 = currentsong (initial report),
-        //     5 = status (query_state first attempt) -> close.
+        //     3 = replay_gain_mode (same),
+        //     4 = status    (initial report),
+        //     5 = currentsong (initial report),
+        //     6 = status (query_state first attempt) -> close.
         //   Second command-conn (reconnect): Standard -> OK on
         //     status + currentsong retry.
         //   Idle conn: hold.
         let (endpoint, _mock) = spawn_mock_mpd(vec![
-            ConnBehaviour::CloseOnNth { nth: 5 },
+            ConnBehaviour::CloseOnNth { nth: 6 },
             ConnBehaviour::HoldAfterWelcome,
             ConnBehaviour::Standard,
         ])
@@ -1825,6 +2383,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -1865,6 +2424,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -1900,6 +2460,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -1948,6 +2509,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -2002,6 +2564,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -2047,6 +2610,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await
@@ -2110,6 +2674,7 @@ mod tests {
             SupervisorSpawn {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
             },
         )
         .await

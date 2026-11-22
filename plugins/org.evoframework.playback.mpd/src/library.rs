@@ -127,6 +127,17 @@ pub(crate) struct LibraryContext {
     /// manifest declares it and eliminates the MPD-music_directory
     /// error surface for network sources.
     pub(crate) shelf_dispatcher: Option<Arc<dyn ShelfRequestDispatcher>>,
+    /// Tracks the operator has forgotten. Every answer that lists
+    /// tracks — browse, search, the facet drills, the two
+    /// play-history reads — omits them. See
+    /// [`crate::forgotten_tracks`].
+    pub(crate) forgotten: crate::forgotten_tracks::ForgottenTracks,
+    /// When an index may start, and with which MPD handles. See
+    /// [`crate::scan_door`].
+    pub(crate) scan_gate: crate::scan_door::ScanGate,
+    /// Scan-time local artwork hashes carried on list rows as
+    /// `artwork_hash`. See [`crate::artwork_hash`].
+    pub(crate) artwork_hashes: crate::artwork_hash::ArtworkHashIndex,
 }
 
 impl LibraryContext {
@@ -145,7 +156,41 @@ impl LibraryContext {
             state_mirror: Arc::new(Mutex::new(None)),
             works_aggregate: Arc::new(Mutex::new(None)),
             shelf_dispatcher,
+            forgotten: crate::forgotten_tracks::ForgottenTracks::default(),
+            scan_gate: crate::scan_door::ScanGate::settled(),
+            artwork_hashes: Default::default(),
         }
+    }
+
+    /// Share the scan-time artwork hash index. Without this the
+    /// context carries an empty one and no row has `artwork_hash`.
+    pub(crate) fn with_artwork_hashes(
+        mut self,
+        index: crate::artwork_hash::ArtworkHashIndex,
+    ) -> Self {
+        self.artwork_hashes = index;
+        self
+    }
+
+    /// Keep the forgotten set here. Without this the context
+    /// forgets nothing across a restart.
+    pub(crate) fn with_forgotten(
+        mut self,
+        forgotten: crate::forgotten_tracks::ForgottenTracks,
+    ) -> Self {
+        self.forgotten = forgotten;
+        self
+    }
+
+    /// Kick indexes through `gate`. Without this the context's
+    /// gate is open and holds no MPD handles, so `add_source` and
+    /// the restart pass start nothing.
+    pub(crate) fn with_scan_gate(
+        mut self,
+        gate: crate::scan_door::ScanGate,
+    ) -> Self {
+        self.scan_gate = gate;
+        self
     }
 }
 
@@ -569,6 +614,9 @@ pub(crate) enum VerbError {
     Mpd { verb: String, reason: String },
     #[error("library.add_source: source registration failed: {reason}")]
     Register { reason: String },
+    /// A `local_usb` source whose claim the host does not bear out.
+    #[error("{reason}")]
+    UsbClaimInvalid { reason: String },
     #[error(
         "library.browse_library: source {source_id:?} mount_path {mount_path:?} \
          is not under MPD's music_directory {music_directory:?}; \
@@ -596,6 +644,22 @@ pub(crate) enum VerbError {
         "library.park_uri_prefix: prefix must be a non-empty MPD folder path"
     )]
     ParkPrefixInvalid,
+    #[error("library.forget_track: uri must not be empty")]
+    ForgetUriEmpty,
+    #[error("library.forget_album: album must not be empty")]
+    ForgetAlbumEmpty,
+    #[error("library.forget_album: album {album:?} resolves to no track")]
+    ForgetAlbumUnknown { album: String },
+    /// A verb this one handed work to was refused by the steward, by
+    /// name: `household_policy_locked` when the household protects
+    /// it. Carried out under the same name, so the operator meets
+    /// the refusal they would have met asking directly.
+    #[error("library.{verb}: refused ({subclass}): {reason}")]
+    Refused {
+        verb: String,
+        subclass: String,
+        reason: String,
+    },
 }
 
 fn check_version(v: u32, verb: &str) -> Result<(), VerbError> {
@@ -752,6 +816,11 @@ fn shelf_error_reason(e: &ShelfDispatchError) -> String {
         ShelfDispatchError::SubstrateFailure { detail } => {
             format!("substrate failure: {detail}")
         }
+        ShelfDispatchError::Refused { subclass, detail } => {
+            format!("refused ({subclass}): {detail}")
+        }
+        // A category this SDK does not name yet: its own message.
+        other => other.to_string(),
     }
 }
 
@@ -970,6 +1039,117 @@ pub(crate) async fn handle_list_sources(
     })
 }
 
+/// Ask the household door whether the consumer being served may
+/// change sources now. Fails closed: a door that cannot be asked
+/// is not an open one.
+async fn require_household_door(
+    ctx: &LibraryContext,
+    verb: &'static str,
+) -> Result<(), VerbError> {
+    let Some(dispatcher) = ctx.shelf_dispatcher.as_ref() else {
+        return Err(VerbError::Mpd {
+            verb: verb.to_string(),
+            reason: "the household door cannot be asked: no peer dispatcher \
+                     at admission"
+                .to_string(),
+        });
+    };
+    let body = serde_json::to_vec(&json!({
+        "scope": crate::household_door::SOURCES_SCOPE,
+    }))
+    .map_err(|e| VerbError::Mpd {
+        verb: verb.to_string(),
+        reason: e.to_string(),
+    })?;
+    dispatcher
+        .dispatch(
+            crate::household_door::HOUSEHOLD_SHELF,
+            crate::household_door::HOUSEHOLD_REQUIRE,
+            body,
+            None,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| match e {
+            ShelfDispatchError::Refused { subclass, detail } => {
+                VerbError::Refused {
+                    verb: verb.to_string(),
+                    subclass,
+                    reason: detail,
+                }
+            }
+            other => VerbError::Mpd {
+                verb: verb.to_string(),
+                reason: format!(
+                    "the household door could not be asked: {other}"
+                ),
+            },
+        })
+}
+
+/// `library.add_source` as a consumer reaches it. A source that is
+/// not a USB volume is a share (or a media server), and adding one
+/// is protected by the household door.
+///
+/// A USB source is not door-gated: `storage.usb` registers every
+/// stick through this verb as it is plugged in, at any household
+/// level. The request names no caller, so a stick is not trusted on
+/// its say-so either. The claim is checked against the host: a
+/// mount path that is not a mounted block device under the USB
+/// root is refused and nothing is registered
+/// ([`crate::usb_claim`]).
+pub(crate) async fn add_source_for_consumer(
+    ctx: &LibraryContext,
+    payload: AddSourcePayload,
+) -> Result<AddSourceResponse, VerbError> {
+    add_source_checked(ctx, payload, &crate::usb_claim::SystemMounts).await
+}
+
+/// [`add_source_for_consumer`] against a given host.
+pub(crate) async fn add_source_checked(
+    ctx: &LibraryContext,
+    payload: AddSourcePayload,
+    host: &dyn crate::usb_claim::HostMounts,
+) -> Result<AddSourceResponse, VerbError> {
+    match &payload.kind {
+        SourceKind::LocalUsb { device_node, .. } => {
+            crate::usb_claim::verify_usb_claim(
+                &ctx.music_directory,
+                &payload.mount_path,
+                device_node,
+                host,
+            )
+            .map_err(|e| VerbError::UsbClaimInvalid {
+                reason: e.to_string(),
+            })?;
+        }
+        _ => require_household_door(ctx, "add_source").await?,
+    }
+    handle_add_source(ctx, payload).await
+}
+
+/// `library.remove_source` as a consumer reaches it. Gated for every
+/// source that is not a USB volume, whatever flags the payload
+/// carries: `consumer_stop` still drops the registry row, so it is
+/// not a way round the door. A USB source keeps its own gate, the
+/// nested `storage.usb.safe_remove`. An unknown id is not gated;
+/// it changes nothing and answers `UnknownSource` as before.
+pub(crate) async fn remove_source_for_consumer(
+    ctx: &LibraryContext,
+    queue: &crate::queue::QueueContext,
+    conn: &mut MpdConnection,
+    payload: RemoveSourcePayload,
+) -> Result<(), VerbError> {
+    let protected = match ctx.registry.get(&payload.source_id).await {
+        Some(record) => !matches!(record.kind, SourceKind::LocalUsb { .. }),
+        None => false,
+    };
+    if protected {
+        require_household_door(ctx, "remove_source").await?;
+    }
+    handle_remove_source(ctx, queue, conn, payload).await
+}
+
 pub(crate) async fn handle_add_source(
     ctx: &LibraryContext,
     payload: AddSourcePayload,
@@ -1037,12 +1217,16 @@ pub(crate) async fn handle_add_source(
     // Blocking, as `run_warm_start_probes_blocking` is: one
     // source, a bounded budget, and the response then carries a
     // state that was actually observed rather than a placeholder.
+    let mut became_online = false;
+    let mut local_usb = false;
     if let Some(registered) = ctx.registry.get(&id).await {
         let outcome = crate::source_registry::probe_source(
             &registered,
             crate::source_registry::PROBE_BUDGET,
         )
         .await;
+        local_usb = matches!(registered.kind, SourceKind::LocalUsb { .. });
+        let online = matches!(outcome.new_state, SourceState::Online);
         if let Err(e) = ctx.registry.transition(&id, outcome.new_state).await {
             tracing::warn!(
                 plugin = PLUGIN_NAME,
@@ -1051,11 +1235,25 @@ pub(crate) async fn handle_add_source(
                 "add_source: probe transition failed; source stays Probing \
                  until the next probe"
             );
+        } else {
+            became_online = online;
         }
     }
 
     let _ = ctx.registry.persist().await;
     publish_subjects(ctx).await;
+    // The first index: the same door as the shares sync and the
+    // restart pass. A USB store attached here was mounted, so its
+    // `on_mount_event` counts too. The kick waits for the gate and
+    // does not hold this verb.
+    crate::scan_door::kick_after_add(
+        ctx,
+        &id,
+        crate::scan_door::ScanTrigger::observed_now(
+            became_online,
+            became_online && local_usb,
+        ),
+    );
     Ok(AddSourceResponse {
         v: LIBRARY_PAYLOAD_VERSION,
         source_id: id,
@@ -1627,17 +1825,28 @@ async fn remove_usb_via_safe_remove(
         verb: "remove_source".into(),
         reason: e.to_string(),
     })?;
-    // plugin-system holds no scopes. safe_remove is admitted
-    // without step-up so this handoff is the same gesture the
-    // glass already ran (library.remove_source). A storage_admin
-    // gate here is the 8 ms 400: permission_denied, volume still
-    // mounted, toast `refused: 400 Bad Request`.
+    // The handoff is a nested dispatch. It holds network_admin as
+    // the framework's plugin principal, and at a household level
+    // that protects that group it carries the sitting of the
+    // operator whose library.remove_source this is. Without one,
+    // the steward refuses it by name, and that name goes back to
+    // the glass: household_policy_locked opens the household door,
+    // where a bare 400 told the operator nothing.
     dispatcher
         .dispatch("storage.usb", "storage.usb.safe_remove", bytes, None)
         .await
-        .map_err(|e| VerbError::Mpd {
-            verb: "remove_source".into(),
-            reason: format!("storage.usb.safe_remove refused: {e}"),
+        .map_err(|e| match e {
+            ShelfDispatchError::Refused { subclass, detail } => {
+                VerbError::Refused {
+                    verb: "remove_source".into(),
+                    subclass,
+                    reason: detail,
+                }
+            }
+            other => VerbError::Mpd {
+                verb: "remove_source".into(),
+                reason: format!("storage.usb.safe_remove refused: {other}"),
+            },
         })?;
     Ok(())
 }
@@ -1957,8 +2166,14 @@ pub(crate) async fn handle_browse_library(
             .get(&(payload.source_id.clone(), path.clone()))
             .cloned();
         drop(cache);
+        // The cache holds the listing as MPD gave it; what the
+        // operator has forgotten is taken out on the way to the
+        // answer, so forgetting needs no refresh.
         let full_entries: Vec<serde_json::Value> =
-            cached.map(|c| c.entries).unwrap_or_default();
+            crate::forgotten_tracks::omit_forgotten(
+                cached.map(|c| c.entries).unwrap_or_default(),
+                &ctx.forgotten.snapshot().await,
+            );
         let (page_entries, next_page, truncated) =
             paginate(&full_entries, range_start, page_size);
         return Ok(json!({
@@ -2053,10 +2268,13 @@ pub(crate) async fn handle_browse_library(
     let render_ctx = RenderCtx {
         music_directory: &ctx.music_directory,
     };
-    let rendered: Vec<serde_json::Value> = entries
-        .iter()
-        .map(|e| render_library_entry(e, Some(render_ctx)))
-        .collect();
+    let rendered: Vec<serde_json::Value> = with_artwork_hashes(
+        entries
+            .iter()
+            .map(|e| render_library_entry(e, Some(render_ctx)))
+            .collect(),
+        &ctx.artwork_hashes,
+    );
     // Cache the fresh listing (full, unpaginated — the cache is
     // the source of truth for subsequent page requests without
     // re-issuing lsinfo).
@@ -2070,8 +2288,14 @@ pub(crate) async fn handle_browse_library(
             },
         );
     }
+    // Cached as MPD gave it; answered without what the operator
+    // has forgotten.
+    let shown = crate::forgotten_tracks::omit_forgotten(
+        rendered,
+        &ctx.forgotten.snapshot().await,
+    );
     let (page_entries, next_page, truncated) =
-        paginate(&rendered, range_start, page_size);
+        paginate(&shown, range_start, page_size);
     Ok(json!({
         "v":            LIBRARY_PAYLOAD_VERSION,
         "source_id":    payload.source_id,
@@ -2081,7 +2305,7 @@ pub(crate) async fn handle_browse_library(
         "source_state": record.state,
         "page":         page,
         "page_size":    page_size,
-        "total":        rendered.len(),
+        "total":        shown.len(),
         "truncated":    truncated,
         "next_page":    next_page,
     }))
@@ -2192,6 +2416,7 @@ pub(crate) struct BrowseSelectorParent {
 /// [`handle_search_library`].
 pub(crate) async fn handle_browse_by_tag(
     conn: &mut MpdConnection,
+    ctx: &LibraryContext,
     payload: BrowseByTagPayload,
     verb_name: &'static str,
     tag: &'static str,
@@ -2204,17 +2429,16 @@ pub(crate) async fn handle_browse_by_tag(
     let page_size = requested_size.clamp(1, BROWSE_HARD_CAP);
     let range_start = page.saturating_mul(page_size);
 
-    // Drill path — return TRACKS matching the selector.
+    // What the operator has forgotten, once for this answer.
+    let forgotten = ctx.forgotten.snapshot().await;
+    let hashes = &ctx.artwork_hashes;
+
+    // Drill path — return TRACKS matching the selector, minus
+    // what the operator has forgotten.
     if let Some(selector) = payload.select.as_ref() {
         return drill_by_tag(
-            conn,
-            verb_name,
-            tag,
-            facet_key,
-            selector,
-            page,
-            page_size,
-            range_start,
+            conn, verb_name, tag, facet_key, selector, page, page_size,
+            &forgotten, hashes,
         )
         .await;
     }
@@ -2245,7 +2469,10 @@ pub(crate) async fn handle_browse_by_tag(
     //   (year extraction) and case-insensitive dedupe. See
     //   [`enumerate_generic_facet`].
     let rendered: Vec<serde_json::Value> = match facet_key {
-        "album" => enumerate_albums_via_folder(conn, verb_name).await?,
+        "album" => {
+            enumerate_albums_via_folder(conn, verb_name, &forgotten, hashes)
+                .await?
+        }
         "artist" => {
             enumerate_artists_via_fanout(conn, tag, verb_name, post_process)
                 .await?
@@ -2328,9 +2555,19 @@ pub(crate) struct AlbumTile {
 
 impl AlbumTile {
     /// Track count = number of File entries in the canonical
-    /// folder.
-    pub(crate) fn track_count(&self) -> u64 {
-        self.tracks.len() as u64
+    /// folder the operator has not forgotten. A tile whose count
+    /// is zero is not shown.
+    pub(crate) fn remaining_track_count(
+        &self,
+        forgotten: &std::collections::BTreeSet<String>,
+    ) -> u64 {
+        self.tracks
+            .iter()
+            .filter(|t| match t {
+                MpdLibraryEntry::File { path, .. } => !forgotten.contains(path),
+                _ => false,
+            })
+            .count() as u64
     }
 }
 
@@ -2570,24 +2807,36 @@ fn pick_majority(votes: &HashMap<String, u64>) -> Option<String> {
 async fn enumerate_albums_via_folder(
     conn: &mut MpdConnection,
     verb_name: &'static str,
+    forgotten: &std::collections::BTreeSet<String>,
+    hashes: &crate::artwork_hash::ArtworkHashIndex,
 ) -> Result<Vec<serde_json::Value>, VerbError> {
     let tiles = resolve_album_tiles(conn, verb_name).await?;
     let rendered = tiles
         .into_iter()
-        .map(|tile| {
+        .filter_map(|tile| {
+            // A tile counts the tracks the operator has not
+            // forgotten, and goes when none of them remain.
+            let remaining = tile.remaining_track_count(forgotten);
+            if remaining == 0 {
+                return None;
+            }
             let cover_url = evo_device_audio_shared::artwork_target_url_sized(
                 "mpd-path",
                 &tile.representative_track_path,
                 Some("small"),
             );
-            let track_count = tile.track_count();
-            json!({
+            let mut row = json!({
                 "album":       tile.display_title,
                 "album_id":    tile.canonical_folder,
                 "artist":      tile.display_artist,
                 "cover_url":   cover_url,
-                "track_count": track_count,
-            })
+                "track_count": remaining,
+            });
+            crate::artwork_hash::attach(
+                &mut row,
+                hashes.hash_for_folder(&tile.canonical_folder),
+            );
+            Some(row)
         })
         .collect();
     Ok(rendered)
@@ -2725,6 +2974,148 @@ async fn enumerate_generic_facet(
 /// renders each track via [`render_library_entry`], and
 /// paginates the same envelope shape as the enumeration
 /// response.
+/// The tracks an album selector names now — the one identity
+/// the album drill and `library.forget_album` share.
+///
+/// The enumeration path grouped tracks by
+/// [`AlbumTile::canonical_folder`]. The selector may carry the
+/// tile's `album_id` (canonical folder path, when the UI emits
+/// it) or the tile's `album` display title (backward-compatible
+/// path). Tiles are matched by whichever the selector value
+/// equals; an optional parent artist narrows same-titled albums
+/// by different artists; the tracks the tiles already carry come
+/// back, deduplicated, with no second MPD roundtrip.
+///
+/// `Ok(None)` is no tile matching the selector at all. The
+/// caller says what that means for its verb.
+async fn album_tracks_for_selector(
+    conn: &mut MpdConnection,
+    verb_name: &'static str,
+    selector: &BrowseSelector,
+) -> Result<Option<Vec<MpdLibraryEntry>>, VerbError> {
+    let selector_value = selector.value.trim();
+    let tiles = resolve_album_tiles(conn, verb_name).await?;
+    let matching: Vec<&AlbumTile> = tiles
+        .iter()
+        .filter(|t| {
+            t.canonical_folder == selector_value
+                || t.display_title.eq_ignore_ascii_case(selector_value)
+        })
+        .collect();
+    if matching.is_empty() {
+        return Ok(None);
+    }
+    // Optional parent-context filter: when the operator UI
+    // passes a parent artist (e.g. drill from an artist tile →
+    // an album under that artist), narrow the matched tiles by
+    // artist fold-key so same-titled albums by different artists
+    // disambiguate.
+    let parent_ctx = build_parent_field(selector, verb_name)?;
+    let filtered: Vec<&AlbumTile> = match &parent_ctx {
+        None => matching,
+        Some((field, value)) => {
+            let target_key = match field {
+                MpdSearchField::AlbumArtist | MpdSearchField::Artist => {
+                    artist_fold_key(value)
+                }
+                _ => String::new(),
+            };
+            if target_key.is_empty() {
+                matching
+            } else {
+                matching
+                    .into_iter()
+                    .filter(|t| {
+                        artist_fold_key(&t.display_artist) == target_key
+                    })
+                    .collect()
+            }
+        }
+    };
+    let mut all: Vec<MpdLibraryEntry> = Vec::new();
+    for tile in &filtered {
+        all.extend(tile.tracks.iter().cloned());
+    }
+    Ok(Some(dedupe_entries_by_path(all)))
+}
+
+/// `library.forget_album` request payload. `album` is the
+/// identity `library.browse_by_album` already drills — the
+/// tile's `album_id` or its display title; `parent` the same
+/// optional artist context the drill takes.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ForgetAlbumPayload {
+    pub(crate) v: u32,
+    pub(crate) album: String,
+    #[serde(default)]
+    pub(crate) parent: Option<BrowseSelectorParent>,
+}
+
+/// `library.forget_album` — every track the album drill would
+/// list now leaves the library the operator browses, through the
+/// one forgotten set `library.forget_track` keeps.
+///
+/// The files stay on disk, the source stays, the live queue is
+/// left as it is: the only MPD traffic is the read the drill
+/// itself makes. A file added to the album later is not
+/// forgotten — the set holds URIs, not the folder. An empty
+/// identity, and an album that resolves to no track, are refused
+/// before anything is forgotten.
+pub(crate) async fn handle_forget_album(
+    ctx: &LibraryContext,
+    conn: &mut MpdConnection,
+    payload: ForgetAlbumPayload,
+) -> Result<serde_json::Value, VerbError> {
+    check_version(payload.v, "library.forget_album")?;
+    let album = payload.album.trim();
+    if album.is_empty() {
+        return Err(VerbError::ForgetAlbumEmpty);
+    }
+    let selector = BrowseSelector {
+        value: album.to_string(),
+        parent: payload.parent,
+    };
+    let tracks =
+        album_tracks_for_selector(conn, "library.forget_album", &selector)
+            .await?
+            .ok_or_else(|| VerbError::ForgetAlbumUnknown {
+                album: album.to_string(),
+            })?;
+    let uris: Vec<String> = tracks
+        .into_iter()
+        .filter_map(|e| match e {
+            MpdLibraryEntry::File { path, .. } => Some(path),
+            _ => None,
+        })
+        .collect();
+    if uris.is_empty() {
+        return Err(VerbError::ForgetAlbumUnknown {
+            album: album.to_string(),
+        });
+    }
+    let mut newly = 0usize;
+    for uri in &uris {
+        if ctx.forgotten.forget(uri).await {
+            newly += 1;
+        }
+    }
+    tracing::info!(
+        plugin = PLUGIN_NAME,
+        album,
+        tracks = uris.len(),
+        newly_forgotten = newly,
+        "album forgotten"
+    );
+    Ok(json!({
+        "v": LIBRARY_PAYLOAD_VERSION,
+        "status": "ok",
+        "album": album,
+        "forgotten": uris,
+        "newly_forgotten": newly,
+        "already_forgotten": uris.len() - newly,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drill_by_tag(
     conn: &mut MpdConnection,
@@ -2734,8 +3125,10 @@ async fn drill_by_tag(
     selector: &BrowseSelector,
     page: usize,
     page_size: usize,
-    range_start: usize,
+    forgotten: &std::collections::BTreeSet<String>,
+    hashes: &crate::artwork_hash::ArtworkHashIndex,
 ) -> Result<serde_json::Value, VerbError> {
+    let range_start = page.saturating_mul(page_size);
     let selector_value = selector.value.trim();
     if selector_value.is_empty() {
         return Err(VerbError::Mpd {
@@ -2861,64 +3254,20 @@ async fn drill_by_tag(
         }
         dedupe_entries_by_path(all)
     } else if tag == "album" {
-        // Album facet drill — folder-anchored.
-        //
-        // The enumeration path grouped tracks by
-        // [`AlbumTile::canonical_folder`]. The selector may
-        // carry the tile's `album_id` (canonical folder path,
-        // when the UI emits it) or the tile's `album` display
-        // title (backward-compatible path). Match tiles by
-        // whichever the selector value equals, then return the
-        // tracks the tile already carries — no second MPD
-        // roundtrip.
-        let tiles = resolve_album_tiles(conn, verb_name).await?;
-        let matching: Vec<&AlbumTile> = tiles
-            .iter()
-            .filter(|t| {
-                t.canonical_folder == selector_value
-                    || t.display_title.eq_ignore_ascii_case(selector_value)
-            })
-            .collect();
-        if matching.is_empty() {
-            return Err(VerbError::Mpd {
-                verb: verb_name.to_string(),
-                reason: format!(
-                    "no album matched selector value {selector_value:?}"
-                ),
-            });
-        }
-        // Optional parent-context filter: when the operator UI
-        // passes a parent artist (e.g. drill from an artist
-        // tile → an album under that artist), narrow the
-        // matched tiles by artist fold-key so same-titled
-        // albums by different artists disambiguate.
-        let parent_ctx = build_parent_field(selector, verb_name)?;
-        let filtered: Vec<&AlbumTile> = match &parent_ctx {
-            None => matching,
-            Some((field, value)) => {
-                let target_key = match field {
-                    MpdSearchField::AlbumArtist | MpdSearchField::Artist => {
-                        artist_fold_key(value)
-                    }
-                    _ => String::new(),
-                };
-                if target_key.is_empty() {
-                    matching
-                } else {
-                    matching
-                        .into_iter()
-                        .filter(|t| {
-                            artist_fold_key(&t.display_artist) == target_key
-                        })
-                        .collect()
-                }
+        // Album facet drill — folder-anchored. The identity and
+        // the tracks are the ones `album_tracks_for_selector`
+        // resolves; `library.forget_album` uses the same.
+        match album_tracks_for_selector(conn, verb_name, selector).await? {
+            Some(tracks) => tracks,
+            None => {
+                return Err(VerbError::Mpd {
+                    verb: verb_name.to_string(),
+                    reason: format!(
+                        "no album matched selector value {selector_value:?}"
+                    ),
+                });
             }
-        };
-        let mut all: Vec<MpdLibraryEntry> = Vec::new();
-        for tile in &filtered {
-            all.extend(tile.tracks.iter().cloned());
         }
-        dedupe_entries_by_path(all)
     } else {
         let field = match tag {
             "artist" => MpdSearchField::Artist,
@@ -2979,15 +3328,21 @@ async fn drill_by_tag(
     // Render the tracks in the same file-entry shape
     // handle_search_library uses so any consumer of that
     // envelope reads the drill response identically.
-    let rendered: Vec<serde_json::Value> = entries
-        .iter()
-        .filter_map(|e| match e {
-            crate::mpd::MpdLibraryEntry::File { .. } => {
-                Some(render_library_entry(e, None))
-            }
-            _ => None,
-        })
-        .collect();
+    let rendered: Vec<serde_json::Value> = with_artwork_hashes(
+        crate::forgotten_tracks::omit_forgotten(
+            entries
+                .iter()
+                .filter_map(|e| match e {
+                    crate::mpd::MpdLibraryEntry::File { .. } => {
+                        Some(render_library_entry(e, None))
+                    }
+                    _ => None,
+                })
+                .collect(),
+            forgotten,
+        ),
+        hashes,
+    );
 
     let (page_entries, next_page, truncated) =
         paginate(&rendered, range_start, page_size);
@@ -3398,6 +3753,26 @@ fn pick_directory_cover_url(
     )
 }
 
+/// Stamp `artwork_hash` on every file row that has a scan-time
+/// local hash. Directory rows are left alone: their tile art is
+/// chosen by `pick_directory_cover_url`, not by an album folder.
+fn with_artwork_hashes(
+    mut rows: Vec<serde_json::Value>,
+    hashes: &crate::artwork_hash::ArtworkHashIndex,
+) -> Vec<serde_json::Value> {
+    for row in &mut rows {
+        if row.get("kind").and_then(|k| k.as_str()) != Some("file") {
+            continue;
+        }
+        let hash = row
+            .get("uri")
+            .and_then(|u| u.as_str())
+            .and_then(|uri| hashes.hash_for_path(uri));
+        crate::artwork_hash::attach(row, hash);
+    }
+    rows
+}
+
 fn render_library_entry(
     entry: &MpdLibraryEntry,
     ctx: Option<RenderCtx<'_>>,
@@ -3490,25 +3865,142 @@ fn render_library_entry(
     }
 }
 
+/// Where a source's hits sit in the one list: the local library
+/// first, then USB and NAS, then DLNA, then cloud.
+fn source_rank(kind: &SourceKind) -> u8 {
+    match kind {
+        SourceKind::LocalInternal => 0,
+        SourceKind::LocalUsb { .. }
+        | SourceKind::NetworkNasSmb { .. }
+        | SourceKind::NetworkNasNfs { .. } => 1,
+        SourceKind::NetworkDlna { .. } => 2,
+        SourceKind::CloudGdrive { .. } | SourceKind::CloudOnedrive { .. } => 3,
+    }
+}
+
+/// How many `source.dlna.browse` calls one search may spend on one
+/// DLNA source. The ContentDirectory has no search this plugin
+/// speaks, so a search walks the tree breadth-first; a tree bigger
+/// than this is answered as far as the walk got and the source is
+/// named stale.
+pub(crate) const DLNA_SEARCH_MAX_BROWSES: usize = 32;
+
+/// Whether a DLNA entry matches the query: its name, title, artist
+/// or album contains it, case-insensitively.
+fn dlna_entry_matches(entry: &serde_json::Value, query_lower: &str) -> bool {
+    ["name", "title", "artist", "album"].iter().any(|k| {
+        entry
+            .get(k)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.to_lowercase().contains(query_lower))
+    })
+}
+
+/// Search one online DLNA source through the browse this plugin
+/// already uses: walk containers from the root, breadth-first,
+/// keep the items whose name or tags contain the query, in the
+/// order the server lists them. Returns the hits and whether the
+/// walk was cut short by [`DLNA_SEARCH_MAX_BROWSES`].
+async fn dlna_search_via_browse(
+    dispatcher: &Arc<dyn ShelfRequestDispatcher>,
+    record: &SourceRecord,
+    service_id: &str,
+    query_lower: &str,
+) -> Result<(Vec<serde_json::Value>, bool), VerbError> {
+    let mut hits: Vec<serde_json::Value> = Vec::new();
+    let mut queue: std::collections::VecDeque<String> =
+        std::collections::VecDeque::from([String::new()]);
+    let mut browses = 0usize;
+    while let Some(container) = queue.pop_front() {
+        let mut page = 0usize;
+        loop {
+            if browses >= DLNA_SEARCH_MAX_BROWSES {
+                return Ok((hits, true));
+            }
+            browses += 1;
+            let answer = browse_dlna_via_source_dlna(
+                dispatcher,
+                &record.id,
+                service_id,
+                &container,
+                page,
+                evo_dlna::DLNA_PAGE_HARD_CAP as usize,
+                &record.state,
+            )
+            .await?;
+            let entries = answer
+                .get("entries")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for entry in entries {
+                let kind = entry.get("kind").and_then(|v| v.as_str());
+                match kind {
+                    Some("directory") => {
+                        if let Some(id) =
+                            entry.get("uri").and_then(|v| v.as_str())
+                        {
+                            queue.push_back(id.to_string());
+                        }
+                    }
+                    _ => {
+                        if dlna_entry_matches(&entry, query_lower) {
+                            hits.push(entry);
+                        }
+                    }
+                }
+            }
+            match answer.get("next_page").and_then(|v| v.as_u64()) {
+                Some(next) => page = next as usize,
+                None => break,
+            }
+        }
+    }
+    Ok((hits, false))
+}
+
+/// `library.search_library` — one query, one ranked list.
+///
+/// Every hit is stamped once with the source it came from. MPD is
+/// searched once for all the sources it serves — local, USB, NAS —
+/// and each hit is resolved to its source by the mount it lies
+/// under. An online DLNA source is searched through the browse
+/// this plugin already uses. A cloud source has no search client
+/// here: it is named in `stale_sources`, not skipped and not
+/// filled with invented hits. A source that was asked and failed,
+/// or whose DLNA walk was cut short, is named there too.
+///
+/// Order: the local library, then USB and NAS, then DLNA, then
+/// cloud; two sources of the same rank by source id; within one
+/// source, that source's own order. A forgotten track is omitted.
+/// An offline or retired source stays out, as before.
 pub(crate) async fn handle_search_library(
     ctx: &LibraryContext,
     conn: &mut MpdConnection,
     payload: SearchLibraryPayload,
 ) -> Result<serde_json::Value, VerbError> {
     check_version(payload.v, "library.search_library")?;
-    let max_results = payload.max_results.min(SEARCH_MAX_RESULTS_CAP);
-    let snapshot = ctx.registry.snapshot().await;
+    let max_results = payload.max_results.min(SEARCH_MAX_RESULTS_CAP) as usize;
+    let mut snapshot = ctx.registry.snapshot().await;
+    // The registry hands records back in no particular order; the
+    // list's order must be one order, so ties within a rank go by
+    // source id.
+    snapshot.sort_by(|a, b| {
+        source_rank(&a.kind)
+            .cmp(&source_rank(&b.kind))
+            .then_with(|| a.id.cmp(&b.id))
+    });
     let mut stale_sources: Vec<String> = Vec::new();
-    let mut results: Vec<serde_json::Value> = Vec::new();
-    let mut truncated = false;
+
+    // Which sources are in play.
+    let mut mpd_backed: Vec<&SourceRecord> = Vec::new();
+    let mut dlna: Vec<(&SourceRecord, String)> = Vec::new();
     for record in &snapshot {
-        // Optional source-id filter.
         if let Some(ids) = &payload.source_ids {
             if !ids.contains(&record.id) {
                 continue;
             }
         }
-        // Skip Offline sources unless include_offline.
         if matches!(
             record.state,
             SourceState::Offline { .. } | SourceState::Retired
@@ -3518,17 +4010,30 @@ pub(crate) async fn handle_search_library(
             }
             continue;
         }
-        // Skip cloud + DLNA — cloud-native search substrate is a
-        // follow-on primitive; for now those source kinds don't
-        // appear in the search results.
-        if matches!(
-            record.kind,
+        match &record.kind {
+            SourceKind::NetworkDlna { service_id, .. } => {
+                dlna.push((record, service_id.clone()));
+            }
             SourceKind::CloudGdrive { .. }
-                | SourceKind::CloudOnedrive { .. }
-                | SourceKind::NetworkDlna { .. }
-        ) {
-            continue;
+            | SourceKind::CloudOnedrive { .. } => {
+                // No cloud search client in this plugin: named,
+                // not skipped, not invented.
+                stale_sources.push(record.id.clone());
+            }
+            _ => mpd_backed.push(record),
         }
+    }
+
+    // What the operator has forgotten, once for this answer. It
+    // applies to every hit by the URI the hit carries — a library
+    // path from MPD, a `dlna:` identity from a DLNA source.
+    let forgotten = ctx.forgotten.snapshot().await;
+
+    // One MPD search for everything MPD serves, each hit stamped
+    // with the source whose mount it lies under.
+    let mut by_source: HashMap<Option<String>, Vec<serde_json::Value>> =
+        HashMap::new();
+    if !mpd_backed.is_empty() {
         let entries = conn
             .search(MpdSearchField::Any, &payload.query)
             .await
@@ -3539,22 +4044,114 @@ pub(crate) async fn handle_search_library(
         let render_ctx = RenderCtx {
             music_directory: &ctx.music_directory,
         };
+        let in_play: std::collections::HashSet<&str> =
+            mpd_backed.iter().map(|r| r.id.as_str()).collect();
         for e in entries {
+            let MpdLibraryEntry::File { path, .. } = &e else {
+                continue;
+            };
+            // A forgotten track is not a result.
+            if forgotten.contains(path) {
+                continue;
+            }
+            let source_id = crate::queue::resolve_source(
+                &ctx.music_directory,
+                path,
+                &ctx.registry,
+            )
+            .await;
+            // A hit under a source that is not in play — filtered
+            // out, offline — is not a result either. One under no
+            // registered source is kept, stamped with no source.
+            if let Some(id) = source_id.as_deref() {
+                if !in_play.contains(id) {
+                    continue;
+                }
+            }
             let mut item = render_library_entry(&e, Some(render_ctx));
+            crate::artwork_hash::attach(
+                &mut item,
+                ctx.artwork_hashes.hash_for_path(path),
+            );
             item.as_object_mut().unwrap().insert(
                 "source_id".to_string(),
-                serde_json::Value::String(record.id.clone()),
+                source_id
+                    .clone()
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Null),
             );
-            results.push(item);
-            if results.len() >= max_results as usize {
-                truncated = true;
-                break;
-            }
-        }
-        if truncated {
-            break;
+            by_source.entry(source_id).or_default().push(item);
         }
     }
+
+    // DLNA, through its own browse.
+    let query_lower = payload.query.to_lowercase();
+    for (record, service_id) in &dlna {
+        let Some(dispatcher) = ctx.shelf_dispatcher.as_ref() else {
+            stale_sources.push(record.id.clone());
+            continue;
+        };
+        match dlna_search_via_browse(
+            dispatcher,
+            record,
+            service_id,
+            &query_lower,
+        )
+        .await
+        {
+            Ok((hits, cut_short)) => {
+                // A forgotten DLNA track is not a result either:
+                // the same set, matched on the `dlna:` identity
+                // the hit carries.
+                let stamped: Vec<serde_json::Value> =
+                    crate::forgotten_tracks::omit_forgotten(hits, &forgotten)
+                        .into_iter()
+                        .map(|mut h| {
+                            h.as_object_mut().unwrap().insert(
+                                "source_id".to_string(),
+                                serde_json::Value::String(record.id.clone()),
+                            );
+                            h
+                        })
+                        .collect();
+                by_source
+                    .entry(Some(record.id.clone()))
+                    .or_default()
+                    .extend(stamped);
+                if cut_short {
+                    stale_sources.push(record.id.clone());
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    source_id = %record.id,
+                    error = %e,
+                    "search_library: dlna source asked and failed; named stale"
+                );
+                stale_sources.push(record.id.clone());
+            }
+        }
+    }
+
+    // The one list: by rank, then source id, then the source's
+    // own order; hits under no source after the local library.
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    for record in &snapshot {
+        if let Some(hits) = by_source.remove(&Some(record.id.clone())) {
+            results.extend(hits);
+        }
+        if record.kind == SourceKind::LocalInternal {
+            if let Some(hits) = by_source.remove(&None) {
+                results.extend(hits);
+            }
+        }
+    }
+    if let Some(hits) = by_source.remove(&None) {
+        results.extend(hits);
+    }
+    let truncated = results.len() > max_results;
+    results.truncate(max_results);
     Ok(json!({
         "v":             LIBRARY_PAYLOAD_VERSION,
         "results":       results,
@@ -3657,7 +4254,90 @@ pub(crate) async fn rehydrate_from_mpd(
     // library.list_works / library.get_work_recordings verb
     // surfaces have a populated cache from the first publish.
     recompute_works_aggregate(ctx, conn).await;
+    refresh_artwork_hashes(ctx, conn).await;
     publish_subjects(ctx).await;
+}
+
+/// Start the scan-time artwork hash pass: list the library's
+/// albums now, then ask the local art tier about them on a task
+/// of its own. The listing is the only work on the scan event's
+/// clock; the asking is not.
+pub(crate) async fn refresh_artwork_hashes(
+    ctx: &LibraryContext,
+    conn: &mut crate::mpd::MpdConnection,
+) {
+    let Some(dispatcher) = ctx.shelf_dispatcher.clone() else {
+        return;
+    };
+    let index = ctx.artwork_hashes.clone();
+    if !index.begin_pass() {
+        return;
+    }
+    let tiles = match resolve_album_tiles(conn, "artwork_hash_pass").await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "artwork hash pass: could not list albums; skipped"
+            );
+            index.finish_pass();
+            return;
+        }
+    };
+    let albums = pass_albums(&tiles);
+    let ask_all = index.take_first_pass();
+    let gate = ctx.scan_gate.clone();
+    tokio::spawn(async move {
+        let listed = albums.len();
+        let report = index
+            .run_with_retry(
+                Some(albums),
+                || {
+                    let gate = gate.clone();
+                    async move {
+                        let (endpoint, timeouts) = gate.mpd()?;
+                        let mut conn =
+                            crate::mpd::MpdConnection::connect_with_timeouts(
+                                endpoint, timeouts,
+                            )
+                            .await
+                            .ok()?;
+                        resolve_album_tiles(&mut conn, "artwork_hash_pass")
+                            .await
+                            .ok()
+                            .map(|t| pass_albums(&t))
+                    }
+                },
+                dispatcher.as_ref(),
+                ask_all,
+                &crate::artwork_hash::RETRY_SCHEDULE,
+            )
+            .await;
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            albums = listed,
+            asked = report.asked,
+            hashed = report.hashed,
+            no_local_art = report.no_art,
+            failed = report.failed,
+            abandoned = report.abandoned,
+            "artwork hash pass finished (local art tier only)"
+        );
+        index.finish_pass();
+    });
+}
+
+/// The albums a hash pass asks about, from the facet tiles.
+fn pass_albums(tiles: &[AlbumTile]) -> Vec<crate::artwork_hash::PassAlbum> {
+    tiles
+        .iter()
+        .map(|t| crate::artwork_hash::PassAlbum {
+            folder: t.canonical_folder.clone(),
+            representative_path: t.representative_track_path.clone(),
+            track_count: t.tracks.len(),
+        })
+        .collect()
 }
 
 /// Walk MPD's full database via `listallinfo` and compute the
@@ -4059,6 +4739,7 @@ mod tests {
             skip,
             None,
             crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
         )
     }
 
@@ -4772,6 +5453,471 @@ mod tests {
         );
     }
 
+    // ----- the household door -----
+
+    /// Answers `household.require` open or locked, and records every
+    /// dispatch it is given.
+    struct Door {
+        locked: bool,
+        seen: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl Door {
+        fn new(locked: bool) -> Arc<Self> {
+            Arc::new(Self {
+                locked,
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn asked(&self) -> usize {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, v)| v == "household.require")
+                .count()
+        }
+        fn other(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, v)| v != "household.require")
+                .map(|(_, v)| v.clone())
+                .collect()
+        }
+    }
+
+    impl ShelfRequestDispatcher for Door {
+        fn dispatch<'a>(
+            &'a self,
+            shelf: &'a str,
+            request_type: &'a str,
+            payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<u8>,
+                            evo_plugin_sdk::contract::ShelfDispatchError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((shelf.to_string(), request_type.to_string()));
+            let reply = if request_type == "household.require" {
+                let asked: serde_json::Value =
+                    serde_json::from_slice(&payload).unwrap();
+                assert_eq!(asked["scope"], "network_admin");
+                assert_eq!(shelf, "evo.household");
+                if self.locked {
+                    Err(evo_plugin_sdk::contract::ShelfDispatchError::Refused {
+                        subclass: "household_policy_locked".to_string(),
+                        detail: "the household policy protects this group"
+                            .to_string(),
+                    })
+                } else {
+                    Ok(br#"{"household_door":"open"}"#.to_vec())
+                }
+            } else {
+                Ok(Vec::new())
+            };
+            Box::pin(async move { reply })
+        }
+    }
+
+    fn door_ctx(d: &Arc<Door>) -> LibraryContext {
+        LibraryContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            SourceRegistry::new(),
+            Arc::new(NullAnn),
+            Some(Arc::clone(d) as Arc<dyn ShelfRequestDispatcher>),
+        )
+    }
+
+    fn nas_record(id: &str) -> SourceRecord {
+        let mut nas = usb_record(id, "unused");
+        nas.kind = SourceKind::NetworkNasSmb {
+            server: "192.0.2.10".to_string(),
+            share: "Music".to_string(),
+            username: "operator".to_string(),
+        };
+        nas.mount_path = PathBuf::from("/var/lib/evo/music/NAS/Music");
+        nas
+    }
+
+    fn add_nas_payload() -> AddSourcePayload {
+        AddSourcePayload {
+            v: LIBRARY_PAYLOAD_VERSION,
+            display_name: "Music".to_string(),
+            kind: SourceKind::NetworkNasSmb {
+                server: "192.0.2.10".to_string(),
+                share: "Music".to_string(),
+                username: "operator".to_string(),
+            },
+            mount_path: PathBuf::from("/var/lib/evo/music/NAS/Music"),
+            scan_policy: None,
+            probe_cadence_ms: None,
+            cloud_eager_scan_acknowledged: None,
+        }
+    }
+
+    fn assert_locked(err: &VerbError) {
+        match err {
+            VerbError::Refused { subclass, .. } => {
+                assert_eq!(subclass, "household_policy_locked")
+            }
+            other => panic!("expected the household refusal, got {other:?}"),
+        }
+    }
+
+    /// At a locked household a share cannot be
+    /// removed by a caller without a sitting, and the refusal
+    /// changes nothing: the row stays, the queue stays, MPD is not
+    /// told to update, USB is not reached. RED if the gate goes.
+    #[tokio::test]
+    async fn a_locked_door_refuses_a_share_remove_and_changes_nothing() {
+        let (mut conn, log) = live_queue_conn(
+            vec![
+                (11, "NAS/Music/a.flac".to_string()),
+                (12, "INTERNAL/keep.flac".to_string()),
+            ],
+            Some(0),
+        )
+        .await;
+        let d = Door::new(true);
+        let ctx = door_ctx(&d);
+        ctx.registry
+            .register(nas_record("nas-music"))
+            .await
+            .unwrap();
+
+        let err = remove_source_for_consumer(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("nas-music", false),
+        )
+        .await
+        .unwrap_err();
+
+        assert_locked(&err);
+        assert!(ctx.registry.get("nas-music").await.is_some(), "row kept");
+        assert_eq!(
+            remaining_queue(&mut conn).await,
+            vec![
+                "NAS/Music/a.flac".to_string(),
+                "INTERNAL/keep.flac".to_string()
+            ],
+            "queue untouched"
+        );
+        let seen = log.lock().unwrap().clone();
+        for forbidden in ["update", "rescan", "deleteid", "clear"] {
+            assert!(
+                seen.iter().all(|c| !c.starts_with(forbidden)),
+                "{forbidden} sent on a refused remove: {seen:?}"
+            );
+        }
+        assert_eq!(d.asked(), 1);
+        assert!(
+            d.other().is_empty(),
+            "no other verb reached: {:?}",
+            d.other()
+        );
+    }
+
+    /// `consumer_stop` still drops the registry row, so it is not an
+    /// exemption: a caller cannot name its way round the door.
+    #[tokio::test]
+    async fn consumer_stop_is_not_a_way_round_the_door() {
+        let d = Door::new(true);
+        let ctx = door_ctx(&d);
+        ctx.registry
+            .register(nas_record("nas-music"))
+            .await
+            .unwrap();
+        let mut conn = mock_conn().await;
+
+        let err = remove_source_for_consumer(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("nas-music", true),
+        )
+        .await
+        .unwrap_err();
+
+        assert_locked(&err);
+        assert!(ctx.registry.get("nas-music").await.is_some());
+    }
+
+    /// An open door changes nothing about what Remove does.
+    #[tokio::test]
+    async fn an_open_door_lets_a_share_remove_proceed() {
+        let d = Door::new(false);
+        let ctx = door_ctx(&d);
+        ctx.registry
+            .register(nas_record("nas-music"))
+            .await
+            .unwrap();
+        let mut conn = mock_conn().await;
+
+        remove_source_for_consumer(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("nas-music", false),
+        )
+        .await
+        .unwrap();
+
+        assert!(ctx.registry.get("nas-music").await.is_none());
+        assert_eq!(d.asked(), 1);
+        assert!(d.other().is_empty(), "a share never reaches storage.usb");
+    }
+
+    /// Adding a share is protected the same way, and refused adds
+    /// register nothing.
+    #[tokio::test]
+    async fn a_locked_door_refuses_a_share_add_and_registers_nothing() {
+        let d = Door::new(true);
+        let ctx = door_ctx(&d);
+
+        let err = add_source_for_consumer(&ctx, add_nas_payload())
+            .await
+            .unwrap_err();
+
+        assert_locked(&err);
+        assert!(
+            ctx.registry.snapshot().await.is_empty(),
+            "nothing registered"
+        );
+        assert_eq!(d.asked(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_open_door_lets_a_share_add_proceed() {
+        let d = Door::new(false);
+        let ctx = door_ctx(&d);
+
+        let res = add_source_for_consumer(&ctx, add_nas_payload()).await;
+
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(ctx.registry.snapshot().await.len(), 1);
+        assert_eq!(d.asked(), 1);
+    }
+
+    /// USB is untouched: its Remove and Add never ask the door here.
+    /// Remove's own gate is the nested `storage.usb.safe_remove`.
+    #[tokio::test]
+    async fn usb_is_not_gated_by_this_door() {
+        let d = Door::new(true);
+        let ctx = door_ctx(&d);
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+        let mut conn = mock_conn().await;
+
+        // rename/repair path: consumer_stop drops the row without
+        // the handover, so the dispatcher sees nothing at all.
+        remove_source_for_consumer(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("usb-audio", true),
+        )
+        .await
+        .unwrap();
+        assert!(ctx.registry.get("usb-audio").await.is_none());
+
+        let usb_add = AddSourcePayload {
+            v: LIBRARY_PAYLOAD_VERSION,
+            display_name: "Stick".to_string(),
+            kind: usb_record("x", "y").kind,
+            mount_path: PathBuf::from("/var/lib/evo/music/USB/stick"),
+            scan_policy: None,
+            probe_cadence_ms: None,
+            cloud_eager_scan_acknowledged: None,
+        };
+        add_source_checked(&ctx, usb_add, &StickHost).await.unwrap();
+
+        assert_eq!(d.asked(), 0, "USB never asks the household door here");
+    }
+
+    /// A host with one stick mounted where `storage.usb` puts it.
+    struct StickHost;
+
+    impl crate::usb_claim::HostMounts for StickHost {
+        fn mountinfo(&self) -> std::io::Result<String> {
+            Ok("36 25 8:1 / /var/lib/evo/music/USB/stick rw - vfat /dev/sda1 rw\n\
+                40 25 0:40 / /var/lib/evo/music/USB/share rw - cifs //nas/x rw\n"
+                .to_string())
+        }
+        fn canonical(&self, path: &str) -> Option<PathBuf> {
+            match path {
+                "/dev/disk/by-uuid/test" | "/dev/sda1" => {
+                    Some(PathBuf::from("/dev/sda1"))
+                }
+                _ => None,
+            }
+        }
+    }
+
+    fn usb_add_at(path: &str) -> AddSourcePayload {
+        AddSourcePayload {
+            v: LIBRARY_PAYLOAD_VERSION,
+            display_name: "Stick".to_string(),
+            kind: usb_record("x", "y").kind,
+            mount_path: PathBuf::from(path),
+            scan_policy: None,
+            probe_cadence_ms: None,
+            cloud_eager_scan_acknowledged: None,
+        }
+    }
+
+    /// The operator-visible contract: a consumer cannot
+    /// register an arbitrary path as a USB source, at any household
+    /// level. Nothing is registered, and nothing is probed.
+    #[tokio::test]
+    async fn an_arbitrary_path_is_never_registered_as_usb() {
+        for open_door in [false, true] {
+            let d = Door::new(!open_door);
+            let ctx = door_ctx(&d);
+            for path in [
+                "/etc",
+                "/var/lib/evo/music/INTERNAL",
+                "/var/lib/evo/music/NAS/Music",
+                "/var/lib/evo/music/USB/ghost",
+                "/var/lib/evo/music/USB/share",
+                "/var/lib/evo/music/USB/../NAS/Music",
+            ] {
+                let err =
+                    add_source_checked(&ctx, usb_add_at(path), &StickHost)
+                        .await
+                        .unwrap_err();
+                assert!(
+                    matches!(err, VerbError::UsbClaimInvalid { .. }),
+                    "{path}: {err:?}"
+                );
+            }
+            assert!(
+                ctx.registry.snapshot().await.is_empty(),
+                "nothing registered (door open: {open_door})"
+            );
+        }
+    }
+
+    /// Hotplug must not invert: a stick that is really mounted is
+    /// registered at a locked household, with no door question.
+    #[tokio::test]
+    async fn a_genuine_stick_registers_even_at_a_locked_door() {
+        let d = Door::new(true);
+        let ctx = door_ctx(&d);
+        let res = add_source_checked(
+            &ctx,
+            usb_add_at("/var/lib/evo/music/USB/stick"),
+            &StickHost,
+        )
+        .await;
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(ctx.registry.snapshot().await.len(), 1);
+        assert_eq!(d.asked(), 0);
+    }
+
+    /// The verb entry a consumer reaches checks against the real
+    /// host. In a test there is no such mount, so the claim fails.
+    /// RED if the entry stops checking.
+    #[tokio::test]
+    async fn the_consumer_entry_checks_the_claim_against_the_host() {
+        let d = Door::new(false);
+        let ctx = door_ctx(&d);
+        let err = add_source_for_consumer(
+            &ctx,
+            usb_add_at("/var/lib/evo/music/USB/stick"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, VerbError::UsbClaimInvalid { .. }), "{err:?}");
+        assert!(ctx.registry.snapshot().await.is_empty());
+    }
+
+    /// The background handler is not the consumer entry. A share
+    /// retired by the shares sync is removed at a locked household,
+    /// because no consumer asked for it.
+    #[tokio::test]
+    async fn the_background_handler_is_not_gated() {
+        let d = Door::new(true);
+        let ctx = door_ctx(&d);
+        ctx.registry
+            .register(nas_record("nas-music"))
+            .await
+            .unwrap();
+        let mut conn = mock_conn().await;
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("nas-music", false),
+        )
+        .await
+        .unwrap();
+
+        assert!(ctx.registry.get("nas-music").await.is_none());
+        assert_eq!(d.asked(), 0);
+    }
+
+    /// No dispatcher at admission: the door cannot be asked, so a
+    /// protected change is refused, as a USB remove without a
+    /// dispatcher already is.
+    #[tokio::test]
+    async fn a_door_that_cannot_be_asked_is_not_an_open_one() {
+        let ctx = LibraryContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            SourceRegistry::new(),
+            Arc::new(NullAnn),
+            None,
+        );
+        ctx.registry
+            .register(nas_record("nas-music"))
+            .await
+            .unwrap();
+        let mut conn = mock_conn().await;
+
+        let err = remove_source_for_consumer(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("nas-music", false),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, VerbError::Mpd { .. }), "{err:?}");
+        assert!(ctx.registry.get("nas-music").await.is_some());
+    }
+
+    /// The consumer's verb entry is the gated one, and the shares
+    /// sync is not. A call site that swapped back would reopen
+    /// the hole with every other pin green.
+    #[test]
+    fn the_verb_entry_is_gated_and_the_sync_is_not() {
+        let shelves = include_str!("shelves.rs");
+        assert!(shelves.contains("library::add_source_for_consumer("));
+        assert!(shelves.contains("library::remove_source_for_consumer("));
+        assert!(!shelves.contains("library::handle_add_source("));
+        assert!(!shelves.contains("library::handle_remove_source("));
+        let sync = include_str!("network_shares_sync.rs");
+        assert!(sync.contains("handle_remove_source("));
+        assert!(!sync.contains("_for_consumer"));
+    }
+
     #[tokio::test]
     async fn removing_a_non_usb_source_does_not_call_safe_remove() {
         let d = Arc::new(RecordingDispatcher::default());
@@ -5393,6 +6539,13 @@ mod tests {
             budget_ms: 15_000
         })
         .contains("15000ms"));
+        assert_eq!(
+            shelf_error_reason(&ShelfDispatchError::Refused {
+                subclass: "household_policy_locked".into(),
+                detail: "protected".into(),
+            }),
+            "refused (household_policy_locked): protected"
+        );
         assert!(shelf_error_reason(&ShelfDispatchError::SubstrateFailure {
             detail: "router down".into()
         })
@@ -5525,6 +6678,84 @@ mod tests {
         assert_eq!(entries[1]["kind"], "file");
         assert_eq!(entries[1]["uri"], "dlna:uuid:server-1/12$1");
         assert!(!entries[1].as_object().unwrap().contains_key("stable_uri"));
+    }
+
+    /// The household refusal on the safe_remove handoff leaves
+    /// remove_source under its own name, not as an MPD error.
+    #[tokio::test]
+    async fn a_household_refusal_of_safe_remove_keeps_its_name() {
+        let captured = Arc::new(Mutex::new(None));
+        let disp: Arc<dyn ShelfRequestDispatcher> = Arc::new(FakeDispatcher {
+            response: Vec::new(),
+            error: Some(ShelfDispatchError::Refused {
+                subclass: "household_policy_locked".into(),
+                detail: "verb \"storage.usb.safe_remove\" touches a settings \
+                         group the household policy protects"
+                    .into(),
+            }),
+            captured: Arc::clone(&captured),
+        });
+        let ctx = LibraryContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            SourceRegistry::new(),
+            Arc::new(NullAnn),
+            Some(disp),
+        );
+        let err = remove_usb_via_safe_remove(
+            &ctx,
+            "usb-audio",
+            &usb_record("usb-audio", "MUSIC"),
+        )
+        .await
+        .expect_err("the refusal must surface");
+        match err {
+            VerbError::Refused {
+                verb,
+                subclass,
+                reason,
+            } => {
+                assert_eq!(verb, "remove_source");
+                assert_eq!(subclass, "household_policy_locked");
+                assert!(reason.contains("household policy"), "{reason}");
+            }
+            other => panic!("expected VerbError::Refused, got {other:?}"),
+        }
+        let (shelf, verb, _) =
+            captured.lock().await.clone().expect("the handoff was made");
+        assert_eq!(
+            (shelf.as_str(), verb.as_str()),
+            ("storage.usb", "storage.usb.safe_remove")
+        );
+    }
+
+    /// Any other handoff failure stays the MPD-side error it was.
+    #[tokio::test]
+    async fn an_unnamed_safe_remove_failure_stays_an_mpd_error() {
+        let disp: Arc<dyn ShelfRequestDispatcher> = Arc::new(FakeDispatcher {
+            response: Vec::new(),
+            error: Some(ShelfDispatchError::SubstrateFailure {
+                detail: "wire transport closed".into(),
+            }),
+            captured: Arc::new(Mutex::new(None)),
+        });
+        let ctx = LibraryContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            SourceRegistry::new(),
+            Arc::new(NullAnn),
+            Some(disp),
+        );
+        let err = remove_usb_via_safe_remove(
+            &ctx,
+            "usb-audio",
+            &usb_record("usb-audio", "MUSIC"),
+        )
+        .await
+        .expect_err("the failure must surface");
+        assert!(
+            matches!(&err, VerbError::Mpd { reason, .. }
+                if reason.contains("wire transport closed")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -5957,6 +7188,28 @@ mod tests {
     // a file tree; portraits belong on the artist facet, which
     // keys on the tag. See `pick_directory_cover_url`'s docs.
     // -----------------------------------------------------------
+
+    /// File rows get the album's scan-time hash; directory rows
+    /// and rows of albums without one are left exactly as they were.
+    #[test]
+    fn file_rows_are_stamped_and_directory_rows_are_not() {
+        let idx = crate::artwork_hash::ArtworkHashIndex::default();
+        idx.seed("A/One", Some("h1"));
+        idx.seed("A/Bare", None);
+        let rows = with_artwork_hashes(
+            vec![
+                json!({"kind": "file", "uri": "A/One/01.flac"}),
+                json!({"kind": "file", "uri": "A/Bare/01.flac"}),
+                json!({"kind": "file", "uri": "A/Unknown/01.flac"}),
+                json!({"kind": "directory", "uri": "A/One"}),
+            ],
+            &idx,
+        );
+        assert_eq!(rows[0]["artwork_hash"], "h1");
+        assert!(rows[1].get("artwork_hash").is_none());
+        assert!(rows[2].get("artwork_hash").is_none());
+        assert!(rows[3].get("artwork_hash").is_none());
+    }
 
     #[test]
     fn tier1_self_cover_wins_when_direct_sidecar_present() {
@@ -6402,5 +7655,430 @@ mod artist_image_container_tests {
         let url = pick_directory_cover_url("Container Name", music_dir);
         assert!(url.contains("Container%20Name"), "got {url}");
         assert!(!url.contains("First%20Album"), "got {url}");
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    //! One query, one ranked list — pinned against a mock MPD, a
+    //! registry of every source kind, and a mock DLNA peer.
+
+    use super::*;
+    use crate::playback_supervisor::test_mock::{
+        short_timeouts, spawn_mock_mpd, CapturingSubjectAnnouncer,
+        ConnBehaviour,
+    };
+    use crate::source_registry::{ScanPolicy, SourceRecord, SourceRegistry};
+    use evo_plugin_sdk::contract::{ShelfDispatchError, SubjectAnnouncer};
+    use std::collections::BTreeMap;
+
+    const LOCAL_HIT: &str = "INTERNAL/Low/trust.flac";
+    const USB_HIT: &str = "USB/Stick/song trust.flac";
+    const NOWHERE_HIT: &str = "Other/elsewhere trust.flac";
+    const NAS_OFF_HIT: &str = "NAS/Box/trust at sea.flac";
+    const MISS: &str = "INTERNAL/Low/other.flac";
+
+    /// A DLNA peer with a small tree under service `svc-1`: the
+    /// root holds one container and one matching item; the
+    /// container holds one matching and one non-matching item.
+    /// Service `svc-fail` refuses every browse. Service
+    /// `svc-deep` answers every container with another container
+    /// and a matching item, for ever.
+    #[derive(Default)]
+    struct TreeDispatcher {
+        browses: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ShelfRequestDispatcher for TreeDispatcher {
+        fn dispatch<'a>(
+            &'a self,
+            _shelf: &'a str,
+            request_type: &'a str,
+            payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Vec<u8>, ShelfDispatchError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let req: serde_json::Value =
+                serde_json::from_slice(&payload).unwrap_or_default();
+            let service = req["service_id"].as_str().unwrap_or("").to_string();
+            let object = req["object_id"].as_str().unwrap_or("0").to_string();
+            self.browses
+                .lock()
+                .unwrap()
+                .push(format!("{request_type} {service} {object}"));
+            Box::pin(async move {
+                if service == "svc-fail" {
+                    return Err(ShelfDispatchError::NoPluginOnShelf {
+                        shelf: "audio.dlna".to_string(),
+                    });
+                }
+                let entries = if service == "svc-deep" {
+                    vec![
+                        json!({ "kind": "directory", "name": "deeper", "path": format!("{object}/d"), "uri": format!("{object}/d") }),
+                        json!({ "kind": "item", "name": "Trust forever", "path": format!("{object}/i"), "uri": format!("dlna:svc-deep/{object}/i") }),
+                    ]
+                } else if object == "0" {
+                    vec![
+                        json!({ "kind": "directory", "name": "Albums", "path": "c1", "uri": "c1" }),
+                        json!({ "kind": "item", "name": "Trust (live)", "path": "i1", "uri": "dlna:svc-1/i1" }),
+                    ]
+                } else if object == "c1" {
+                    vec![
+                        json!({ "kind": "item", "name": "Words", "title": "Words", "album": "Trust", "path": "i2", "uri": "dlna:svc-1/i2" }),
+                        json!({ "kind": "item", "name": "Nothing here", "path": "i3", "uri": "dlna:svc-1/i3" }),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                let body = json!({
+                    "v": 1, "status": "ok", "service_id": service,
+                    "path": object, "entries": entries,
+                    "page": 0, "page_size": 100, "total": 2,
+                    "truncated": false, "next_page": null,
+                });
+                Ok(serde_json::to_vec(&body).unwrap())
+            })
+        }
+    }
+
+    fn record(
+        id: &str,
+        kind: SourceKind,
+        mount: &str,
+        state: SourceState,
+    ) -> SourceRecord {
+        SourceRecord {
+            id: id.into(),
+            display_name: id.into(),
+            kind,
+            mount_path: PathBuf::from(mount),
+            mpd_storage_name: None,
+            state,
+            last_seen_online_at_ms: Some(1),
+            probe_cadence_ms: 60_000,
+            scan_policy: ScanPolicy::EagerIncremental {
+                on_online: true,
+                on_mount_event: false,
+            },
+            track_count: 0,
+            track_count_available: 0,
+            last_scan_at_ms: None,
+        }
+    }
+
+    struct Harness {
+        ctx: LibraryContext,
+        conn: MpdConnection,
+        commands: Arc<std::sync::Mutex<Vec<String>>>,
+        dispatcher: Arc<TreeDispatcher>,
+    }
+
+    async fn harness(extra: Vec<SourceRecord>) -> Harness {
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // USB before local in MPD's own order, so rank is seen to
+        // win over the order MPD answered in.
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::StoredPlaylists {
+                commands: Arc::clone(&commands),
+                playlists: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+                library: vec![(
+                    String::new(),
+                    Vec::new(),
+                    vec![
+                        USB_HIT.to_string(),
+                        NAS_OFF_HIT.to_string(),
+                        NOWHERE_HIT.to_string(),
+                        LOCAL_HIT.to_string(),
+                        MISS.to_string(),
+                    ],
+                )],
+                queue: Vec::new(),
+            }])
+            .await;
+        let conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+        let registry = SourceRegistry::new();
+        let m = "/m";
+        registry
+            .upsert(record(
+                "local-internal",
+                SourceKind::LocalInternal,
+                "/m/INTERNAL",
+                SourceState::Online,
+            ))
+            .await;
+        registry
+            .upsert(record(
+                "usb-1",
+                SourceKind::LocalUsb {
+                    device_node: "/dev/sda1".into(),
+                    label: "Stick".into(),
+                },
+                "/m/USB/Stick",
+                SourceState::Online,
+            ))
+            .await;
+        registry
+            .upsert(record(
+                "nas-off",
+                SourceKind::NetworkNasSmb {
+                    server: "box".into(),
+                    share: "music".into(),
+                    username: "u".into(),
+                },
+                "/m/NAS/Box",
+                SourceState::Offline {
+                    reason: "gone".into(),
+                    since_ms: 1,
+                },
+            ))
+            .await;
+        for r in extra {
+            registry.upsert(r).await;
+        }
+        let dispatcher = Arc::new(TreeDispatcher::default());
+        let ctx = LibraryContext::new(
+            PathBuf::from(m),
+            registry,
+            Arc::new(CapturingSubjectAnnouncer::default())
+                as Arc<dyn SubjectAnnouncer>,
+            Some(Arc::clone(&dispatcher) as Arc<dyn ShelfRequestDispatcher>),
+        );
+        Harness {
+            ctx,
+            conn,
+            commands,
+            dispatcher,
+        }
+    }
+
+    fn dlna(id: &str, service: &str) -> SourceRecord {
+        record(
+            id,
+            SourceKind::NetworkDlna {
+                service_id: service.into(),
+                control_url: String::new(),
+                base_url: String::new(),
+            },
+            "/nowhere",
+            SourceState::Online,
+        )
+    }
+
+    fn cloud(id: &str) -> SourceRecord {
+        record(
+            id,
+            SourceKind::CloudGdrive {
+                account_ref: "acct".into(),
+            },
+            "/nowhere",
+            SourceState::Online,
+        )
+    }
+
+    async fn search(
+        h: &mut Harness,
+        include_offline: bool,
+    ) -> serde_json::Value {
+        handle_search_library(
+            &h.ctx,
+            &mut h.conn,
+            SearchLibraryPayload {
+                v: 1,
+                query: "trust".into(),
+                source_ids: None,
+                include_offline,
+                max_results: 50,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    fn stamps(v: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
+        v["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["uri"].as_str().unwrap().to_string(),
+                    r["source_id"].clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// MPD is searched once for every source it serves, and each
+    /// hit carries the one source whose mount it lies under; a
+    /// hit under no registered source is stamped with none.
+    #[tokio::test]
+    async fn one_mpd_search_stamps_each_hit_once() {
+        let mut h = harness(vec![]).await;
+        let v = search(&mut h, false).await;
+        let searches = h
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.starts_with("search "))
+            .count();
+        assert_eq!(searches, 1, "one MPD search, not one per source");
+        let s = stamps(&v);
+        assert_eq!(
+            s,
+            vec![
+                (LOCAL_HIT.to_string(), json!("local-internal")),
+                (NOWHERE_HIT.to_string(), serde_json::Value::Null),
+                (USB_HIT.to_string(), json!("usb-1")),
+            ],
+            "{v}"
+        );
+        assert!(v["stale_sources"].as_array().unwrap().is_empty(), "{v}");
+    }
+
+    /// The list is ranked: the local library, then USB and NAS,
+    /// then DLNA, then cloud — whatever order MPD or the registry
+    /// answered in. Within a source, that source's own order.
+    #[tokio::test]
+    async fn the_list_is_ranked_local_then_usb_then_dlna() {
+        let mut h =
+            harness(vec![dlna("dlna-1", "svc-1"), cloud("cloud-1")]).await;
+        let v = search(&mut h, false).await;
+        let ids: Vec<serde_json::Value> =
+            stamps(&v).into_iter().map(|(_, id)| id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                json!("local-internal"),
+                serde_json::Value::Null,
+                json!("usb-1"),
+                json!("dlna-1"),
+                json!("dlna-1"),
+            ],
+            "{v}"
+        );
+    }
+
+    /// An online DLNA source is searched through its browse: the
+    /// matching items from the root and from a container are in
+    /// the list, in the order the server listed them, stamped
+    /// with the source, carrying the stable `dlna:` identity.
+    #[tokio::test]
+    async fn a_dlna_hit_from_an_online_source_is_in_the_list() {
+        let mut h = harness(vec![dlna("dlna-1", "svc-1")]).await;
+        let v = search(&mut h, false).await;
+        let dlna_hits: Vec<String> = stamps(&v)
+            .into_iter()
+            .filter(|(_, id)| id == "dlna-1")
+            .map(|(uri, _)| uri)
+            .collect();
+        assert_eq!(dlna_hits, vec!["dlna:svc-1/i1", "dlna:svc-1/i2"], "{v}");
+        let browses = h.dispatcher.browses.lock().unwrap().clone();
+        assert_eq!(
+            browses,
+            vec!["source.dlna.browse svc-1 0", "source.dlna.browse svc-1 c1"],
+            "root, then the container, through the browse verb"
+        );
+        assert!(v["stale_sources"].as_array().unwrap().is_empty());
+    }
+
+    /// A cloud source is named in `stale_sources` — not silently
+    /// skipped, not filled with invented hits.
+    #[tokio::test]
+    async fn a_cloud_source_is_named_and_not_invented() {
+        let mut h = harness(vec![cloud("cloud-1")]).await;
+        let v = search(&mut h, false).await;
+        assert_eq!(v["stale_sources"], json!(["cloud-1"]), "{v}");
+        assert!(
+            stamps(&v).iter().all(|(_, id)| id != "cloud-1"),
+            "no invented cloud hits: {v}"
+        );
+    }
+
+    /// A DLNA source that was asked and failed is named stale,
+    /// and the rest of the list is still answered.
+    #[tokio::test]
+    async fn a_dlna_source_that_fails_is_named_stale() {
+        let mut h =
+            harness(vec![dlna("dlna-1", "svc-1"), dlna("dlna-2", "svc-fail")])
+                .await;
+        let v = search(&mut h, false).await;
+        assert_eq!(v["stale_sources"], json!(["dlna-2"]), "{v}");
+        assert!(stamps(&v).iter().any(|(_, id)| id == "dlna-1"));
+        assert!(stamps(&v).iter().all(|(_, id)| id != "dlna-2"));
+    }
+
+    /// A forgotten track is not a result.
+    #[tokio::test]
+    async fn a_forgotten_uri_is_omitted() {
+        let mut h = harness(vec![]).await;
+        h.ctx.forgotten.forget(LOCAL_HIT).await;
+        let v = search(&mut h, false).await;
+        assert!(stamps(&v).iter().all(|(uri, _)| uri != LOCAL_HIT), "{v}");
+        assert_eq!(stamps(&v).len(), 2);
+    }
+
+    /// A forgotten DLNA track is not a result either: the same
+    /// set, matched on the `dlna:` identity the hit carries.
+    /// Searching for it does not put it back.
+    #[tokio::test]
+    async fn a_forgotten_dlna_uri_is_omitted() {
+        let mut h = harness(vec![dlna("dlna-1", "svc-1")]).await;
+        h.ctx.forgotten.forget("dlna:svc-1/i1").await;
+        let v = search(&mut h, false).await;
+        let dlna_hits: Vec<String> = stamps(&v)
+            .into_iter()
+            .filter(|(_, id)| id == "dlna-1")
+            .map(|(uri, _)| uri)
+            .collect();
+        assert_eq!(dlna_hits, vec!["dlna:svc-1/i2"], "{v}");
+        assert!(
+            stamps(&v).iter().all(|(uri, _)| uri != "dlna:svc-1/i1"),
+            "a forgotten DLNA hit must not come back through search: {v}"
+        );
+    }
+
+    /// An offline source stays out: its hits are not in the list,
+    /// and it is named stale only when the caller asks to include
+    /// offline sources.
+    #[tokio::test]
+    async fn an_offline_source_stays_out() {
+        let mut h = harness(vec![]).await;
+        let v = search(&mut h, false).await;
+        assert!(stamps(&v).iter().all(|(uri, _)| uri != NAS_OFF_HIT), "{v}");
+        assert!(v["stale_sources"].as_array().unwrap().is_empty());
+        let v = search(&mut h, true).await;
+        assert!(stamps(&v).iter().all(|(uri, _)| uri != NAS_OFF_HIT), "{v}");
+        assert_eq!(v["stale_sources"], json!(["nas-off"]));
+    }
+
+    /// A DLNA tree deeper than the walk's budget is answered as
+    /// far as the walk got, and the source is named stale.
+    #[tokio::test]
+    async fn a_bottomless_dlna_tree_is_cut_short_and_named_stale() {
+        let mut h = harness(vec![dlna("dlna-deep", "svc-deep")]).await;
+        let v = search(&mut h, false).await;
+        let hits = stamps(&v)
+            .iter()
+            .filter(|(_, id)| id == "dlna-deep")
+            .count();
+        assert_eq!(
+            hits, DLNA_SEARCH_MAX_BROWSES,
+            "one hit per browse, then stop"
+        );
+        assert_eq!(
+            h.dispatcher.browses.lock().unwrap().len(),
+            DLNA_SEARCH_MAX_BROWSES
+        );
+        assert_eq!(v["stale_sources"], json!(["dlna-deep"]), "{v}");
     }
 }
