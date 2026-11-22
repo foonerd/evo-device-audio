@@ -534,14 +534,12 @@ toml_path.write_text(new_text)
 print("  workspace-member filter: applied", file=sys.stderr)
 PYEOF
 
-# Drop any leftover Cargo.lock and regenerate against the
-# filtered workspace via cargo metadata. The locked-build CI
-# step compares this lockfile against the manifests; it must
-# match the post-filter workspace.
-rm -f "${STAGE_DIR}/Cargo.lock"
+# Keep the tag's Cargo.lock and let cargo metadata prune it to the
+# filtered workspace. Never delete it and resolve afresh: a fresh
+# resolution can pull a dependency the MSRV cannot build.
 (
     cd "${STAGE_DIR}"
-    cargo metadata --format-version 1 > /dev/null
+    cargo "+${TOOLCHAIN}" metadata --format-version 1 > /dev/null
 )
 
 # -------------------------------------------------------------
