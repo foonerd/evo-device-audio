@@ -1,0 +1,54 @@
+# org.evoframework.receiver.dlna: the device as a UPnP/DLNA MediaRenderer.
+#
+# The plugin is the renderer. It advertises over SSDP, serves the
+# device and service description, and answers the control and
+# event endpoints itself. There is no external renderer daemon.
+# Disabled by default; no socket is open while disabled.
+[plugin]
+name = "org.evoframework.receiver.dlna"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "audio.receiver"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+evo_min_version = "0.1.12"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 32
+max_cpu_percent = 5
+
+[lifecycle]
+mode = "reload-cleanable"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = [
+    "receiver.dlna.get_state",
+    "receiver.dlna.enable",
+    "receiver.dlna.disable",
+]
+response_budget_ms = 10000
+
+[capabilities.respondent.verb_capabilities]
+"receiver.dlna.get_state" = { kind = "none" }
+"receiver.dlna.enable" = { kind = "write", scope = "network_admin" }
+"receiver.dlna.disable" = { kind = "write", scope = "network_admin" }

@@ -1,0 +1,45 @@
+schema_version: "1.0"
+plugin: org.evoframework.receiver.dlna
+owner: evo-device-audio
+isolation: oop
+has_os_dependencies: false
+
+# Out-of-process plugin shipped as a signed bundle. The plugin is the
+# renderer: it needs no host binary, no systemd unit and no sudo. While
+# enabled it holds two network listeners and nothing else outside its
+# own state directory:
+#
+#   - UDP, joined to the SSDP multicast group 239.255.255.250:1900,
+#     opened with address reuse so the source.dlna client's passive
+#     NOTIFY listener keeps binding beside it;
+#   - TCP, one persisted port at or above 1024, for the device and
+#     service description, the SOAP control endpoints and the event
+#     endpoints.
+#
+# Both accept LAN-origin peers only (the steward's own predicate:
+# RFC1918, loopback, link-local, unique-local). Neither is open while
+# the plugin is disabled, which is the default.
+
+capability_intent:
+  - id: ssdp_multicast_listener
+    need: bind UDP 1900 with address and port reuse, join 239.255.255.250 on each LAN IPv4 interface, answer M-SEARCH from LAN peers and announce alive and byebye for the renderer's device and service types.
+    access_path: direct socket
+    failure_mode: bind or join failure leaves the plugin enabled but degraded with reason `ssdp_bind_failed`; no advertisement is made and the source.dlna client is unaffected.
+  - id: description_and_control_listener
+    need: bind one TCP port at or above 1024 on all interfaces to serve the device description, the three service descriptions and the control and event endpoints to LAN peers.
+    access_path: direct socket
+    failure_mode: bind failure leaves the plugin enabled but degraded with reason `http_bind_failed`; the plugin advertises nothing without a description to point at.
+
+required_binaries: []
+
+required_kernel_modules: []
+
+required_system_services: []
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+  expected:
+    - state directory exists as the steward identity
+
+host_provisioning: {}

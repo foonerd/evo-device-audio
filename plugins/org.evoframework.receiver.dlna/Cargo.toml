@@ -1,0 +1,42 @@
+[package]
+name = "org-evoframework-receiver-dlna"
+# Keep in sync with manifest.toml [plugin].version and PluginIdentity in describe().
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The device as a UPnP/DLNA MediaRenderer, built in-process. Owns SSDP advertisement, the device and service description and the control and event endpoints, and publishes the reactive audio_receiver_dlna subject. Default disabled; enable and disable are write verbs under network_admin. Orthogonal to the source.dlna client."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "receiver-dlna-wire"
+path = "src/bin/receiver-dlna-wire.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+bytes = "1"
+evo-plugin-sdk = { workspace = true }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+if-addrs = "0.13"
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+socket2 = { version = "0.5", features = ["all"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "time", "sync", "rt", "macros", "io-util", "fs"] }
+tracing = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+evo-dlna = { path = "../../crates/evo-dlna" }
+roxmltree = "0.20"
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+[lints]
+workspace = true

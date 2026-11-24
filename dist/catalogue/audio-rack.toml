@@ -69,6 +69,19 @@ network_dlna sources for the unified Library UI.
 """
 
 [[racks.shelves]]
+name = "receiver"
+shape = 1
+description = """
+Audio receivers: the device as a network target that other \
+players send audio to. Multi-occupant respondent shelf, one \
+plugin per protocol with disjoint verb sets. The DLNA renderer \
+(org.evoframework.receiver.dlna) stocks receiver.dlna.get_state \
+/ enable / disable and publishes audio_receiver_dlna. Default \
+disabled; enabling is a write under network_admin. Orthogonal \
+to audio.dlna, the MediaServer client.
+"""
+
+[[racks.shelves]]
 name = "delivery"
 shape = 2
 description = """
@@ -904,6 +917,14 @@ name = "network_share_events"
 # apply / user_add / user_revoke.
 [[subjects]]
 name = "system_smb_server"
+
+# Published by `org.evoframework.receiver.dlna`: singleton
+# `audio_receiver_dlna` carrying the renderer's state
+# (disabled / starting / advertising / degraded + reason),
+# the operator switch, the friendly name, the device UUID and
+# the description port. Republished on every transition.
+[[subjects]]
+name = "audio_receiver_dlna"
 
 # Published by `org.evoframework.storage.usb`: singleton
 # `storage_usb_drives` carrying the full USB-drive inventory
