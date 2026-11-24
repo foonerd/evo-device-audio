@@ -10,18 +10,25 @@
 
 use std::sync::Arc;
 
+use org_evoframework_receiver_dlna::bridge::NoPlayer;
+use org_evoframework_receiver_dlna::control::Control;
 use org_evoframework_receiver_dlna::description::{
     device_description, SERVICES,
 };
-use org_evoframework_receiver_dlna::http::{start, DeviceInfo};
+use org_evoframework_receiver_dlna::events::Subscriptions;
+use org_evoframework_receiver_dlna::http::{start, DeviceInfo, Services};
 
 #[tokio::test]
 async fn the_client_fetch_path_refuses_the_renderer() {
     let h = start(
         "127.0.0.1:0".parse().unwrap(),
-        Arc::new(DeviceInfo {
-            uuid: "11111111-2222-3333-4444-555555555555".into(),
-            friendly_name: "Kitchen".into(),
+        Arc::new(Services {
+            info: DeviceInfo {
+                uuid: "11111111-2222-3333-4444-555555555555".into(),
+                friendly_name: "Kitchen".into(),
+            },
+            control: Control::new(Arc::new(NoPlayer)),
+            subs: Subscriptions::new(),
         }),
     )
     .await

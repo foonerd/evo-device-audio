@@ -32,10 +32,14 @@ use evo_plugin_sdk::contract::{
 };
 use evo_plugin_sdk::Manifest;
 
+pub mod bridge;
+pub mod control;
 pub mod description;
+pub mod events;
 pub mod http;
 pub mod lan;
 pub mod runtime;
+pub mod soap;
 pub mod ssdp;
 pub mod state;
 
@@ -126,6 +130,17 @@ impl Plugin for ReceiverDlnaPlugin {
                     ))
                 })?,
             );
+            // The player is `playback.mpd`, reached by its verbs. Without the
+            // peer dispatcher the renderer still advertises, and every
+            // control action answers "Action Failed".
+            match ctx.shelf_request_dispatcher.clone() {
+                Some(d) => rt.set_player(Arc::new(bridge::PeerPlayer::new(d))),
+                None => tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    "no shelf request dispatcher in the load context; control \
+                     actions will fail until the steward provides one"
+                ),
+            }
             if let Err(e) = rt
                 .attach_subject_publisher(Arc::clone(&ctx.subject_announcer))
                 .await

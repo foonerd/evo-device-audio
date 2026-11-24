@@ -17,12 +17,14 @@ path = "src/bin/receiver-dlna-wire.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = "0.1"
 bytes = "1"
 evo-plugin-sdk = { workspace = true }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 if-addrs = "0.13"
+roxmltree = "0.20"
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -34,7 +36,6 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 evo-dlna = { path = "../../crates/evo-dlna" }
-roxmltree = "0.20"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 

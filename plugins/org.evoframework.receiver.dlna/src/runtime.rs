@@ -19,7 +19,10 @@ use evo_plugin_sdk::contract::{
 use serde::Serialize;
 use tokio::sync::Mutex;
 
-use crate::http::{self, DeviceInfo, HttpHandle};
+use crate::bridge::{NoPlayer, Player};
+use crate::control::Control;
+use crate::events::{self, Subscriptions};
+use crate::http::{self, DeviceInfo, HttpHandle, Services};
 use crate::ssdp::{self, Identity, SsdpConfig, SsdpHandle};
 use crate::state::{self, Persisted};
 
@@ -120,8 +123,11 @@ impl RuntimeConfig {
 }
 
 struct Running {
+    control: Arc<Control>,
     http: HttpHandle,
     ssdp: SsdpHandle,
+    monitor_stop: tokio::sync::watch::Sender<bool>,
+    monitor: tokio::task::JoinHandle<()>,
 }
 
 struct Inner {
@@ -136,6 +142,7 @@ pub struct RendererRuntime {
     cfg: RuntimeConfig,
     inner: Mutex<Inner>,
     publisher: StdMutex<Option<Arc<dyn SubjectAnnouncer>>>,
+    player: StdMutex<Arc<dyn Player>>,
 }
 
 /// A verb failed.
@@ -183,7 +190,14 @@ impl RendererRuntime {
                 running: None,
             }),
             publisher: StdMutex::new(None),
+            player: StdMutex::new(Arc::new(NoPlayer)),
         })
+    }
+
+    /// Wire the player the control actions drive. Until this is called
+    /// every action answers "Action Failed".
+    pub fn set_player(&self, p: Arc<dyn Player>) {
+        *self.player.lock().expect("player slot") = p;
     }
 
     fn friendly_name(&self) -> String {
@@ -260,9 +274,16 @@ impl RendererRuntime {
         }
         g.status = Status::Starting;
 
-        let info = Arc::new(DeviceInfo {
-            uuid: g.persisted.uuid.clone(),
-            friendly_name: self.friendly_name(),
+        let control =
+            Control::new(self.player.lock().expect("player slot").clone());
+        let subs = Subscriptions::new();
+        let info = Arc::new(Services {
+            info: DeviceInfo {
+                uuid: g.persisted.uuid.clone(),
+                friendly_name: self.friendly_name(),
+            },
+            control: Arc::clone(&control),
+            subs: Arc::clone(&subs),
         });
 
         // The description server first: SSDP must point at something.
@@ -322,7 +343,16 @@ impl RendererRuntime {
             }
         };
 
-        g.running = Some(Running { http, ssdp });
+        let (monitor_stop, stop_rx) = tokio::sync::watch::channel(false);
+        let monitor =
+            tokio::spawn(events::monitor(Arc::clone(&control), subs, stop_rx));
+        g.running = Some(Running {
+            control,
+            http,
+            ssdp,
+            monitor_stop,
+            monitor,
+        });
         g.status = Status::Advertising;
         let env = self.envelope_of(&g);
         drop(g);
@@ -352,6 +382,15 @@ impl RendererRuntime {
     async fn stop(&self) {
         let mut g = self.inner.lock().await;
         if let Some(r) = g.running.take() {
+            let _ = r.monitor_stop.send(true);
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                r.monitor,
+            )
+            .await;
+            // Whatever the controller was doing, the operator's play order
+            // comes back.
+            r.control.end().await;
             r.ssdp.stop().await;
             r.http.stop().await;
         }

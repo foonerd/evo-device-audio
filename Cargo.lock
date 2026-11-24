@@ -3974,6 +3974,7 @@ name = "org-evoframework-receiver-dlna"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "evo-dlna",
  "evo-plugin-sdk",
