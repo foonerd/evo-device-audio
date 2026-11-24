@@ -126,6 +126,22 @@ pub async fn discover_media_servers(
     Ok(out)
 }
 
+/// Bind the NOTIFY listener's socket on `0.0.0.0:<port>`.
+///
+/// Opened with address reuse, so another SSDP party on the same host,
+/// such as the DLNA renderer plugin, can bind the same port and receive
+/// the same multicast searches. Nothing else about the listener changes:
+/// it joins the group and parses announcements as before.
+fn bind_notify_socket(port: u16) -> std::io::Result<StdUdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_reuse_address(true)?;
+    sock.bind(
+        &SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)).into(),
+    )?;
+    Ok(sock.into())
+}
+
 /// Spawn a passive NOTIFY listener bound to
 /// `239.255.255.250:1900`. Returns an mpsc receiver that yields
 /// one [`SsdpHit`] per LOCATION-carrying inbound SSDP frame
@@ -150,11 +166,9 @@ pub fn spawn_notify_listener(
     // Bind + multicast join via std::net::UdpSocket so we can
     // set nonblocking BEFORE handing the fd to tokio. Tokio's
     // UdpSocket::from_std requires a nonblocking socket.
-    let std_sock =
-        StdUdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 1900))
-            .map_err(|e| {
-                DlnaError::Ssdp(format!("bind :1900 for NOTIFY listener: {e}"))
-            })?;
+    let std_sock = bind_notify_socket(1900).map_err(|e| {
+        DlnaError::Ssdp(format!("bind :1900 for NOTIFY listener: {e}"))
+    })?;
     std_sock
         .join_multicast_v4(&SSDP_MCAST_IP, &Ipv4Addr::UNSPECIFIED)
         .map_err(|e| DlnaError::Ssdp(format!("join_multicast_v4: {e}")))?;
@@ -224,6 +238,28 @@ fn parse_ssdp_response(bytes: &[u8]) -> Option<SsdpHit> {
 
 #[cfg(test)]
 mod tests {
+    /// The NOTIFY listener shares the SSDP port. Another SSDP party on
+    /// the same host (the DLNA renderer plugin) must be able to bind the
+    /// same port beside it; if the listener took the port exclusively,
+    /// the renderer could not receive searches and would not be found.
+    #[test]
+    fn the_notify_listener_can_share_its_port() {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let listener = super::bind_notify_socket(0).expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        // A second socket opened the way the renderer opens its own:
+        // address and port reuse, same wildcard address.
+        let other = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+            .unwrap();
+        other.set_reuse_address(true).unwrap();
+        other.set_reuse_port(true).unwrap();
+        let addr: std::net::SocketAddr =
+            (std::net::Ipv4Addr::UNSPECIFIED, port).into();
+        other.bind(&addr.into()).expect(
+            "a second SSDP socket must be able to share the NOTIFY port",
+        );
+    }
+
     use super::*;
 
     #[test]
