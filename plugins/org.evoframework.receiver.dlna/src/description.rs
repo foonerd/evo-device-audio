@@ -43,6 +43,43 @@ pub const SERVICES: [ServiceDef; 3] = [
     },
 ];
 
+/// One device icon: the Evo mark, as PNG.
+#[derive(Debug, Clone, Copy)]
+pub struct IconDef {
+    /// File name under `/icon/`.
+    pub name: &'static str,
+    /// Pixels, square.
+    pub size: u32,
+    /// The PNG bytes.
+    pub bytes: &'static [u8],
+}
+
+/// The icons the description lists. A controller paints the largest it
+/// likes; without any it paints a generic glyph, which loses the device's
+/// identity.
+pub const ICONS: [IconDef; 3] = [
+    IconDef {
+        name: "evo-48.png",
+        size: 48,
+        bytes: include_bytes!("../assets/icons/icon-48.png"),
+    },
+    IconDef {
+        name: "evo-120.png",
+        size: 120,
+        bytes: include_bytes!("../assets/icons/icon-120.png"),
+    },
+    IconDef {
+        name: "evo-256.png",
+        size: 256,
+        bytes: include_bytes!("../assets/icons/icon-256.png"),
+    },
+];
+
+/// Find an icon by file name.
+pub fn icon(name: &str) -> Option<&'static IconDef> {
+    ICONS.iter().find(|i| i.name == name)
+}
+
 /// Find a service by its short name.
 pub fn service(name: &str) -> Option<&'static ServiceDef> {
     SERVICES.iter().find(|s| s.name == name)
@@ -87,6 +124,17 @@ pub fn device_description(udn_uuid: &str, friendly_name: &str) -> String {
     x.push_str("    <modelName>evo-device-audio</modelName>\n");
     x.push_str("    <modelDescription>evo audio player</modelDescription>\n");
     let _ = writeln!(x, "    <UDN>uuid:{}</UDN>", xml_escape(udn_uuid));
+    x.push_str("    <iconList>\n");
+    for i in ICONS {
+        x.push_str("      <icon>\n");
+        x.push_str("        <mimetype>image/png</mimetype>\n");
+        let _ = writeln!(x, "        <width>{}</width>", i.size);
+        let _ = writeln!(x, "        <height>{}</height>", i.size);
+        x.push_str("        <depth>32</depth>\n");
+        let _ = writeln!(x, "        <url>/icon/{}</url>", i.name);
+        x.push_str("      </icon>\n");
+    }
+    x.push_str("    </iconList>\n");
     x.push_str("    <serviceList>\n");
     for s in SERVICES {
         x.push_str("      <service>\n");
@@ -609,6 +657,44 @@ mod tests {
         }
         // No ContentDirectory: this is a renderer, not a server.
         assert!(!x.contains("ContentDirectory"));
+    }
+
+    /// The device must carry the Evo mark: a description with no icon
+    /// list makes a controller paint a generic glyph.
+    #[test]
+    fn the_description_lists_the_evo_icons() {
+        let x = device_description("u", "Kitchen");
+        let doc = roxmltree::Document::parse(&x).expect("well-formed");
+        let urls: Vec<String> = doc
+            .descendants()
+            .filter(|n| n.has_tag_name("icon"))
+            .filter_map(|n| {
+                n.children()
+                    .find(|c| c.has_tag_name("url"))
+                    .and_then(|c| c.text())
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(urls.len(), ICONS.len());
+        assert!(urls.len() >= 2, "a description without icons is RED");
+        for u in urls {
+            let name = u.strip_prefix("/icon/").expect("served under /icon/");
+            assert!(icon(name).is_some(), "{u} is not served");
+        }
+        // Schema order: the icon list precedes the service list.
+        assert!(
+            x.find("<iconList>").unwrap() < x.find("<serviceList>").unwrap()
+        );
+    }
+
+    #[test]
+    fn every_icon_is_a_png_of_its_declared_size() {
+        for i in ICONS {
+            assert_eq!(&i.bytes[..8], b"\x89PNG\r\n\x1a\n", "{}", i.name);
+            let w = u32::from_be_bytes(i.bytes[16..20].try_into().unwrap());
+            let h = u32::from_be_bytes(i.bytes[20..24].try_into().unwrap());
+            assert_eq!((w, h), (i.size, i.size), "{}", i.name);
+        }
     }
 
     #[test]

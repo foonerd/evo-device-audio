@@ -183,6 +183,18 @@ pub async fn handle(
                 device_description(&svcs.info.uuid, &svcs.info.friendly_name),
             );
         }
+        if let Some(def) = path
+            .strip_prefix("/icon/")
+            .and_then(crate::description::icon)
+        {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "image/png")
+                .header("Cache-Control", "max-age=86400")
+                .header(SERVER, crate::ssdp::server_string())
+                .body(Full::new(Bytes::from_static(def.bytes)))
+                .expect("static response parts are valid");
+        }
         if let Some(name) = path
             .strip_prefix("/scpd/")
             .and_then(|p| p.strip_suffix(".xml"))
@@ -343,6 +355,43 @@ mod tests {
 
     async fn up() -> HttpHandle {
         start("127.0.0.1:0".parse().unwrap(), svcs()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn every_listed_icon_is_served_as_png() {
+        let h = up().await;
+        let d = raw(
+            h.local_addr(),
+            "GET /description.xml HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
+        let mut n = 0;
+        for line in d.lines() {
+            let Some(rest) = line.trim().strip_prefix("<url>") else {
+                continue;
+            };
+            let url = rest.trim_end_matches("</url>");
+            let r = raw(
+                h.local_addr(),
+                &format!("GET {url} HTTP/1.1\r\nHost: x\r\n\r\n"),
+            )
+            .await;
+            assert!(r.starts_with("HTTP/1.1 200"), "{url}: {r:.80}");
+            assert!(
+                r.to_lowercase().contains("content-type: image/png"),
+                "{url}"
+            );
+            assert!(r.contains("PNG"), "{url} body is a PNG");
+            n += 1;
+        }
+        assert_eq!(n, crate::description::ICONS.len());
+        let missing = raw(
+            h.local_addr(),
+            "GET /icon/nope.png HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
+        assert!(missing.starts_with("HTTP/1.1 404"), "{missing:.60}");
+        h.stop().await;
     }
 
     #[tokio::test]

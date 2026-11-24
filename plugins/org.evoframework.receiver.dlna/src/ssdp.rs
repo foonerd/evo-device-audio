@@ -36,6 +36,12 @@ pub const PORT: u16 = 1900;
 /// `CACHE-CONTROL: max-age` carried by announcements and replies.
 pub const MAX_AGE: u32 = 1800;
 
+/// How often `alive` is repeated. A controller drops a device whose
+/// last announcement is older than `max-age`, and multicast is lossy
+/// (Wi-Fi power-save drops it first), so several rounds fit in one
+/// `max-age`: a lost round costs a sixth of the window, not half.
+pub const ALIVE_EVERY: Duration = Duration::from_secs(MAX_AGE as u64 / 6);
+
 /// One advertised target: its `NT`/`ST` and its `USN`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
@@ -214,7 +220,7 @@ impl SsdpConfig {
             multicast: true,
             notify_target: SocketAddr::V4(SocketAddrV4::new(GROUP, PORT)),
             interfaces: Vec::new(),
-            alive_every: Duration::from_secs(u64::from(MAX_AGE) / 2),
+            alive_every: ALIVE_EVERY,
         }
     }
 }
@@ -462,6 +468,19 @@ mod tests {
     use super::*;
 
     const U: &str = "11111111-2222-3333-4444-555555555555";
+
+    /// A controller expires a device after `max-age`; announcements must
+    /// land several times inside that window so one lost round is not a
+    /// disappearance.
+    #[test]
+    fn alive_repeats_at_least_three_times_per_max_age() {
+        assert!(
+            ALIVE_EVERY.as_secs() * 3 <= u64::from(MAX_AGE),
+            "alive every {:?} against max-age {MAX_AGE}",
+            ALIVE_EVERY
+        );
+        assert_eq!(SsdpConfig::production().alive_every, ALIVE_EVERY);
+    }
 
     #[test]
     fn six_targets_with_the_right_usn_shape() {
