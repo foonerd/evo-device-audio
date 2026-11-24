@@ -101,12 +101,86 @@ impl ShuffleMode {
 #[derive(Debug, Clone)]
 pub(crate) struct ShuffleModeCell {
     mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// Where the mode is kept across a restart. `None` keeps nothing:
+    /// the shape every test but the persistence pins uses.
+    store: std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
 }
+
+/// The mode as it sits on disk.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct StoredMode {
+    v: u32,
+    mode: String,
+}
+
+/// File-format version of the stored mode.
+const STORED_MODE_VERSION: u32 = 1;
 
 impl ShuffleModeCell {
     pub(crate) fn new() -> Self {
         Self {
             mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            store: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Keep the mode in `path` from now on, and take up the one it
+    /// holds.
+    ///
+    /// Album and similar order are written into the queue, and the
+    /// queue survives a restart; the operator's word for how it was
+    /// ordered must survive with it, or the glass reads "off" over a
+    /// queue that is in album order. A missing, unreadable or
+    /// unrecognised file leaves the mode `off`: the report then
+    /// says what MPD's own flag says, which is the honest floor.
+    pub(crate) fn attach_store(&self, path: std::path::PathBuf) {
+        let kept = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|body| toml::from_str::<StoredMode>(&body).ok())
+            .filter(|s| s.v == STORED_MODE_VERSION)
+            .and_then(|s| ShuffleMode::parse(&s.mode));
+        if let Some(m) = kept {
+            self.store_mode(m);
+        }
+        if let Ok(mut slot) = self.store.lock() {
+            *slot = Some(path);
+        }
+    }
+
+    fn store_mode(&self, mode: ShuffleMode) {
+        let v = match mode {
+            ShuffleMode::Off => 0u8,
+            ShuffleMode::Tracks => 1,
+            ShuffleMode::Albums => 2,
+            ShuffleMode::Similar => 3,
+        };
+        self.mode.store(v, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Write the mode where it is kept. A failure is reported and
+    /// the mode still holds in memory: a full disk must not make the
+    /// shuffle verb fail.
+    fn persist(&self, mode: ShuffleMode) {
+        let Some(path) = self.store.lock().ok().and_then(|s| s.clone()) else {
+            return;
+        };
+        let body = match toml::to_string(&StoredMode {
+            v: STORED_MODE_VERSION,
+            mode: mode.as_str().to_string(),
+        }) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let staging = path.with_extension("toml.tmp");
+        let result = std::fs::write(&staging, body)
+            .and_then(|()| std::fs::rename(&staging, &path));
+        if let Err(e) = result {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                path = %path.display(),
+                error = %e,
+                "shuffle mode could not be kept across a restart"
+            );
         }
     }
 
@@ -120,15 +194,10 @@ impl ShuffleModeCell {
         }
     }
 
-    /// Record it. Only `set_shuffle` calls this.
+    /// Record it, and keep it. Only `set_shuffle` calls this.
     pub(crate) fn set(&self, mode: ShuffleMode) {
-        let v = match mode {
-            ShuffleMode::Off => 0u8,
-            ShuffleMode::Tracks => 1,
-            ShuffleMode::Albums => 2,
-            ShuffleMode::Similar => 3,
-        };
-        self.mode.store(v, std::sync::atomic::Ordering::SeqCst);
+        self.store_mode(mode);
+        self.persist(mode);
     }
 }
 
@@ -680,6 +749,86 @@ mod tests {
             reported_shuffle_mode(true, ShuffleMode::Similar),
             ShuffleMode::Tracks,
             "random on is always tracks, whatever was remembered"
+        );
+    }
+    #[test]
+    fn the_mode_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shuffle-mode.toml");
+        let first = ShuffleModeCell::new();
+        first.attach_store(path.clone());
+        first.set(ShuffleMode::Albums);
+        // A restart: a new cell over the same file.
+        let second = ShuffleModeCell::new();
+        second.attach_store(path);
+        assert_eq!(second.get(), ShuffleMode::Albums);
+    }
+
+    #[test]
+    fn every_mode_round_trips_through_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shuffle-mode.toml");
+        for m in [
+            ShuffleMode::Similar,
+            ShuffleMode::Tracks,
+            ShuffleMode::Off,
+            ShuffleMode::Albums,
+        ] {
+            let c = ShuffleModeCell::new();
+            c.attach_store(path.clone());
+            c.set(m);
+            let r = ShuffleModeCell::new();
+            r.attach_store(path.clone());
+            assert_eq!(r.get(), m);
+        }
+    }
+
+    #[test]
+    fn a_missing_or_damaged_file_leaves_the_mode_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = ShuffleModeCell::new();
+        missing.attach_store(dir.path().join("absent.toml"));
+        assert_eq!(missing.get(), ShuffleMode::Off);
+        for body in [
+            "this is not toml = [",
+            "v = 1\nmode = \"sideways\"\n",
+            "v = 9\nmode = \"albums\"\n",
+        ] {
+            let p = dir.path().join("bad.toml");
+            std::fs::write(&p, body).unwrap();
+            let c = ShuffleModeCell::new();
+            c.attach_store(p);
+            assert_eq!(c.get(), ShuffleMode::Off, "{body}");
+        }
+    }
+
+    #[test]
+    fn an_unwritable_store_does_not_stop_the_mode_holding() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ShuffleModeCell::new();
+        c.attach_store(dir.path().join("no-such-dir").join("m.toml"));
+        c.set(ShuffleMode::Albums);
+        assert_eq!(c.get(), ShuffleMode::Albums);
+    }
+
+    #[test]
+    fn a_cell_with_no_store_keeps_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ShuffleModeCell::new();
+        c.set(ShuffleMode::Albums);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert_eq!(ShuffleModeCell::new().get(), ShuffleMode::Off);
+    }
+    /// The store is only worth having if `load` attaches it: a cell that
+    /// is never attached keeps nothing, and the restart lie returns.
+    #[test]
+    fn load_attaches_the_shuffle_store_in_the_state_directory() {
+        let lib = include_str!("lib.rs");
+        assert!(
+            lib.contains("self.shuffle")
+                && lib.contains(".attach_store(")
+                && lib.contains("ctx.state_dir.join(\"shuffle-mode.toml\")"),
+            "load must attach the shuffle store under ctx.state_dir"
         );
     }
 }

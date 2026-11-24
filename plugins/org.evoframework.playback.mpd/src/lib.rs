@@ -2455,6 +2455,11 @@ impl Plugin for MpdPlaybackPlugin {
                      source-format probe disarmed — source_codec still surfaces"
                 );
             }
+            // The shuffle mode the operator last chose is kept in
+            // the state directory beside the queue it ordered, so
+            // the report agrees with the queue after a restart.
+            self.shuffle
+                .attach_store(ctx.state_dir.join("shuffle-mode.toml"));
             // The play history lives in the plugin's state
             // directory and survives a restart. The observer
             // records into it; the library's two history reads
