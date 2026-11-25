@@ -119,6 +119,7 @@ mod forgotten_tracks;
 mod gone_curation;
 mod household_door;
 mod idle_observer;
+mod keep_playing;
 mod last_queue;
 mod library;
 mod library_triage;
@@ -2364,7 +2365,16 @@ impl Plugin for MpdPlaybackPlugin {
                 rationale = %auto.rationale(),
                 "MPD restart strategy resolved"
             );
-            self.restarter = auto.clone() as Arc<dyn MpdRestarter>;
+            // Every restart this plugin starts, the fragment worker's
+            // and the asound watcher's alike, goes through one gate
+            // and plays a playing player again afterwards.
+            self.restarter = Arc::new(keep_playing::PlayKeepingRestarter::new(
+                auto.clone() as Arc<dyn MpdRestarter>,
+                keep_playing::DirectMpd::new(
+                    self.endpoint.clone(),
+                    self.timeouts,
+                ),
+            ));
             self.auto_restarter = Some(auto.clone());
 
             // Spawn the PPAG capabilities-watch reactor when
@@ -2604,8 +2614,6 @@ impl Plugin for MpdPlaybackPlugin {
             self.asound_watcher = Some(asound_watcher::spawn(
                 Arc::clone(&self.active_command_sender),
                 Arc::clone(&self.restarter),
-                self.endpoint.clone(),
-                self.timeouts,
             ));
 
             // Initialise the shelf integration: source
