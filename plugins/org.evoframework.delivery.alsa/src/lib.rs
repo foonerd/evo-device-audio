@@ -4466,6 +4466,7 @@ pcm.evo {
     // ----- output verbs: five verbs on one output -----
 
     use crate::outputs::tests::output as seeded_output;
+    use crate::outputs::tests::real_dac;
 
     /// Records every mixer call instead of running `amixer`.
     #[derive(Default)]
@@ -4931,6 +4932,52 @@ pcm.evo {
             .await
             .unwrap();
         assert_eq!(b["output"]["volume"], 40);
+    }
+
+    /// The DAC as `.24` lists it: id `DAC`, long name `I-Sabre Q2M
+    /// DAC`, card 3, with the baseline follow device naming the id.
+    /// Its volume is the global volume and is refused, and a pause
+    /// renders the chain head `pcm.evo` with a null terminus.
+    #[tokio::test]
+    async fn the_real_dac_is_quiet_on_pause_and_its_volume_is_not_an_outputs() {
+        let rig = OutputRig::new().await;
+        *rig.plugin.cached_outputs.write().await =
+            vec![real_dac(), seeded_output(1, "HDMI", Some("PCM"))];
+        *rig.plugin.active_dac_config.write().await = Some(ActiveDacConfig {
+            overlay: "i-sabre-q2m".into(),
+            catalogue_id: None,
+            display_name: None,
+            alsacard_hint: Some("DAC".into()),
+            mixer_hint: Some("Digital".into()),
+            interface: Some("i2s".into()),
+            boot_config_path: String::new(),
+        });
+        let err = rig
+            .call(
+                "delivery.set_output_volume",
+                json!({ "v": 1, "output_id": "hw:3,0", "volume": 40 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("global volume"), "{err}");
+        assert!(rig.mixer.calls.lock().unwrap().is_empty());
+
+        let paused = rig.verb("delivery.pause_output", "hw:3,0").await.unwrap();
+        assert_eq!(paused["output"]["playing"], false);
+        let quiet = rig.drop_in().await;
+        assert!(quiet.contains("pcm.evo {"), "{quiet}");
+        assert!(
+            quiet.contains("pcm.evo_terminus {\n    type null"),
+            "{quiet}"
+        );
+
+        let played = rig.verb("delivery.play_output", "hw:3,0").await.unwrap();
+        assert_eq!(played["output"]["playing"], true);
+        let sound = rig.drop_in().await;
+        assert!(
+            sound.contains("pcm.evo_terminus {\n    type hw\n    card \"3\""),
+            "{sound}"
+        );
     }
 
     /// Enabled flags and volumes survive a restart on the same

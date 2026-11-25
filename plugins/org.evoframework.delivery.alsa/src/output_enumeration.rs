@@ -50,6 +50,13 @@ pub struct ResolvedAlsaOutput {
     /// Raw ALSA card name as the kernel reports it (the
     /// bracketed token from `aplay -l`).
     pub card_name: String,
+    /// ALSA's short card id, the token before the bracket in
+    /// `aplay -l` (`DAC` for a card named `I-Sabre Q2M DAC`). It is
+    /// what `hw:CARD=<id>` and `card "<id>"` name, so a descriptor
+    /// is matched against it as well as the name and the index.
+    /// Empty when a publisher did not carry it.
+    #[serde(default)]
+    pub card_id: String,
     /// Canonical `hw:N,M` identifier.
     pub alsa_id: String,
     /// Operator-friendly label resolved against the catalog,
@@ -372,6 +379,7 @@ fn resolve_row(
     catalog: &AlsaCardCatalog,
 ) -> ResolvedAlsaOutput {
     let alsa_id = format!("hw:{},{}", row.card_idx, row.device_idx);
+    let card_id = row.short_id.clone();
     // Layer 2: kernel-supplied classification is authoritative per
     // the kernel-introspection-authoritative discipline. When kernel
     // introspection produced an identity for
@@ -390,6 +398,7 @@ fn resolve_row(
                 card_idx: row.card_idx,
                 device_idx: row.device_idx,
                 card_name: row.card_name,
+                card_id: card_id.clone(),
                 alsa_id,
                 label,
                 output_class: kernel_output_class,
@@ -406,6 +415,7 @@ fn resolve_row(
                     card_idx: row.card_idx,
                     device_idx: row.device_idx,
                     card_name: row.card_name,
+                    card_id: card_id.clone(),
                     alsa_id,
                     label,
                     output_class: kernel_output_class,
@@ -430,6 +440,7 @@ fn resolve_row(
                     card_idx: row.card_idx,
                     device_idx: row.device_idx,
                     card_name: row.card_name.clone(),
+                    card_id: card_id.clone(),
                     alsa_id,
                     label,
                     output_class: kernel_output_class,
@@ -463,6 +474,7 @@ fn resolve_row(
                 card_idx: row.card_idx,
                 device_idx: row.device_idx,
                 card_name: row.card_name.clone(),
+                card_id: card_id.clone(),
                 alsa_id,
                 label,
                 output_class: kernel_output_class,

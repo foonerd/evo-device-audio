@@ -218,7 +218,8 @@ impl GlobalMixer {
     fn is_control_of(&self, output: &ResolvedAlsaOutput) -> bool {
         output.default_mixer_control.as_deref() == Some(self.control.as_str())
             && (self.card == output.card_idx.to_string()
-                || self.card == output.card_name)
+                || self.card == output.card_name
+                || (!output.card_id.is_empty() && self.card == output.card_id))
     }
 }
 
@@ -291,7 +292,9 @@ pub(crate) fn resolve_output_device<'a>(
     let device = parse_card_device(descriptor);
     outputs.iter().find(|o| {
         o.device_idx == device
-            && (o.card_name == card || o.card_idx.to_string() == card)
+            && (o.card_name == card
+                || (!o.card_id.is_empty() && o.card_id == card)
+                || o.card_idx.to_string() == card)
     })
 }
 
@@ -590,6 +593,7 @@ pub(crate) mod tests {
             card_idx,
             device_idx: 0,
             card_name: card_name.to_string(),
+            card_id: String::new(),
             alsa_id: format!("hw:{card_idx},0"),
             label: card_name.to_string(),
             output_class: OutputClass::Unknown,
@@ -927,5 +931,74 @@ pub(crate) mod tests {
         assert_eq!(id("hw:1,1").as_deref(), Some("hw:1,1"));
         assert_eq!(id("hw:CARD=HDMI").as_deref(), Some("hw:1,0"));
         assert_eq!(id("hw:CARD=Nope,DEV=0"), None);
+    }
+
+    /// The DAC as `.24` reports it: ALSA's short id is `DAC`, the
+    /// long name is `I-Sabre Q2M DAC`, and the card is number 3.
+    pub(crate) fn real_dac() -> ResolvedAlsaOutput {
+        ResolvedAlsaOutput {
+            card_id: "DAC".to_string(),
+            ..output(3, "I-Sabre Q2M DAC", Some("Digital"))
+        }
+    }
+
+    /// `hw:CARD=DAC` names the card by its id, not its long name.
+    /// A descriptor resolves by id, by long name and by index.
+    #[test]
+    fn a_descriptor_resolves_by_the_cards_short_id() {
+        let outs = vec![real_dac()];
+        let id = |d: &str| {
+            resolve_output_device(&outs, d).map(|o| o.alsa_id.clone())
+        };
+        assert_eq!(id("hw:CARD=DAC,DEV=0").as_deref(), Some("hw:3,0"));
+        assert_eq!(id("hw:3,0").as_deref(), Some("hw:3,0"));
+        assert_eq!(
+            id("hw:CARD=I-Sabre Q2M DAC,DEV=0").as_deref(),
+            Some("hw:3,0")
+        );
+        assert_eq!(id("hw:CARD=Nope,DEV=0"), None);
+        // A row that carries no id does not match an empty card.
+        let bare = vec![output(3, "I-Sabre Q2M DAC", None)];
+        assert_eq!(resolve_output_device(&bare, "hw:CARD=DAC,DEV=0"), None);
+    }
+
+    /// The baseline chain follows `hw:CARD=DAC,DEV=0`; on this card
+    /// that is the output playing, so a pause quiets it and a play
+    /// on it is already playing.
+    #[test]
+    fn the_baseline_follow_device_is_the_playing_output_and_pause_quiets_it() {
+        let outs = vec![real_dac()];
+        let follow = crate::options_render::DEFAULT_OUTPUT_DEVICE;
+        let mut p = OutputPolicy::default();
+        assert!(p.snapshot(&outs, follow, "hw:3,0").playing);
+        assert_eq!(p.pause(&outs, follow, "hw:3,0"), Ok(Effect::Rebind));
+        assert_eq!(p.binding(), &OutputBinding::Silent);
+        assert!(!p.snapshot(&outs, follow, "hw:3,0").playing);
+    }
+
+    /// With no option saved, the DAC's mixer is the global volume
+    /// even though the catalogue names the card by id and the
+    /// enumeration by long name.
+    #[test]
+    fn the_dacs_mixer_is_the_global_volume_by_id_when_the_name_differs() {
+        let outs = vec![real_dac()];
+        let global = GlobalMixer::resolve(
+            &OptionsSettings::default(),
+            Some("DAC"),
+            Some("Digital"),
+        )
+        .unwrap();
+        assert_eq!(
+            OutputPolicy::default().volume_target(
+                &outs,
+                Some(&global),
+                "hw:3,0",
+                40
+            ),
+            Err(Refusal::GlobalMixer {
+                output: "hw:3,0".to_string(),
+                control: "Digital".to_string()
+            })
+        );
     }
 }
