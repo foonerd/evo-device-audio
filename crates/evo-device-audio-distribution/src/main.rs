@@ -125,11 +125,12 @@ use evo::admission::AdmissionEngine;
 use evo::config::StewardConfig;
 use evo::{AdmissionSetup, RuntimeSetup, RuntimeSetupContext};
 
-/// The topology store, shared between this distribution's two
+/// The chain controller, shared between this distribution's two
 /// boot hooks. Written once during runtime setup; read by the
-/// post-admission hook that seeds the default chain.
-type SharedTopologyStore =
-    Arc<OnceLock<Arc<evo_audio_topology::audio_topology::AudioTopologyStore>>>;
+/// post-admission hook that arms it, which is what publishes the
+/// first chain.
+type SharedChainController =
+    Arc<OnceLock<Arc<evo_audio_topology::eq_chain::ChainController>>>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -138,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
     // distribution holds it. Runtime setup builds it and fills
     // this cell; the post-admission hook reads it back out.
     // Nothing hands it to the steward and nothing hands it back.
-    let topology_store: SharedTopologyStore = Arc::new(OnceLock::new());
+    let topology_store: SharedChainController = Arc::new(OnceLock::new());
     let opts = evo::RunOptions::new(args, audio_distribution_admission())
         .with_rtc_wake(Arc::new(rtc_wake::SysfsRtcWake::new()))
         .with_post_admission(audio_distribution_post_admission(Arc::clone(
@@ -177,7 +178,7 @@ async fn main() -> anyhow::Result<()> {
 /// goodbyes while the transport is still up. The framework crate
 /// has no production dep on `evo-multiroom`.
 fn audio_distribution_runtime_setup(
-    topology_store_cell: SharedTopologyStore,
+    topology_store_cell: SharedChainController,
 ) -> RuntimeSetup {
     Box::new(move |ctx: RuntimeSetupContext| {
         Box::pin(async move {
@@ -294,10 +295,22 @@ fn audio_distribution_runtime_setup(
                 )),
             );
 
-            // Hand the store to the post-admission hook, which
-            // seeds the default chain once every plugin has
-            // admitted.
-            let _ = topology_store_cell.set(audio_topology_store);
+            // The chain controller keeps the published chain matching
+            // the composition mode: the direct chain by default, the
+            // chain with the EQ stage in the path while `eq_only` is
+            // chosen. It follows the composition plugin's mode
+            // announcements from here, before any plugin admits, so a
+            // mode announced during admission is not missed; it
+            // publishes nothing until the post-admission hook arms it.
+            let chain_controller =
+                Arc::new(evo_audio_topology::eq_chain::ChainController::new(
+                    Arc::clone(&audio_topology_store),
+                ));
+            tokio::spawn(Arc::clone(&chain_controller).follow(bus.subscribe()));
+
+            // Hand the controller to the post-admission hook, which
+            // arms it once every plugin has admitted.
+            let _ = topology_store_cell.set(chain_controller);
 
             // The audio plane. It belongs here, not in the
             // steward: it exists to move audio between a source
@@ -699,89 +712,50 @@ fn audio_distribution_https_setup() -> evo::HttpsSetup {
 }
 
 fn audio_distribution_post_admission(
-    topology_store_cell: SharedTopologyStore,
+    controller_cell: SharedChainController,
 ) -> evo::PostAdmissionSetup {
     Box::new(move |_ctx: evo::PostAdmissionContext| {
         Box::pin(async move {
-            use evo::server::{
-                ActiveAudioTopology, ActiveChainStage, ScoreBreakdown,
-                VolumeMode,
-            };
-            use evo_plugin_sdk::audio::{AudioFormat, PcmCodec};
-            use evo_plugin_sdk::contract::audio_routing::EndpointKind;
-            use std::path::PathBuf;
-
-            // Publish a stable, role-agnostic default topology
-            // pointing at the canonical PCM device `evo`. The
-            // operator's role choice manifests in `/etc/asound.conf`
-            // at bootstrap time, NOT in this binary: bootstrap
-            // wires `pcm.evo` to either the snd-aloop playback
-            // half (source role) or the hardware DAC
-            // (receiver/auto role). The topology here names the
+            // Publish the chain the composition mode wants: the direct
+            // chain by default, which names the canonical PCM device
+            // `evo` by alias, or the chain with the EQ stage in the
+            // path when the composition plugin has announced `eq_only`
+            // (a device that comes up with the EQ chosen comes up with
+            // the EQ in the path).
+            //
+            // The operator's role choice manifests in
+            // `/etc/asound.conf` at bootstrap time, NOT in this
+            // binary: bootstrap wires `pcm.evo` to either the
+            // snd-aloop playback half (source role) or the hardware
+            // DAC (receiver/auto role). The chain here names the
             // device by alias; ALSA resolves the alias per the
             // operator's role-specific asound.conf.
             //
-            // This binary intentionally does NOT read the
-            // multi-room plugin's TOML to decide endpoint
-            // wiring. Per docs/engineering/BOUNDARY.md, the
-            // framework binary does not own named-subsystem
-            // semantics (role / source / receiver / snd-aloop /
-            // hardware DAC); the multi-room plugin owns its own
-            // role state and engages role-specific tasks
-            // through its own substrate subscriptions. The
-            // route-change reactor in playback.mpd consumes
-            // this topology and rewrites mpd.conf to point at
-            // `pcm.evo`; the asound.conf the operator installed
-            // determines where `pcm.evo` ultimately resolves.
-            let format = AudioFormat::Pcm {
-                codec: PcmCodec::PcmS16Le,
-                rate_hz: 44_100,
-                channels: 2,
-            };
-            let source_stage = ActiveChainStage::Source {
-                plugin: "org.evoframework.playback.mpd".to_string(),
-                format: format.clone(),
-                endpoint_kind: EndpointKind::AlsaPcm,
-                endpoint_path: PathBuf::from("evo"),
-            };
-            let delivery_stage = ActiveChainStage::Delivery {
-                plugin: "org.evoframework.delivery.alsa".to_string(),
-                format: format.clone(),
-                endpoint_kind: EndpointKind::AlsaPcm,
-                endpoint_path: PathBuf::from("evo"),
-            };
-            let topology = ActiveAudioTopology {
-                target_key: "evo-device-audio:default".to_string(),
-                display_name: "Default delivery chain (44.1kHz/16-bit/stereo)"
-                    .to_string(),
-                chain: vec![source_stage, delivery_stage],
-                volume_mode: VolumeMode::Software,
-                volume_position: Some(0.5),
-                volume_db: None,
-                bit_perfect: false,
-                score: ScoreBreakdown::default(),
-                implicit_conversions: Vec::new(),
-                warnings: Vec::new(),
-            };
-            tracing::info!(
-                target_key = %topology.target_key,
-                source = "org.evoframework.playback.mpd",
-                delivery = "org.evoframework.delivery.alsa",
-                "post-admission: publishing role-agnostic default audio topology"
-            );
-            let Some(store) = topology_store_cell.get() else {
+            // This binary intentionally does NOT read the multi-room
+            // plugin's TOML to decide endpoint wiring. Per
+            // docs/engineering/BOUNDARY.md, the framework binary does
+            // not own named-subsystem semantics (role / source /
+            // receiver / snd-aloop / hardware DAC); the multi-room
+            // plugin owns its own role state and engages role-specific
+            // tasks through its own substrate subscriptions. The
+            // route-change reactor in playback.mpd consumes this
+            // topology and rewrites mpd.conf to point at the source
+            // endpoint; the asound.conf the operator installed
+            // determines where that name ultimately resolves.
+            let Some(controller) = controller_cell.get() else {
                 // Runtime setup did not run, so there is no
-                // store to seed. Nothing to publish into.
+                // controller to arm. Nothing to publish into.
                 tracing::warn!(
-                    "post-admission: no topology store; default chain not \
-                     published"
+                    "post-admission: no chain controller; default chain \
+                     not published"
                 );
                 return Ok(());
             };
-            store
-                .publish(topology, "evo-device-audio:post-admission")
-                .await
-                .context("publishing default audio topology")?;
+            tracing::info!(
+                "post-admission: arming the audio chain controller; \
+                 publishing the chain the composition mode wants"
+            );
+            controller.arm().await;
             Ok(())
         })
     })
