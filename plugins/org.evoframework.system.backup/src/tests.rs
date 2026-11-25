@@ -196,7 +196,9 @@ impl Stub {
                 o.zones.push(zone.clone());
                 Ok(json!({ "v": 1, "zone": zone }))
             }
-            "zone.set_eq_band" | "zone.set_eq_engaged" => {
+            "zone.set_eq_band"
+            | "zone.set_eq_engaged"
+            | "zone.remove_eq_band" => {
                 let id = p["id"].clone();
                 let zone = o
                     .zones
@@ -205,11 +207,20 @@ impl Stub {
                     .ok_or("unknown zone")?;
                 if verb == "zone.set_eq_engaged" {
                     zone["eq"]["engaged"] = p["engaged"].clone();
+                } else if verb == "zone.remove_eq_band" {
+                    let i = p["index"].as_u64().unwrap() as usize;
+                    zone["eq"]["bands"].as_array_mut().unwrap().remove(i);
                 } else {
                     let i = p["index"].as_u64().unwrap() as usize;
-                    zone["eq"]["bands"][i] = json!({
+                    let band = json!({
                         "freq_hz": p["freq_hz"], "gain_db": p["gain_db"], "q": p["q"],
                     });
+                    let bands = zone["eq"]["bands"].as_array_mut().unwrap();
+                    if i == bands.len() {
+                        bands.push(band);
+                    } else {
+                        bands[i] = band;
+                    }
                 }
                 Ok(json!({ "v": 1, "zone": zone.clone() }))
             }
@@ -474,6 +485,30 @@ async fn an_owner_that_cannot_answer_refuses_the_export() {
 }
 
 // ----- import_backup -----
+
+/// A zone whose EQ was grown past ten bands, or cut below ten, goes
+/// back with the band count it had, each band in its place.
+#[tokio::test]
+async fn a_zone_eq_goes_back_at_the_band_count_it_had() {
+    for count in [31usize, 20, 10, 6, 1] {
+        let mut owners = Owners::set_up();
+        let bands: Vec<Value> = (0..count)
+            .map(|i| json!({ "freq_hz": 100 + i as u32, "gain_db": (i as f64) / 10.0, "q": 1.25 }))
+            .collect();
+        owners.zones[0]["eq"]["bands"] = json!(bands);
+        let (backup, _) = export_from(owners).await;
+        let stub = Stub::new(Owners::empty());
+        let refused = import_into(&stub, backup).await.unwrap();
+        assert!(refused.is_empty(), "{count}: {refused:?}");
+        let after = stub.owners();
+        let got = after.zones[0]["eq"]["bands"].as_array().unwrap();
+        assert_eq!(got.len(), count, "{count} bands in, {} out", got.len());
+        for (i, b) in got.iter().enumerate() {
+            assert_eq!(b["freq_hz"], 100 + i as u32, "{count}: band {i}");
+            assert_eq!(b["gain_db"], (i as f64) / 10.0, "{count}: band {i}");
+        }
+    }
+}
 
 /// A backup taken on one device goes back onto an empty one:
 /// config, then settings, then playlists, zone membership mapped
@@ -854,7 +889,6 @@ async fn no_music_file_no_share_secret_and_no_share_add() {
             "read_dir",
             "/var/lib/evo",
             "remove_logical_output",
-            "zone.remove",
             "scene.",
             "delete_",
             "reset_to_defaults",
@@ -863,5 +897,13 @@ async fn no_music_file_no_share_secret_and_no_share_add() {
         ] {
             assert!(!source.contains(token), "{file} names {token:?}");
         }
+        // A restore never removes a zone. The one verb of that name it
+        // may use is the one that trims a restored zone's extra EQ
+        // bands, so every mention of `zone.remove` must be that verb.
+        assert_eq!(
+            source.matches("zone.remove").count(),
+            source.matches("zone.remove_eq_band").count(),
+            "{file} names a zone removal other than the band trim"
+        );
     }
 }

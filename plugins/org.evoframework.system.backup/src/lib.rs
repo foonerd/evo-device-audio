@@ -459,6 +459,14 @@ async fn import(
             json!({ "v": PAYLOAD_VERSION, "name": zone.name, "logical_output_ids": members }),
         )
         .await;
+        // How many bands a new zone starts with; a saved zone with fewer
+        // is trimmed to its own count once its bands are set.
+        let starting_bands = answer
+            .as_ref()
+            .ok()
+            .and_then(|a| a.pointer("/zone/eq/bands"))
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
         let new_id = answer.and_then(|a| {
             a.pointer("/zone/id")
                 .and_then(Value::as_str)
@@ -475,6 +483,22 @@ async fn import(
             merge_band(&mut payload, band);
             let r = call(d, ZONES, "zone.set_eq_band", payload).await;
             put("config", format!("zone {} EQ band {index}", zone.name), r);
+        }
+        // The bands past the saved count, from the end, so the saved
+        // ones keep their places.
+        for index in (zone.eq.bands.len()..starting_bands).rev() {
+            let r = call(
+                d,
+                ZONES,
+                "zone.remove_eq_band",
+                json!({ "v": PAYLOAD_VERSION, "id": id, "index": index }),
+            )
+            .await;
+            put(
+                "config",
+                format!("zone {} EQ band {index} trimmed", zone.name),
+                r,
+            );
         }
         let r = call(
             d,
