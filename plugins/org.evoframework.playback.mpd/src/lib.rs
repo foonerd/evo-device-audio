@@ -482,11 +482,11 @@ pub struct MpdPlaybackPlugin {
     /// operator has taken custody yet.
     ambient_observer: Option<playback_supervisor::AmbientObserverHandle>,
     /// `/etc/asound.d/` composition-change watcher. Spawned at
-    /// plugin load; on every observed change dispatches a
-    /// `CycleOutput` to the currently-active custody's
-    /// supervisor so MPD reopens its ALSA handle against the
-    /// post-change drop-in stack. `None` before first load and
-    /// after `Plugin::unload`.
+    /// plugin load; on every observed change restarts MPD
+    /// through the plugin's restarter (resuming playback if it
+    /// was playing) so MPD loads the post-change drop-in
+    /// stack. `None` before first load and after
+    /// `Plugin::unload`.
     asound_watcher: Option<asound_watcher::AsoundWatcherHandle>,
     /// Test-tone in-flight gate. Set true at the entry of
     /// `emit_test_tone` and cleared by the background restore
@@ -2595,17 +2595,16 @@ impl Plugin for MpdPlaybackPlugin {
 
             // Spawn the /etc/asound.d/ composition-change
             // watcher. On every detected change the watcher
-            // dispatches a CycleOutput to the active custody's
-            // supervisor, which sends disableoutput 0 +
-            // enableoutput 0 over the MPD wire protocol so
-            // MPD drops and reopens its snd_pcm_t against the
-            // post-change drop-in stack. This is how the
-            // playback warden adapts to multi-room source-mode
-            // engage / disengage without a systemd bounce or a
-            // fragment rewrite.
-            self.asound_watcher = Some(asound_watcher::spawn(Arc::clone(
-                &self.active_command_sender,
-            )));
+            // restarts MPD through the plugin's restarter (a
+            // running MPD keeps the ALSA configuration it
+            // started with, and reopening its output does not
+            // reload it), then resumes playback if the player
+            // was playing. The output cycle is the fallback
+            // when the restart is unavailable.
+            self.asound_watcher = Some(asound_watcher::spawn(
+                Arc::clone(&self.active_command_sender),
+                Arc::clone(&self.restarter),
+            ));
 
             // Initialise the shelf integration: source
             // registry + sticker reconciler + four shelf

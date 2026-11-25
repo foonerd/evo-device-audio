@@ -11,12 +11,19 @@
 //! handle; MPD must close and reopen for the new composition to
 //! take effect.
 //!
-//! This watcher closes that loop. On every observed change
-//! under `/etc/asound.d/` it dispatches a `CycleOutput`
-//! supervisor command, which sends `disableoutput 0` +
-//! `enableoutput 0` over the MPD wire protocol. MPD reopens
-//! against the post-change drop-in stack — no `systemctl
-//! restart mpd`, no fragment rewrite, no plugin reload.
+//! This watcher closes that loop. A running MPD keeps the ALSA
+//! configuration it loaded when it started: closing and reopening
+//! its output (`disableoutput` + `enableoutput`) reopens the same
+//! handle against the same stale configuration, which was seen on
+//! the reference device (a paused output kept the DAC open through
+//! a cycle, through a touched `asound.conf`, and only a process
+//! restart moved it). So on every observed change under
+//! `/etc/asound.d/` the watcher restarts MPD through the plugin's
+//! own restarter (the `mpd_systemctl_restart` intent and its
+//! narrow NOPASSWD drop-in, the same path a fragment rewrite
+//! uses), and when the player was playing it resumes playback
+//! afterwards, because MPD restores a paused queue. The output
+//! cycle stays as the fallback when no restarter is available.
 //!
 //! Detection mechanism: mtime polling at a fixed interval. The
 //! directory contents change only on operator gestures
@@ -52,7 +59,9 @@ use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 
-use crate::playback_supervisor::SupervisorCommandSender;
+use crate::mpd::PlayState;
+use crate::mpd_restart::MpdRestarter;
+use crate::playback_supervisor::{PlaybackCommand, SupervisorCommandSender};
 
 /// Directory the watcher observes. The bootstrap installs this
 /// path with mode 0775 owned by the steward's service user; the
@@ -97,15 +106,21 @@ impl AsoundWatcherHandle {
 /// dispatch when no custody is active (no MPD output to cycle).
 pub(crate) fn spawn(
     active_command_sender: Arc<Mutex<Option<SupervisorCommandSender>>>,
+    restarter: Arc<dyn MpdRestarter>,
 ) -> AsoundWatcherHandle {
     let shutdown = Arc::new(Notify::new());
-    let task = tokio::spawn(run(Arc::clone(&shutdown), active_command_sender));
+    let task = tokio::spawn(run(
+        Arc::clone(&shutdown),
+        active_command_sender,
+        restarter,
+    ));
     AsoundWatcherHandle { shutdown, task }
 }
 
 async fn run(
     shutdown: Arc<Notify>,
     active_command_sender: Arc<Mutex<Option<SupervisorCommandSender>>>,
+    restarter: Arc<dyn MpdRestarter>,
 ) {
     let mut last: HashMap<PathBuf, SystemTime> = HashMap::new();
     let mut seeded = false;
@@ -129,9 +144,10 @@ async fn run(
                         dir = ASOUND_DROP_IN_DIR,
                         prior_entries = last.len(),
                         current_entries = current.len(),
-                        "asound composition change detected; cycling MPD output"
+                        "asound composition change detected; restarting MPD"
                     );
-                    dispatch_cycle_output(&active_command_sender).await;
+                    let sender = active_command_sender.lock().await.clone();
+                    reload_mpd(sender.as_ref(), restarter.as_ref()).await;
                 }
                 last = current;
                 seeded = true;
@@ -160,33 +176,98 @@ fn snapshot_mtimes() -> HashMap<PathBuf, SystemTime> {
     out
 }
 
-/// Dispatch a `CycleOutput` to the currently-active custody's
-/// supervisor. No-op when no custody is active or the dispatch
-/// fails (the next change retries).
-async fn dispatch_cycle_output(
-    cell: &Arc<Mutex<Option<SupervisorCommandSender>>>,
+/// What the reload needs of the active custody. The supervisor's
+/// command sender is the production implementation; tests stand
+/// in a recorder.
+trait Custody {
+    /// Whether the player is playing right now.
+    async fn is_playing(&self) -> bool;
+    /// Start playback again.
+    async fn resume(&self) -> Result<(), String>;
+    /// Close and reopen the MPD output (the fallback).
+    async fn cycle_output(&self) -> Result<(), String>;
+}
+
+impl Custody for SupervisorCommandSender {
+    async fn is_playing(&self) -> bool {
+        matches!(
+            self.query_state().await.map(|r| r.state),
+            Ok(PlayState::Playing)
+        )
+    }
+
+    async fn resume(&self) -> Result<(), String> {
+        self.command(PlaybackCommand::Play)
+            .await
+            .map_err(|e| format!("{e:?}"))
+    }
+
+    async fn cycle_output(&self) -> Result<(), String> {
+        SupervisorCommandSender::cycle_output(self)
+            .await
+            .map_err(|e| format!("{e:?}"))
+    }
+}
+
+/// Make a running MPD take the changed composition.
+///
+/// MPD is restarted through the plugin's restarter. A restarted
+/// MPD comes back paused, so when the player was playing it is
+/// told to play again: the operator hears the gap of a restart,
+/// not a stopped player. With no active custody there is nothing
+/// to resume and the restart is the whole job. When the restart
+/// is refused or unavailable the output is cycled instead, which
+/// is the best a running MPD can do, and the warning says that
+/// the change applies at the next MPD start.
+async fn reload_mpd<C: Custody>(
+    custody: Option<&C>,
+    restarter: &dyn MpdRestarter,
 ) {
-    let sender = {
-        let guard = cell.lock().await;
-        guard.as_ref().cloned()
+    let was_playing = match custody {
+        Some(c) => c.is_playing().await,
+        None => false,
     };
-    let Some(sender) = sender else {
-        tracing::debug!(
-            target = "asound_watcher",
-            "asound change observed but no active custody; skipping cycle"
-        );
-        return;
-    };
-    match sender.cycle_output().await {
-        Ok(()) => tracing::info!(
-            target = "asound_watcher",
-            "MPD output cycled successfully"
-        ),
-        Err(e) => tracing::warn!(
-            target = "asound_watcher",
-            error = ?e,
-            "MPD output cycle dispatch failed; will retry on next change"
-        ),
+    match restarter.restart().await {
+        Ok(()) => {
+            tracing::info!(
+                target = "asound_watcher",
+                strategy = restarter.strategy_name(),
+                was_playing,
+                "MPD restarted to take the asound composition"
+            );
+            if was_playing {
+                if let Some(c) = custody {
+                    match c.resume().await {
+                        Ok(()) => tracing::info!(
+                            target = "asound_watcher",
+                            "playback resumed after the MPD restart"
+                        ),
+                        Err(e) => tracing::warn!(
+                            target = "asound_watcher",
+                            error = %e,
+                            "playback did not resume after the MPD restart"
+                        ),
+                    }
+                }
+            }
+        }
+        Err(reason) => {
+            tracing::warn!(
+                target = "asound_watcher",
+                reason = %reason,
+                "MPD restart unavailable; cycling the output instead, so the \
+                 change applies at the next MPD start"
+            );
+            if let Some(c) = custody {
+                if let Err(e) = c.cycle_output().await {
+                    tracing::warn!(
+                        target = "asound_watcher",
+                        error = %e,
+                        "MPD output cycle failed"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -201,5 +282,99 @@ mod tests {
         // assert it returns a HashMap (possibly empty).
         let s = snapshot_mtimes();
         let _: HashMap<PathBuf, SystemTime> = s;
+    }
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex as StdMutex;
+
+    use crate::mpd_restart::{FailingRestarter, NoOpRestarter};
+
+    /// Records what the reload asked of the custody, in order.
+    struct Recorder {
+        playing: bool,
+        calls: StdMutex<Vec<&'static str>>,
+        resume_fails: AtomicBool,
+    }
+
+    impl Recorder {
+        fn new(playing: bool) -> Self {
+            Self {
+                playing,
+                calls: StdMutex::new(Vec::new()),
+                resume_fails: AtomicBool::new(false),
+            }
+        }
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl Custody for Recorder {
+        async fn is_playing(&self) -> bool {
+            self.calls.lock().unwrap().push("is_playing");
+            self.playing
+        }
+        async fn resume(&self) -> Result<(), String> {
+            self.calls.lock().unwrap().push("resume");
+            if self.resume_fails.load(Ordering::SeqCst) {
+                Err("gone".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        async fn cycle_output(&self) -> Result<(), String> {
+            self.calls.lock().unwrap().push("cycle_output");
+            Ok(())
+        }
+    }
+
+    /// A playing player is restarted and then told to play: the
+    /// output cycle, which reopens a stale configuration, is not
+    /// used.
+    #[tokio::test]
+    async fn a_playing_player_is_restarted_and_resumed_not_cycled() {
+        let restarter = NoOpRestarter::new();
+        let c = Recorder::new(true);
+        reload_mpd(Some(&c), &restarter).await;
+        assert_eq!(restarter.call_count(), 1);
+        assert_eq!(c.calls(), vec!["is_playing", "resume"]);
+    }
+
+    /// A paused or stopped player is restarted and left alone.
+    #[tokio::test]
+    async fn a_paused_player_is_restarted_and_not_resumed() {
+        let restarter = NoOpRestarter::new();
+        let c = Recorder::new(false);
+        reload_mpd(Some(&c), &restarter).await;
+        assert_eq!(restarter.call_count(), 1);
+        assert_eq!(c.calls(), vec!["is_playing"]);
+    }
+
+    /// With no custody the restart is the whole job.
+    #[tokio::test]
+    async fn with_no_custody_mpd_is_still_restarted() {
+        let restarter = NoOpRestarter::new();
+        reload_mpd::<Recorder>(None, &restarter).await;
+        assert_eq!(restarter.call_count(), 1);
+    }
+
+    /// When the restart is refused the output is cycled instead.
+    #[tokio::test]
+    async fn a_refused_restart_falls_back_to_the_output_cycle() {
+        let restarter = FailingRestarter::new("sudo refused");
+        let c = Recorder::new(true);
+        reload_mpd(Some(&c), &restarter).await;
+        assert_eq!(restarter.call_count(), 1);
+        assert_eq!(c.calls(), vec!["is_playing", "cycle_output"]);
+    }
+
+    /// A resume that fails is logged and does not panic or retry.
+    #[tokio::test]
+    async fn a_failed_resume_is_survivable() {
+        let restarter = NoOpRestarter::new();
+        let c = Recorder::new(true);
+        c.resume_fails.store(true, Ordering::SeqCst);
+        reload_mpd(Some(&c), &restarter).await;
+        assert_eq!(c.calls(), vec!["is_playing", "resume"]);
     }
 }
