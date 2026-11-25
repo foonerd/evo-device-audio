@@ -237,14 +237,20 @@ async fn run(
             },
             history: &history,
         };
-        emit_now_playing(
+        if !emit_now_playing(
             &mut cmd_conn,
             &subject_emitter,
             music_directory.as_deref(),
             &mut last_probed_file,
             watch,
         )
-        .await;
+        .await
+        {
+            // The pair opened but the command side will not answer;
+            // wait and open another rather than spin.
+            sleep_or_shutdown(&shutdown, RECONNECT_BACKOFF).await;
+            continue;
+        }
 
         // Inner loop: each iteration blocks on MPD's IDLE; on
         // wake, re-query status + currentsong and republish.
@@ -346,14 +352,23 @@ async fn run_inner(
                         continue;
                     }
                     Ok(_changed) => {
-                        emit_now_playing(
+                        if !emit_now_playing(
                             cmd_conn,
                             subject_emitter,
                             music_directory,
                             last_probed_file,
                             watch,
                         )
-                        .await;
+                        .await
+                        {
+                            // The command connection is gone (MPD
+                            // closes one that has been quiet). Leave
+                            // so the outer loop opens a fresh pair
+                            // and takes a snapshot, which is also
+                            // what lets the history see a track that
+                            // ended while the connection was down.
+                            return;
+                        }
                     }
                     Err(e) => {
                         // Idle-conn errors are the expected signal
@@ -385,26 +400,35 @@ async fn run_inner(
 /// custody-side reporter step (no custody handle is required
 /// here; the observer is custody-agnostic).
 ///
-/// Transport errors on the query path do NOT fail the loop —
-/// they log at DEBUG (the reconnect path in `run` recovers via
-/// outer-loop reset on the next idle error) and the publish is
-/// simply skipped for this cycle.
+/// A transport error on the query path skips the publish for this
+/// cycle, logs at DEBUG, and answers `false`: the command
+/// connection is no longer usable and the caller reconnects.
+///
+/// It cannot be left to the idle connection to notice. MPD closes
+/// a client connection that has been quiet for its
+/// `connection_timeout` (a minute by default), and the command
+/// connection is only used on a wake, so after a quiet minute it
+/// is dead while the idle connection, which MPD does not time out,
+/// is perfectly well. Skipping and waiting for the idle side to
+/// fail meant waiting forever: every later wake failed the same
+/// way, nothing was published, and the play history stopped
+/// recording until the plugin restarted.
 async fn emit_now_playing(
     cmd_conn: &mut MpdConnection,
     subject_emitter: &SubjectEmitter,
     music_directory: Option<&std::path::Path>,
     last_probed_file: &mut Option<String>,
     watch: Watch<'_>,
-) {
+) -> bool {
     let status = match cmd_conn.status().await {
         Ok(s) => s,
         Err(e) => {
             tracing::debug!(
                 plugin = PLUGIN_NAME,
                 error = %e,
-                "ambient observer: status query failed; skipping this cycle"
+                "ambient observer: status query failed; reconnecting"
             );
-            return;
+            return false;
         }
     };
     let song: Option<MpdSong> = match cmd_conn.current_song().await {
@@ -413,9 +437,9 @@ async fn emit_now_playing(
             tracing::debug!(
                 plugin = PLUGIN_NAME,
                 error = %e,
-                "ambient observer: currentsong query failed; skipping this cycle"
+                "ambient observer: currentsong query failed; reconnecting"
             );
-            return;
+            return false;
         }
     };
     // What this wake saw goes to the play history first: if the
@@ -458,6 +482,7 @@ async fn emit_now_playing(
     let report =
         PlaybackStateReport::from_mpd(status, song, watch.cells.read());
     subject_emitter.update_now_playing(&report).await;
+    true
 }
 
 /// Run the file-side source-format probe iff the current song's
@@ -732,6 +757,66 @@ mod tests {
             (most[0].uri.as_str(), most[0].count),
             ("INTERNAL/a.flac", 1)
         );
+    }
+
+    /// A command connection MPD has closed on a quiet client does
+    /// not end the history.
+    ///
+    /// MPD drops a client connection that has been quiet for its
+    /// `connection_timeout`, and the command connection is only
+    /// used on a wake. The track that was playing ends, the idle
+    /// connection wakes the observer, and the command connection
+    /// answers nothing. The observer reconnects, takes the snapshot
+    /// the new connection gives, and the history sees the track
+    /// that ended while it was down.
+    #[tokio::test]
+    async fn a_finish_is_recorded_across_a_dropped_command_connection() {
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        // Connections in the order the observer opens them: command
+        // then idle, and after the drop a fresh command and idle pair.
+        let (endpoint, _mock) = spawn_mock_mpd(vec![
+            ConnBehaviour::DropsAfterFirstSong {
+                first: "INTERNAL/a.flac".to_string(),
+            },
+            ConnBehaviour::IdleOnceThenHold,
+            ConnBehaviour::StandardWithSong {
+                file: "INTERNAL/b.flac".to_string(),
+                title: "T".to_string(),
+                artist: "A".to_string(),
+                album: "X".to_string(),
+            },
+            ConnBehaviour::HoldAfterWelcome,
+        ])
+        .await;
+        let history = PlayHistory::disabled();
+        let handle = spawn(
+            endpoint,
+            short_timeouts(),
+            SubjectEmitter::null(),
+            AmbientInputs {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+                shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                history: history.clone(),
+            },
+        );
+        let mut recent = Vec::new();
+        for _ in 0..160 {
+            recent = history.recently_played(10).await;
+            if !recent.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        handle.stop().await;
+        assert_eq!(
+            recent.len(),
+            1,
+            "the finish must be recorded once the observer has reconnected: {recent:?}"
+        );
+        assert_eq!(recent[0].uri, "INTERNAL/a.flac");
     }
 
     /// `stop` returns while the observer waits in its idle loop,

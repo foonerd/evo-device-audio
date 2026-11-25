@@ -385,6 +385,12 @@ pub(crate) enum ConnBehaviour {
     ///
     /// [`IdleOnceThenHold`]: Self::IdleOnceThenHold
     FinishesThenAdvances { first: String, second: String },
+    /// A command connection MPD has closed on a quiet client. The
+    /// first `status` reports `first` playing at 179.5 of 180 and
+    /// `currentsong` answers it; the next command of any kind
+    /// finds the connection closed, as MPD's `connection_timeout`
+    /// leaves one that was not used for a minute. `idle` holds.
+    DropsAfterFirstSong { first: String },
     /// A library that records every command it is sent.
     ///
     /// `listallinfo <path>` answers with `files`, so a caller
@@ -1190,6 +1196,42 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                     return;
                 }
                 let _ = w.write_all(reply.as_bytes()).await;
+                let _ = w.flush().await;
+            }
+        }
+        ConnBehaviour::DropsAfterFirstSong { ref first } => {
+            let mut line = String::new();
+            let mut answered = 0usize;
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                if answered >= 2 {
+                    // Closed by the peer: the next command gets no reply.
+                    return;
+                }
+                if line.starts_with("status") {
+                    answered += 1;
+                    let _ = w
+                        .write_all(
+                            b"state: play\nsong: 0\nelapsed: 179.500\nduration: 180.000\nvolume: 50\nOK\n",
+                        )
+                        .await;
+                } else if line.starts_with("currentsong") {
+                    answered += 1;
+                    let body = format!(
+                        "file: {first}\nTitle: T\nArtist: A\nAlbum: X\n\
+                         Time: 180\nduration: 180.000\nOK\n"
+                    );
+                    let _ = w.write_all(body.as_bytes()).await;
+                } else if line.starts_with("idle") {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    return;
+                } else {
+                    let _ = w.write_all(b"OK\n").await;
+                }
                 let _ = w.flush().await;
             }
         }
