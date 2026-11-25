@@ -160,6 +160,44 @@ const MODE_PASSTHROUGH: &str = "passthrough";
 const MODE_EQ_ONLY: &str = "eq_only";
 const DECLARED_MODES: &[&str] = &[MODE_PASSTHROUGH, MODE_EQ_ONLY];
 
+/// Waits between attempts to report the active mode to audio
+/// options, in milliseconds.
+///
+/// The first report is made at load, and load runs before the
+/// steward's dispatcher is wired to its server: the dispatch is
+/// answered "not yet wired (retryable)" until boot completes, and
+/// audio options may not occupy its shelf yet either. A single
+/// attempt therefore loses to boot on every cold start, and the
+/// glass reads an empty mode for as long as nothing else reports.
+///
+/// The attempts are bounded. The schedule sums to a little under a
+/// minute, which is longer than a cold boot takes to wire the
+/// dispatcher and short enough that a shelf that never appears is
+/// reported once, at WARN, and left.
+const REPORT_RETRY_DELAYS_MS: &[u64] = &[
+    250, 500, 1_000, 2_000, 4_000, 8_000, 8_000, 8_000, 8_000, 8_000, 8_000,
+];
+
+/// Whether a failed report is worth another attempt.
+///
+/// What passes: the steward not wired yet, the destination shelf
+/// not occupied yet, a transient fault, a missed budget. What does
+/// not: a refusal, a verb the shelf does not stock, a permanent
+/// failure. Those are answers; asking again gets the same one.
+/// Anything this build does not know is treated as an answer.
+fn report_is_retryable(
+    e: &evo_plugin_sdk::contract::ShelfDispatchError,
+) -> bool {
+    use evo_plugin_sdk::contract::ShelfDispatchError as E;
+    matches!(
+        e,
+        E::Transient { .. }
+            | E::SubstrateFailure { .. }
+            | E::NoPluginOnShelf { .. }
+            | E::DeadlineExceeded { .. }
+    )
+}
+
 /// Parse the embedded plugin manifest.
 pub fn manifest() -> Manifest {
     Manifest::from_toml(MANIFEST_TOML).expect(
@@ -263,6 +301,10 @@ pub struct AlsaCompositionPlugin {
     /// mount. `None` in an in-process test harness; the steward's
     /// wire adapter always populates it in production.
     shelf_dispatcher: Option<Arc<dyn ShelfRequestDispatcher>>,
+    /// Waits between attempts to report the mode. A field so a
+    /// test can shorten them; production takes
+    /// [`REPORT_RETRY_DELAYS_MS`].
+    report_delays: Vec<std::time::Duration>,
     /// The plugin's own state directory, from
     /// [`LoadContext::state_dir`]. `None` before load, which is
     /// how a unit-test construction stays off the filesystem.
@@ -363,6 +405,10 @@ impl AlsaCompositionPlugin {
         let (eq_state_tx, _) = watch::channel(EqRuntimeState::default());
         Self {
             shelf_dispatcher: None,
+            report_delays: REPORT_RETRY_DELAYS_MS
+                .iter()
+                .map(|ms| std::time::Duration::from_millis(*ms))
+                .collect(),
             state_dir: None,
             loaded: false,
             mode_tx,
@@ -425,41 +471,80 @@ impl AlsaCompositionPlugin {
     ///
     /// The options verb is idempotent — reporting the mode it
     /// already holds persists nothing and republishes nothing —
-    /// which is what makes it safe to call on every change and
-    /// again on the mode restored at load.
+    /// which is what makes it safe to call on every change, on the
+    /// mode restored at load, and again on a retry.
     ///
-    /// Best-effort and detached: a glass that paints a stale mode
-    /// is a worse outcome than a slow one, but neither is worth
+    /// The report made at load runs before the steward's dispatcher
+    /// is wired, so it is retried, a bounded number of times, while
+    /// the failure is one that passes (see [`report_is_retryable`]).
+    /// Each attempt reports the mode in force at that moment, not
+    /// the one the call started with: a retry still waiting when the
+    /// operator chooses another mode must not put the old one back.
+    ///
+    /// Best-effort and detached: a glass that paints a stale mode is
+    /// a worse outcome than a slow one, but neither is worth
     /// failing a load or a mode gesture over. Absent dispatcher
-    /// (an in-process harness) is silent.
-    fn report_mode_to_options(&self, mode: &str) {
+    /// (an in-process harness) is silent. When the attempts run
+    /// out, or the failure is an answer, it is logged once.
+    fn report_mode_to_options(&self, asked: &str) {
         let Some(dispatcher) = self.shelf_dispatcher.clone() else {
             return;
         };
-        let mode = mode.to_string();
+        let asked = asked.to_string();
+        let current = self.mode_tx.subscribe();
+        let delays = self.report_delays.clone();
         tokio::spawn(async move {
-            let payload = serde_json::json!({ "v": 1, "mode": mode });
-            let Ok(bytes) = serde_json::to_vec(&payload) else {
-                return;
-            };
-            if let Err(e) = dispatcher
-                .dispatch(
-                    "audio.options",
-                    "options.set_composition_mode",
-                    bytes,
-                    None,
-                )
-                .await
-            {
+            let mut attempt = 0usize;
+            loop {
+                // The mode now, which is the mode asked for unless the
+                // operator has chosen again since.
+                let mode = current.borrow().clone();
+                let payload = serde_json::json!({ "v": 1, "mode": mode });
+                let Ok(bytes) = serde_json::to_vec(&payload) else {
+                    return;
+                };
+                let failure = match dispatcher
+                    .dispatch(
+                        "audio.options",
+                        "options.set_composition_mode",
+                        bytes,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        if attempt > 0 {
+                            tracing::info!(
+                                plugin = PLUGIN_NAME,
+                                mode = %mode,
+                                attempts = attempt + 1,
+                                "reported the composition mode to audio \
+                                 options after retrying"
+                            );
+                        }
+                        return;
+                    }
+                    Err(e) => e,
+                };
+                if report_is_retryable(&failure) {
+                    if let Some(wait) = delays.get(attempt) {
+                        tokio::time::sleep(*wait).await;
+                        attempt += 1;
+                        continue;
+                    }
+                }
                 tracing::warn!(
                     plugin = PLUGIN_NAME,
                     mode = %mode,
-                    error = %e,
+                    asked = %asked,
+                    attempts = attempt + 1,
+                    error = %failure,
                     "could not report the composition mode to audio \
                      options; the glass may paint a stale mode until the \
                      next change. LOGGING.md §2: operator-visible state \
                      diverging from the device."
                 );
+                return;
             }
         });
     }
@@ -1956,6 +2041,196 @@ mod tests {
             calls[0].2.contains("eq_only"),
             "the report must carry the mode: {}",
             calls[0].2
+        );
+    }
+
+    /// A dispatcher that answers the first `fail` calls with `err`,
+    /// then succeeds, and records every payload it was sent.
+    struct FlakyDispatcher {
+        fail: usize,
+        err: evo_plugin_sdk::contract::ShelfDispatchError,
+        sent: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FlakyDispatcher {
+        fn new(
+            fail: usize,
+            err: evo_plugin_sdk::contract::ShelfDispatchError,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                fail,
+                err,
+                sent: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn payloads(&self) -> Vec<String> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    impl ShelfRequestDispatcher for FlakyDispatcher {
+        fn dispatch<'a>(
+            &'a self,
+            _shelf: &'a str,
+            _request_type: &'a str,
+            payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Vec<u8>,
+                            evo_plugin_sdk::contract::ShelfDispatchError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let mut sent = self.sent.lock().unwrap();
+                sent.push(String::from_utf8_lossy(&payload).to_string());
+                if sent.len() <= self.fail {
+                    Err(self.err.clone())
+                } else {
+                    Ok(b"{}".to_vec())
+                }
+            })
+        }
+    }
+
+    fn not_wired() -> evo_plugin_sdk::contract::ShelfDispatchError {
+        evo_plugin_sdk::contract::ShelfDispatchError::SubstrateFailure {
+            detail: "shelf request dispatcher not yet wired to server \
+                     (admission-time dispatch before boot complete; \
+                     retryable)"
+                .into(),
+        }
+    }
+
+    /// A plugin wired to `dispatcher` with millisecond waits.
+    fn plugin_with(
+        dispatcher: &Arc<FlakyDispatcher>,
+        retries: usize,
+    ) -> AlsaCompositionPlugin {
+        let mut p = AlsaCompositionPlugin::new();
+        p.shelf_dispatcher =
+            Some(Arc::clone(dispatcher) as Arc<dyn ShelfRequestDispatcher>);
+        p.report_delays = vec![std::time::Duration::from_millis(5); retries];
+        p
+    }
+
+    /// The report made at load runs before the steward's dispatcher
+    /// is wired. It is tried again until it lands, which is what
+    /// makes the glass read a mode after a cold boot.
+    #[tokio::test]
+    async fn a_report_refused_before_boot_lands_when_the_steward_is_wired() {
+        let d = FlakyDispatcher::new(3, not_wired());
+        let p = plugin_with(&d, 10);
+        p.report_mode_to_options("passthrough");
+        for _ in 0..200 {
+            if d.payloads().len() >= 4 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let sent = d.payloads();
+        assert_eq!(sent.len(), 4, "three refusals, then the one that lands");
+        assert!(
+            sent.iter().all(|s| s.contains("passthrough")),
+            "every attempt carries the mode: {sent:?}"
+        );
+    }
+
+    /// The retry is bounded. A shelf that never answers is tried
+    /// the scheduled number of times and then left.
+    #[tokio::test]
+    async fn the_report_retry_is_bounded() {
+        let d = FlakyDispatcher::new(usize::MAX, not_wired());
+        let p = plugin_with(&d, 4);
+        p.report_mode_to_options("passthrough");
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(
+            d.payloads().len(),
+            5,
+            "one attempt and four retries, then no more"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(d.payloads().len(), 5, "nothing after the bound");
+    }
+
+    /// The production schedule is bounded and spans a cold boot.
+    #[test]
+    fn the_production_schedule_spans_a_cold_boot_and_no_more() {
+        let total: u64 = REPORT_RETRY_DELAYS_MS.iter().sum();
+        assert!(
+            (30_000..=90_000).contains(&total),
+            "the retry window must cover boot and stay bounded: {total} ms"
+        );
+        assert!(REPORT_RETRY_DELAYS_MS.len() <= 16);
+        let p = AlsaCompositionPlugin::new();
+        assert_eq!(p.report_delays.len(), REPORT_RETRY_DELAYS_MS.len());
+    }
+
+    /// An answer is not retried. A refusal, a verb the shelf does
+    /// not stock and a permanent failure are the same on the next
+    /// ask.
+    #[tokio::test]
+    async fn an_answer_is_not_retried() {
+        use evo_plugin_sdk::contract::ShelfDispatchError as E;
+        for err in [
+            E::Refused {
+                subclass: "household_policy_locked".into(),
+                detail: "locked".into(),
+            },
+            E::VerbNotStockedOnShelf {
+                shelf: "audio.options".into(),
+                request_type: "options.set_composition_mode".into(),
+            },
+            E::Permanent {
+                detail: "no".into(),
+            },
+        ] {
+            let d = FlakyDispatcher::new(usize::MAX, err.clone());
+            let p = plugin_with(&d, 5);
+            p.report_mode_to_options("passthrough");
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            assert_eq!(d.payloads().len(), 1, "{err} must not be retried");
+        }
+    }
+
+    /// What passes is retried: the steward not wired, the shelf not
+    /// occupied yet, a transient fault, a missed budget.
+    #[test]
+    fn what_passes_is_retryable() {
+        use evo_plugin_sdk::contract::ShelfDispatchError as E;
+        assert!(report_is_retryable(&not_wired()));
+        assert!(report_is_retryable(&E::NoPluginOnShelf {
+            shelf: "audio.options".into()
+        }));
+        assert!(report_is_retryable(&E::Transient { detail: "t".into() }));
+        assert!(report_is_retryable(&E::DeadlineExceeded { budget_ms: 1 }));
+        assert!(!report_is_retryable(&E::Permanent { detail: "p".into() }));
+    }
+
+    /// A retry still waiting when the operator chooses another mode
+    /// must not put the old one back: each attempt reports the mode
+    /// in force then.
+    #[tokio::test]
+    async fn a_waiting_retry_reports_the_mode_in_force_then() {
+        let d = FlakyDispatcher::new(1, not_wired());
+        let p = plugin_with(&d, 10);
+        p.report_mode_to_options("passthrough");
+        // The first attempt fails at once; before the retry fires the
+        // operator chooses eq_only.
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        p.mode_tx.send_replace("eq_only".to_string());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let sent = d.payloads();
+        assert!(sent.len() >= 2, "{sent:?}");
+        assert!(
+            sent.last().unwrap().contains("eq_only"),
+            "the landed report carries the mode now in force: {sent:?}"
         );
     }
 
