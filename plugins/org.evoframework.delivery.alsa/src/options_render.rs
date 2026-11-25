@@ -526,14 +526,24 @@ pub fn extract_options_settings_from_state(
         })
         .filter(|s| !s.is_empty());
 
-    // Resampling shape mirrors the `set_resampling` request
-    // arg: `{ "enabled": bool, "target_rate_hz": u32 }`. The
-    // subject state may carry an absent field (operator never
-    // touched it) or an object with the two fields.
+    // The subject state may carry an absent field (operator
+    // never touched it) or an object with `enabled` and a
+    // target rate. The rate is `target_rate_hz` (a number) or
+    // `target_samplerate`, the key playback.options publishes,
+    // as a string of digits (empty while the policy is unset).
+    // Reading only the first left every resampling gesture
+    // unrendered.
     let resampling = state.get("resampling").and_then(|r| {
         let enabled = r.get("enabled").and_then(|v| v.as_bool())?;
-        let target_rate_hz =
-            r.get("target_rate_hz").and_then(|v| v.as_u64())? as u32;
+        let target_rate_hz = r
+            .get("target_rate_hz")
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                let v = r.get("target_samplerate")?;
+                v.as_u64()
+                    .or_else(|| v.as_str()?.trim().parse::<u64>().ok())
+            })
+            .and_then(|hz| u32::try_from(hz).ok())?;
         Some(Resampling {
             enabled,
             target_rate_hz,
@@ -957,6 +967,40 @@ mod tests {
                 target_rate_hz: 96000
             })
         );
+    }
+
+    /// playback.options publishes the rate as `target_samplerate`,
+    /// a string of digits, and empty while the policy is unset.
+    #[test]
+    fn extractor_reads_the_rate_playback_options_publishes() {
+        let on = extract_options_settings_from_state(&serde_json::json!({
+            "resampling": {
+                "enabled": true,
+                "target_bitdepth": "24",
+                "target_samplerate": "48000",
+                "quality": "medium"
+            }
+        }));
+        assert_eq!(
+            on.resampling,
+            Some(Resampling {
+                enabled: true,
+                target_rate_hz: 48000
+            })
+        );
+        let unset = extract_options_settings_from_state(&serde_json::json!({
+            "resampling": {
+                "enabled": false,
+                "target_bitdepth": "",
+                "target_samplerate": "",
+                "quality": ""
+            }
+        }));
+        assert_eq!(unset.resampling, None);
+        let junk = extract_options_settings_from_state(&serde_json::json!({
+            "resampling": {"enabled": true, "target_samplerate": "fast"}
+        }));
+        assert_eq!(junk.resampling, None);
     }
 
     #[test]

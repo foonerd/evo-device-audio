@@ -103,7 +103,8 @@ use evo_plugin_sdk::contract::{
     BuildInfo, ExternalAddressing, HappeningEmitter, HealthReport, LoadContext,
     Plugin, PluginDescription, PluginError, PluginIdentity, Request,
     Respondent, Response, RuntimeCapabilities, SubjectAnnouncement,
-    SubjectAnnouncer, SubjectStateStreamError,
+    SubjectAnnouncer, SubjectQuerier, SubjectStateStreamError,
+    SubjectStateSubscriber,
 };
 use evo_plugin_sdk::Manifest;
 use logical_outputs::{LogicalOutput, LogicalOutputStore, LogicalOutputs};
@@ -1227,30 +1228,96 @@ impl AlsaDeliveryPlugin {
         let renderer = self.drop_in_renderer();
         let eq_claim = self.eq_claim_publisher();
         let happening_emitter = Arc::clone(&ctx.happening_emitter);
-        let addressing = ExternalAddressing {
+        let addressing = AlsaDeliveryPlugin::options_addressing();
+        let querier = Arc::clone(querier);
+        let subscriber = Arc::clone(subscriber);
+        let shutdown = Arc::new(Notify::new());
+        let task = tokio::spawn(AlsaDeliveryPlugin::run_options_observer(
+            querier,
+            subscriber,
+            renderer,
+            eq_claim,
+            happening_emitter,
+            addressing,
+            Arc::clone(&shutdown),
+        ));
+        self.options_observer = Some(OptionsObserverHandle { task, shutdown });
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            "audio-options observer task spawned"
+        );
+    }
+
+    /// The addressing of the settings subject playback.options
+    /// announces.
+    fn options_addressing() -> ExternalAddressing {
+        ExternalAddressing {
             scheme: "evo.audio.options".to_string(),
             value: "settings".to_string(),
-        };
-        let canonical_id =
+        }
+    }
+
+    /// The options observer's task: resolve the settings subject
+    /// (backing off until it is announced), subscribe, seed from
+    /// the current state, then render every update. Returns on
+    /// shutdown or when the stream closes.
+    async fn run_options_observer(
+        querier: Arc<dyn SubjectQuerier>,
+        subscriber: Arc<dyn SubjectStateSubscriber>,
+        renderer: DropInRenderer,
+        eq_claim: EqClaimPublisher,
+        happening_emitter: Arc<dyn HappeningEmitter>,
+        addressing: ExternalAddressing,
+        task_shutdown: Arc<Notify>,
+    ) {
+        // Stage 1: resolve the settings subject, backing off
+        // until playback.options has announced it. Plugins
+        // admit in no fixed order, and giving up at the
+        // first "not yet announced" left the observer unwired
+        // for the whole session: operator gestures stored
+        // their settings and no drop-in was ever rendered
+        // from them. Same shape as the hardware observer.
+        let mut backoff = Duration::from_millis(250);
+        const BACKOFF_CAP: Duration = Duration::from_secs(5);
+        let canonical_id = loop {
             match querier.resolve_addressing(addressing.clone()).await {
-                Ok(Some(id)) => id,
+                Ok(Some(id)) => break id,
                 Ok(None) => {
-                    tracing::info!(
+                    tracing::debug!(
                         plugin = PLUGIN_NAME,
-                        "audio-options settings subject not yet announced; \
-                         observer not wired this cycle"
+                        backoff_ms = backoff.as_millis() as u64,
+                        "audio-options settings subject not yet \
+                         announced; backing off and retrying"
                     );
-                    return;
                 }
                 Err(e) => {
                     tracing::warn!(
                         plugin = PLUGIN_NAME,
                         error = %e,
-                        "resolve_addressing for audio-options settings failed"
+                        backoff_ms = backoff.as_millis() as u64,
+                        "resolve_addressing for audio-options settings \
+                         errored; backing off and retrying"
+                    );
+                }
+            }
+            tokio::select! {
+                _ = task_shutdown.notified() => {
+                    tracing::debug!(
+                        plugin = PLUGIN_NAME,
+                        "audio-options observer: shutdown received \
+                         during resolve-addressing wait"
                     );
                     return;
                 }
-            };
+                _ = tokio::time::sleep(backoff) => {}
+            }
+            backoff = std::cmp::min(backoff * 2, BACKOFF_CAP);
+        };
+        // Stage 2: subscribe, then seed from the current
+        // state. The stream carries only updates made after
+        // the subscription, so a settings subject announced
+        // before this point would otherwise be unknown here
+        // until the next gesture.
         let mut stream =
             match subscriber.subscribe_subject(canonical_id.clone()).await {
                 Ok(s) => s,
@@ -1259,144 +1326,142 @@ impl AlsaDeliveryPlugin {
                         plugin = PLUGIN_NAME,
                         error = %e,
                         canonical_id = %canonical_id,
-                        "subscribe to audio-options settings subject failed"
+                        "subscribe to audio-options settings subject \
+                         failed"
                     );
                     return;
                 }
             };
-        let shutdown = Arc::new(Notify::new());
-        let task_shutdown = Arc::clone(&shutdown);
-        let task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = task_shutdown.notified() => {
-                        tracing::debug!(
-                            plugin = PLUGIN_NAME,
-                            "audio-options observer: shutdown received"
-                        );
-                        return;
-                    }
-                    update = stream.recv() => {
-                        match update {
-                            Ok(state_update) => {
-                                let observed_at_ms = now_ms();
-
-                                // Extract → remember → render →
-                                // write. The observer-observed
-                                // happening (kept for diagnostic-
-                                // replay consumers) fires alongside
-                                // the options_rendered happening
-                                // (which signals subscribers that
-                                // the on-disk pipeline definition
-                                // has changed). Both happenings
-                                // carry the canonical subject id
-                                // so a single subscriber can
-                                // correlate observer activity
-                                // against pipeline rewrites. The
-                                // render goes through the same
-                                // DropInRenderer the output verbs
-                                // use, so the output binding is
-                                // honoured here and the file has
-                                // one writer.
-                                let settings_state =
-                                    state_update.state.unwrap_or(
-                                        serde_json::Value::Null,
-                                    );
-                                let settings =
-                                    options_render::extract_options_settings_from_state(
-                                        &settings_state,
-                                    );
-                                *renderer.last_options.write().await =
-                                    Some(LastOptions {
-                                        settings,
-                                        subject_canonical_id:
-                                            state_update.canonical_id.clone(),
-                                    });
-                                let outcome = renderer.render_and_write().await;
-
-                                let observed_payload = serde_json::json!({
-                                    "subject_canonical_id":
-                                        state_update.canonical_id,
-                                    "observed_at_ms": observed_at_ms,
-                                    "settings_state": settings_state,
-                                });
-                                if let Err(e) = happening_emitter
-                                    .emit_plugin_event(
-                                        "delivery.options_observed"
-                                            .to_string(),
-                                        observed_payload,
-                                    )
-                                    .await
-                                {
-                                    // LOGGING.md §2: warn
-                                    // (recoverable; the disk
-                                    // write was the load-bearing
-                                    // side effect; this happening
-                                    // is the diagnostic surface).
-                                    tracing::warn!(
-                                        plugin = PLUGIN_NAME,
-                                        error = %e,
-                                        "emit delivery.options_observed failed"
-                                    );
-                                }
-
-                                renderer.emit_rendered(&outcome, observed_at_ms).await;
-                                // The operator's output_device
-                                // is the terminus under Follow:
-                                // which zone's EQ sounds may
-                                // have changed with it.
-                                eq_claim.publish().await;
-
-                                // Mixer-transition lifecycle is
-                                // owned by the orchestrator
-                                // (the audio.options-shape
-                                // plugin), per the schema's
-                                // `mixer-transition-lifecycle-
-                                // emitter-is-orchestrator`
-                                // criterion. delivery.alsa
-                                // observes the settings subject
-                                // and renders the drop-in; the
-                                // orchestrator's eight-step
-                                // state machine emits the
-                                // canonical
-                                // `audio.mixer_transition.*`
-                                // happenings (started / applied
-                                // / rolled_back / failed). The
-                                // earlier per-delivery emission
-                                // of a `audio.mixer.transition_
-                                // applied` happening is retired
-                                // — it was a parallel-truth
-                                // path competing with the
-                                // orchestrator's canonical
-                                // lifecycle stream.
-                            }
-                            Err(SubjectStateStreamError::Lagged {
-                                dropped,
-                            }) => {
-                                tracing::warn!(
-                                    plugin = PLUGIN_NAME,
-                                    dropped = dropped,
-                                    "audio-options observer stream lagged"
-                                );
-                            }
-                            Err(SubjectStateStreamError::Closed) => {
-                                tracing::debug!(
-                                    plugin = PLUGIN_NAME,
-                                    "audio-options observer stream closed"
-                                );
-                                return;
-                            }
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            canonical_id = %canonical_id,
+            "audio-options observer task connected"
+        );
+        match subscriber.current_state(canonical_id.clone()).await {
+            Ok(Some(state)) => {
+                AlsaDeliveryPlugin::observe_options_state(
+                    &renderer,
+                    &eq_claim,
+                    &happening_emitter,
+                    canonical_id.clone(),
+                    state,
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "current_state for audio-options settings failed; \
+                 waiting for the next update"
+            ),
+        }
+        loop {
+            tokio::select! {
+                _ = task_shutdown.notified() => {
+                    tracing::debug!(
+                        plugin = PLUGIN_NAME,
+                        "audio-options observer: shutdown received"
+                    );
+                    return;
+                }
+                update = stream.recv() => {
+                    match update {
+                        Ok(state_update) => {
+                            AlsaDeliveryPlugin::observe_options_state(
+                                &renderer,
+                                &eq_claim,
+                                &happening_emitter,
+                                state_update.canonical_id.clone(),
+                                state_update
+                                    .state
+                                    .unwrap_or(serde_json::Value::Null),
+                            )
+                            .await;
+                        }
+                        Err(SubjectStateStreamError::Lagged {
+                            dropped,
+                        }) => {
+                            tracing::warn!(
+                                plugin = PLUGIN_NAME,
+                                dropped = dropped,
+                                "audio-options observer stream lagged"
+                            );
+                        }
+                        Err(SubjectStateStreamError::Closed) => {
+                            tracing::debug!(
+                                plugin = PLUGIN_NAME,
+                                "audio-options observer stream closed"
+                            );
+                            return;
                         }
                     }
                 }
             }
-        });
-        self.options_observer = Some(OptionsObserverHandle { task, shutdown });
-        tracing::info!(
-            plugin = PLUGIN_NAME,
-            canonical_id = %canonical_id,
-            "audio-options observer task spawned"
+        }
+    }
+
+    /// Take one settings state, whether read at subscribe time
+    /// or delivered as an update: extract, remember, render,
+    /// write.
+    ///
+    /// The observer-observed happening (kept for diagnostic-
+    /// replay consumers) fires alongside the options_rendered
+    /// happening (which signals subscribers that the on-disk
+    /// pipeline definition has changed). Both carry the
+    /// canonical subject id so a single subscriber can correlate
+    /// observer activity against pipeline rewrites. The render
+    /// goes through the same DropInRenderer the output verbs
+    /// use, so the output binding is honoured here and the file
+    /// has one writer.
+    ///
+    /// Mixer-transition lifecycle is owned by the orchestrator
+    /// (the audio.options-shape plugin); delivery.alsa observes
+    /// the settings subject and renders the drop-in.
+    async fn observe_options_state(
+        renderer: &DropInRenderer,
+        eq_claim: &EqClaimPublisher,
+        happening_emitter: &Arc<dyn HappeningEmitter>,
+        canonical_id: String,
+        settings_state: serde_json::Value,
+    ) {
+        let observed_at_ms = now_ms();
+        let settings = options_render::extract_options_settings_from_state(
+            &settings_state,
         );
+        *renderer.last_options.write().await = Some(LastOptions {
+            settings,
+            subject_canonical_id: canonical_id.clone(),
+        });
+        let outcome = renderer.render_and_write().await;
+
+        let observed_payload = serde_json::json!({
+            "subject_canonical_id": canonical_id,
+            "observed_at_ms": observed_at_ms,
+            "settings_state": settings_state,
+        });
+        if let Err(e) = happening_emitter
+            .emit_plugin_event(
+                "delivery.options_observed".to_string(),
+                observed_payload,
+            )
+            .await
+        {
+            // LOGGING.md §2: warn (recoverable; the disk write
+            // was the load-bearing side effect; this happening
+            // is the diagnostic surface).
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "emit delivery.options_observed failed"
+            );
+        }
+
+        renderer.emit_rendered(&outcome, observed_at_ms).await;
+        // The operator's output_device is the terminus under
+        // Follow: which zone's EQ sounds may have changed with
+        // it.
+        eq_claim.publish().await;
     }
 
     async fn stop_options_observer(&mut self) {
@@ -4978,6 +5043,241 @@ pcm.evo {
             sound.contains("pcm.evo_terminus {\n    type hw\n    card \"3\""),
             "{sound}"
         );
+    }
+
+    /// A querier that has not seen the settings subject announced
+    /// for the first `unannounced` resolves, and a subscriber that
+    /// holds a current state and a live stream.
+    struct FakeSubjects {
+        unannounced: std::sync::atomic::AtomicUsize,
+        resolves: std::sync::atomic::AtomicUsize,
+        current: Option<Value>,
+        updates: tokio::sync::broadcast::Sender<
+            evo_plugin_sdk::contract::SubjectStateUpdate,
+        >,
+    }
+
+    impl SubjectQuerier for FakeSubjects {
+        fn describe_alias<'a>(
+            &'a self,
+            _subject_id: String,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Option<evo_plugin_sdk::contract::AliasRecord>,
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+        fn describe_subject_with_aliases<'a>(
+            &'a self,
+            _subject_id: String,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            evo_plugin_sdk::contract::SubjectQueryResult,
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async {
+                Err(evo_plugin_sdk::contract::ReportError::Deregistered)
+            })
+        }
+        fn resolve_addressing<'a>(
+            &'a self,
+            _addressing: ExternalAddressing,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Option<String>,
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.resolves
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.unannounced.load(std::sync::atomic::Ordering::SeqCst)
+                    > 0
+                {
+                    self.unannounced
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(None)
+                } else {
+                    Ok(Some("settings-1".to_string()))
+                }
+            })
+        }
+    }
+
+    impl SubjectStateSubscriber for FakeSubjects {
+        fn subscribe_subject<'a>(
+            &'a self,
+            canonical_id: String,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            evo_plugin_sdk::contract::SubjectStateStream,
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                Ok(evo_plugin_sdk::contract::SubjectStateStream::new(
+                    self.updates.subscribe(),
+                    canonical_id,
+                ))
+            })
+        }
+        fn current_state<'a>(
+            &'a self,
+            _canonical_id: String,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Option<Value>,
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let current = self.current.clone();
+            Box::pin(async move { Ok(current) })
+        }
+    }
+
+    #[derive(Default)]
+    struct QuietEmitter;
+
+    impl HappeningEmitter for QuietEmitter {
+        fn emit_plugin_event<'a>(
+            &'a self,
+            _event_type: String,
+            _payload: Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            (),
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+        fn emit_audio_playback_ended<'a>(
+            &'a self,
+            _claim_uri: Option<String>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            (),
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Run the observer against the fakes; the shutdown handle
+    /// comes back with the task.
+    fn run_observer(
+        rig: &OutputRig,
+        subjects: Arc<FakeSubjects>,
+    ) -> (tokio::task::JoinHandle<()>, Arc<Notify>) {
+        let shutdown = Arc::new(Notify::new());
+        let task = tokio::spawn(AlsaDeliveryPlugin::run_options_observer(
+            Arc::clone(&subjects) as Arc<dyn SubjectQuerier>,
+            subjects as Arc<dyn SubjectStateSubscriber>,
+            rig.plugin.drop_in_renderer(),
+            rig.plugin.eq_claim_publisher(),
+            Arc::new(QuietEmitter) as Arc<dyn HappeningEmitter>,
+            AlsaDeliveryPlugin::options_addressing(),
+            Arc::clone(&shutdown),
+        ));
+        (task, shutdown)
+    }
+
+    /// A settings subject that is announced after this plugin
+    /// loads is still observed, and the state it already holds
+    /// is rendered at once. The observer used to give up at the
+    /// first "not yet announced" and so rendered nothing from any
+    /// gesture for the whole session.
+    #[tokio::test(start_paused = true)]
+    async fn the_options_observer_waits_for_the_subject_and_seeds_from_it() {
+        let rig = OutputRig::new().await;
+        let (updates, _keep) = tokio::sync::broadcast::channel(8);
+        let subjects = Arc::new(FakeSubjects {
+            unannounced: std::sync::atomic::AtomicUsize::new(3),
+            resolves: std::sync::atomic::AtomicUsize::new(0),
+            current: Some(json!({
+                "mixer_type": "software",
+                "output_device": "hw:3,0"
+            })),
+            updates,
+        });
+        let (task, shutdown) = run_observer(&rig, Arc::clone(&subjects));
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(
+            subjects.resolves.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "three unannounced answers, then the subject"
+        );
+        let body = rig.drop_in().await;
+        assert!(body.contains("type softvol"), "{body}");
+        shutdown.notify_one();
+        let _ = task.await;
+    }
+
+    /// An update after the seed re-renders the drop-in.
+    #[tokio::test(start_paused = true)]
+    async fn an_options_update_after_the_seed_is_rendered() {
+        let rig = OutputRig::new().await;
+        let (updates, _keep) = tokio::sync::broadcast::channel(8);
+        let subjects = Arc::new(FakeSubjects {
+            unannounced: std::sync::atomic::AtomicUsize::new(0),
+            resolves: std::sync::atomic::AtomicUsize::new(0),
+            current: Some(json!({ "mixer_type": "none" })),
+            updates: updates.clone(),
+        });
+        let (task, shutdown) = run_observer(&rig, Arc::clone(&subjects));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!rig.drop_in().await.contains("type softvol"));
+        updates
+            .send(evo_plugin_sdk::contract::SubjectStateUpdate {
+                canonical_id: "settings-1".to_string(),
+                subject_type: "settings".to_string(),
+                state: Some(json!({ "mixer_type": "software" })),
+                modified_at_ms: 1,
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(rig.drop_in().await.contains("type softvol"));
+        shutdown.notify_one();
+        let _ = task.await;
     }
 
     /// Enabled flags and volumes survive a restart on the same
