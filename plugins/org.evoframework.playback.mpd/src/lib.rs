@@ -2604,6 +2604,8 @@ impl Plugin for MpdPlaybackPlugin {
             self.asound_watcher = Some(asound_watcher::spawn(
                 Arc::clone(&self.active_command_sender),
                 Arc::clone(&self.restarter),
+                self.endpoint.clone(),
+                self.timeouts,
             ));
 
             // Initialise the shelf integration: source

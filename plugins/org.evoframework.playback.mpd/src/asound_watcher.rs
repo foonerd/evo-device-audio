@@ -59,9 +59,9 @@ use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 
-use crate::mpd::PlayState;
+use crate::mpd::{ConnectTimeouts, MpdConnection, MpdEndpoint, PlayState};
 use crate::mpd_restart::MpdRestarter;
-use crate::playback_supervisor::{PlaybackCommand, SupervisorCommandSender};
+use crate::playback_supervisor::SupervisorCommandSender;
 
 /// Directory the watcher observes. The bootstrap installs this
 /// path with mode 0775 owned by the steward's service user; the
@@ -107,12 +107,16 @@ impl AsoundWatcherHandle {
 pub(crate) fn spawn(
     active_command_sender: Arc<Mutex<Option<SupervisorCommandSender>>>,
     restarter: Arc<dyn MpdRestarter>,
+    endpoint: MpdEndpoint,
+    timeouts: ConnectTimeouts,
 ) -> AsoundWatcherHandle {
     let shutdown = Arc::new(Notify::new());
     let task = tokio::spawn(run(
         Arc::clone(&shutdown),
         active_command_sender,
         restarter,
+        endpoint,
+        timeouts,
     ));
     AsoundWatcherHandle { shutdown, task }
 }
@@ -121,6 +125,8 @@ async fn run(
     shutdown: Arc<Notify>,
     active_command_sender: Arc<Mutex<Option<SupervisorCommandSender>>>,
     restarter: Arc<dyn MpdRestarter>,
+    endpoint: MpdEndpoint,
+    timeouts: ConnectTimeouts,
 ) {
     let mut last: HashMap<PathBuf, SystemTime> = HashMap::new();
     let mut seeded = false;
@@ -146,8 +152,14 @@ async fn run(
                         current_entries = current.len(),
                         "asound composition change detected; restarting MPD"
                     );
-                    let sender = active_command_sender.lock().await.clone();
-                    reload_mpd(sender.as_ref(), restarter.as_ref()).await;
+                    let watched = Watched {
+                        mpd: DirectMpd {
+                            endpoint: endpoint.clone(),
+                            timeouts,
+                        },
+                        sender: active_command_sender.lock().await.clone(),
+                    };
+                    reload_mpd(&watched, restarter.as_ref()).await;
                 }
                 last = current;
                 seeded = true;
@@ -176,10 +188,9 @@ fn snapshot_mtimes() -> HashMap<PathBuf, SystemTime> {
     out
 }
 
-/// What the reload needs of the active custody. The supervisor's
-/// command sender is the production implementation; tests stand
-/// in a recorder.
-trait Custody {
+/// What the reload needs: whether the player is playing, a way to
+/// play again, and, as the fallback, a way to cycle the output.
+trait Player {
     /// Whether the player is playing right now.
     async fn is_playing(&self) -> bool;
     /// Start playback again.
@@ -188,24 +199,81 @@ trait Custody {
     async fn cycle_output(&self) -> Result<(), String>;
 }
 
-impl Custody for SupervisorCommandSender {
-    async fn is_playing(&self) -> bool {
-        matches!(
-            self.query_state().await.map(|r| r.state),
-            Ok(PlayState::Playing)
+/// MPD, spoken to directly on its own socket.
+///
+/// The player's state is MPD's, not the custody's: a steward that
+/// has just started has taken no custody yet, and asking the
+/// custody then read "not playing" for a player that was, so the
+/// restart left it paused. Asking MPD does not depend on when the
+/// steward woke.
+struct DirectMpd {
+    endpoint: MpdEndpoint,
+    timeouts: ConnectTimeouts,
+}
+
+/// How long to wait for a restarted MPD to take connections.
+const RESUME_CONNECT_TRIES: u32 = 40;
+const RESUME_CONNECT_GAP: Duration = Duration::from_millis(500);
+
+impl DirectMpd {
+    async fn connect(&self) -> Result<MpdConnection, String> {
+        MpdConnection::connect_with_timeouts(
+            self.endpoint.clone(),
+            self.timeouts,
         )
+        .await
+        .map_err(|e| e.to_string())
+    }
+
+    async fn is_playing(&self) -> bool {
+        let Ok(mut conn) = self.connect().await else {
+            return false;
+        };
+        matches!(conn.status().await.map(|s| s.state), Ok(PlayState::Playing))
+    }
+
+    /// Play, once MPD takes connections again. MPD restores its
+    /// queue paused (`restore_paused`), so `play` carries on from
+    /// where it was.
+    async fn resume(&self) -> Result<(), String> {
+        let mut last = String::from("no attempt");
+        for _ in 0..RESUME_CONNECT_TRIES {
+            match self.connect().await {
+                Ok(mut conn) => {
+                    return conn.play().await.map_err(|e| e.to_string());
+                }
+                Err(e) => last = e,
+            }
+            tokio::time::sleep(RESUME_CONNECT_GAP).await;
+        }
+        Err(last)
+    }
+}
+
+/// The player as the watcher sees it: MPD itself for state and for
+/// resuming, and the active custody (when there is one) for the
+/// output-cycle fallback.
+struct Watched {
+    mpd: DirectMpd,
+    sender: Option<SupervisorCommandSender>,
+}
+
+impl Player for Watched {
+    async fn is_playing(&self) -> bool {
+        self.mpd.is_playing().await
     }
 
     async fn resume(&self) -> Result<(), String> {
-        self.command(PlaybackCommand::Play)
-            .await
-            .map_err(|e| format!("{e:?}"))
+        self.mpd.resume().await
     }
 
     async fn cycle_output(&self) -> Result<(), String> {
-        SupervisorCommandSender::cycle_output(self)
-            .await
-            .map_err(|e| format!("{e:?}"))
+        match &self.sender {
+            Some(sender) => {
+                sender.cycle_output().await.map_err(|e| format!("{e:?}"))
+            }
+            None => Err("no active custody".to_string()),
+        }
     }
 }
 
@@ -214,19 +282,12 @@ impl Custody for SupervisorCommandSender {
 /// MPD is restarted through the plugin's restarter. A restarted
 /// MPD comes back paused, so when the player was playing it is
 /// told to play again: the operator hears the gap of a restart,
-/// not a stopped player. With no active custody there is nothing
-/// to resume and the restart is the whole job. When the restart
-/// is refused or unavailable the output is cycled instead, which
-/// is the best a running MPD can do, and the warning says that
-/// the change applies at the next MPD start.
-async fn reload_mpd<C: Custody>(
-    custody: Option<&C>,
-    restarter: &dyn MpdRestarter,
-) {
-    let was_playing = match custody {
-        Some(c) => c.is_playing().await,
-        None => false,
-    };
+/// not a stopped player. When the restart is refused or
+/// unavailable the output is cycled instead, which is the best a
+/// running MPD can do, and the warning says that the change
+/// applies at the next MPD start.
+async fn reload_mpd<P: Player>(player: &P, restarter: &dyn MpdRestarter) {
+    let was_playing = player.is_playing().await;
     match restarter.restart().await {
         Ok(()) => {
             tracing::info!(
@@ -236,18 +297,16 @@ async fn reload_mpd<C: Custody>(
                 "MPD restarted to take the asound composition"
             );
             if was_playing {
-                if let Some(c) = custody {
-                    match c.resume().await {
-                        Ok(()) => tracing::info!(
-                            target = "asound_watcher",
-                            "playback resumed after the MPD restart"
-                        ),
-                        Err(e) => tracing::warn!(
-                            target = "asound_watcher",
-                            error = %e,
-                            "playback did not resume after the MPD restart"
-                        ),
-                    }
+                match player.resume().await {
+                    Ok(()) => tracing::info!(
+                        target = "asound_watcher",
+                        "playback resumed after the MPD restart"
+                    ),
+                    Err(e) => tracing::warn!(
+                        target = "asound_watcher",
+                        error = %e,
+                        "playback did not resume after the MPD restart"
+                    ),
                 }
             }
         }
@@ -258,14 +317,12 @@ async fn reload_mpd<C: Custody>(
                 "MPD restart unavailable; cycling the output instead, so the \
                  change applies at the next MPD start"
             );
-            if let Some(c) = custody {
-                if let Err(e) = c.cycle_output().await {
-                    tracing::warn!(
-                        target = "asound_watcher",
-                        error = %e,
-                        "MPD output cycle failed"
-                    );
-                }
+            if let Err(e) = player.cycle_output().await {
+                tracing::warn!(
+                    target = "asound_watcher",
+                    error = %e,
+                    "MPD output cycle failed"
+                );
             }
         }
     }
@@ -309,7 +366,7 @@ mod tests {
         }
     }
 
-    impl Custody for Recorder {
+    impl Player for Recorder {
         async fn is_playing(&self) -> bool {
             self.calls.lock().unwrap().push("is_playing");
             self.playing
@@ -335,7 +392,7 @@ mod tests {
     async fn a_playing_player_is_restarted_and_resumed_not_cycled() {
         let restarter = NoOpRestarter::new();
         let c = Recorder::new(true);
-        reload_mpd(Some(&c), &restarter).await;
+        reload_mpd(&c, &restarter).await;
         assert_eq!(restarter.call_count(), 1);
         assert_eq!(c.calls(), vec!["is_playing", "resume"]);
     }
@@ -345,17 +402,9 @@ mod tests {
     async fn a_paused_player_is_restarted_and_not_resumed() {
         let restarter = NoOpRestarter::new();
         let c = Recorder::new(false);
-        reload_mpd(Some(&c), &restarter).await;
+        reload_mpd(&c, &restarter).await;
         assert_eq!(restarter.call_count(), 1);
         assert_eq!(c.calls(), vec!["is_playing"]);
-    }
-
-    /// With no custody the restart is the whole job.
-    #[tokio::test]
-    async fn with_no_custody_mpd_is_still_restarted() {
-        let restarter = NoOpRestarter::new();
-        reload_mpd::<Recorder>(None, &restarter).await;
-        assert_eq!(restarter.call_count(), 1);
     }
 
     /// When the restart is refused the output is cycled instead.
@@ -363,7 +412,7 @@ mod tests {
     async fn a_refused_restart_falls_back_to_the_output_cycle() {
         let restarter = FailingRestarter::new("sudo refused");
         let c = Recorder::new(true);
-        reload_mpd(Some(&c), &restarter).await;
+        reload_mpd(&c, &restarter).await;
         assert_eq!(restarter.call_count(), 1);
         assert_eq!(c.calls(), vec!["is_playing", "cycle_output"]);
     }
@@ -374,7 +423,103 @@ mod tests {
         let restarter = NoOpRestarter::new();
         let c = Recorder::new(true);
         c.resume_fails.store(true, Ordering::SeqCst);
-        reload_mpd(Some(&c), &restarter).await;
+        reload_mpd(&c, &restarter).await;
         assert_eq!(c.calls(), vec!["is_playing", "resume"]);
+    }
+
+    /// A one-connection-at-a-time MPD that reports `state` and counts
+    /// the `play` commands it is sent.
+    async fn stub_mpd(
+        state: &'static str,
+    ) -> (MpdEndpoint, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let plays = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&plays);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let _ = w.write_all(b"OK MPD 0.23.5\n").await;
+                    let mut lines = BufReader::new(r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        if line.starts_with("status") {
+                            let body = format!("state: {state}\nOK\n");
+                            let _ = w.write_all(body.as_bytes()).await;
+                        } else {
+                            if line.starts_with("play") {
+                                seen.fetch_add(1, Ordering::SeqCst);
+                            }
+                            let _ = w.write_all(b"OK\n").await;
+                        }
+                    }
+                });
+            }
+        });
+        (
+            MpdEndpoint::tcp(addr.ip().to_string(), addr.port()).unwrap(),
+            plays,
+        )
+    }
+
+    /// The steward has just started and has taken no custody: the
+    /// player is still found playing, from MPD itself, and played
+    /// again after the restart. Asking the custody read "not
+    /// playing" here and left a playing player paused.
+    #[tokio::test]
+    async fn a_player_is_resumed_when_the_steward_has_no_custody_yet() {
+        let (endpoint, plays) = stub_mpd("play").await;
+        let watched = Watched {
+            mpd: DirectMpd {
+                endpoint,
+                timeouts: ConnectTimeouts::default(),
+            },
+            sender: None,
+        };
+        let restarter = NoOpRestarter::new();
+        reload_mpd(&watched, &restarter).await;
+        assert_eq!(restarter.call_count(), 1);
+        assert_eq!(plays.load(Ordering::SeqCst), 1, "played again");
+    }
+
+    /// A paused player is restarted and left paused.
+    #[tokio::test]
+    async fn a_paused_player_is_not_played_by_the_reload() {
+        let (endpoint, plays) = stub_mpd("pause").await;
+        let watched = Watched {
+            mpd: DirectMpd {
+                endpoint,
+                timeouts: ConnectTimeouts::default(),
+            },
+            sender: None,
+        };
+        let restarter = NoOpRestarter::new();
+        reload_mpd(&watched, &restarter).await;
+        assert_eq!(restarter.call_count(), 1);
+        assert_eq!(plays.load(Ordering::SeqCst), 0);
+    }
+
+    /// With no custody and no restart, the fallback has nothing to
+    /// cycle and the reload still ends.
+    #[tokio::test]
+    async fn a_refused_restart_with_no_custody_ends_quietly() {
+        let (endpoint, plays) = stub_mpd("play").await;
+        let watched = Watched {
+            mpd: DirectMpd {
+                endpoint,
+                timeouts: ConnectTimeouts::default(),
+            },
+            sender: None,
+        };
+        let restarter = FailingRestarter::new("sudo refused");
+        reload_mpd(&watched, &restarter).await;
+        assert_eq!(restarter.call_count(), 1);
+        assert_eq!(plays.load(Ordering::SeqCst), 0);
     }
 }
