@@ -132,6 +132,9 @@ pub(crate) struct LibraryContext {
     /// play-history reads — omits them. See
     /// [`crate::forgotten_tracks`].
     pub(crate) forgotten: crate::forgotten_tracks::ForgottenTracks,
+    /// What each online DLNA source holds, for search. See
+    /// [`crate::dlna_index`].
+    pub(crate) dlna_index: crate::dlna_index::DlnaIndex,
     /// When an index may start, and with which MPD handles. See
     /// [`crate::scan_door`].
     pub(crate) scan_gate: crate::scan_door::ScanGate,
@@ -157,6 +160,7 @@ impl LibraryContext {
             works_aggregate: Arc::new(Mutex::new(None)),
             shelf_dispatcher,
             forgotten: crate::forgotten_tracks::ForgottenTracks::default(),
+            dlna_index: crate::dlna_index::DlnaIndex::default(),
             scan_gate: crate::scan_door::ScanGate::settled(),
             artwork_hashes: Default::default(),
         }
@@ -179,6 +183,16 @@ impl LibraryContext {
         forgotten: crate::forgotten_tracks::ForgottenTracks,
     ) -> Self {
         self.forgotten = forgotten;
+        self
+    }
+
+    /// Keep the DLNA search index here. Without this the context
+    /// indexes nothing across a restart.
+    pub(crate) fn with_dlna_index(
+        mut self,
+        index: crate::dlna_index::DlnaIndex,
+    ) -> Self {
+        self.dlna_index = index;
         self
     }
 
@@ -707,7 +721,7 @@ const SOURCE_DLNA_BROWSE_VERB: &str = "source.dlna.browse";
 /// eliminating both the ownership violation and the MPD-`music_
 /// directory` error surface that leaked "source is not under
 /// music_directory" for network browses.
-async fn browse_dlna_via_source_dlna(
+pub(crate) async fn browse_dlna_via_source_dlna(
     dispatcher: &Arc<dyn ShelfRequestDispatcher>,
     source_id: &str,
     service_id: &str,
@@ -3878,180 +3892,18 @@ fn source_rank(kind: &SourceKind) -> u8 {
     }
 }
 
-/// How many `source.dlna.browse` calls one search may spend on one
-/// DLNA source. The ContentDirectory has no search this plugin
-/// speaks, so a search walks the tree breadth-first; a tree bigger
-/// than this is answered as far as the walk got and the source is
-/// named stale.
-pub(crate) const DLNA_SEARCH_MAX_BROWSES: usize = 32;
-
 /// Whether a DLNA entry matches the query: its name, title, artist
 /// or album contains it, case-insensitively.
-fn dlna_entry_matches(entry: &serde_json::Value, query_lower: &str) -> bool {
+pub(crate) fn dlna_entry_matches(
+    entry: &serde_json::Value,
+    query_lower: &str,
+) -> bool {
     ["name", "title", "artist", "album"].iter().any(|k| {
         entry
             .get(k)
             .and_then(|v| v.as_str())
             .is_some_and(|s| s.to_lowercase().contains(query_lower))
     })
-}
-
-/// Which part of a DLNA tree to walk first, from a container's name.
-///
-/// The browse answer carries no `upnp:class` for a container, so the
-/// name is what there is. Last (2): video, photo and image trees,
-/// and the pseudo-containers a media server lists beside the library
-/// (Watch Later, Recommended, `* Queue`, `* Recommendations`), which
-/// answer a browse with an error or with what is not the library.
-/// First (0): what names music. Everything else between (1). The
-/// pseudo-container check comes first, so "Music Queue" is last.
-/// A container the name does not place follows the one it is in, so
-/// a video tree stays last all the way down and a music tree first.
-fn dlna_container_tier(name: &str) -> usize {
-    const LAST: &[&str] = &[
-        "video",
-        "photo",
-        "image",
-        "picture",
-        "movie",
-        "watch later",
-        "recommended",
-        "recommendations",
-        "queue",
-    ];
-    const FIRST: &[&str] =
-        &["music", "audio", "album", "artist", "song", "track"];
-    let n = name.to_lowercase();
-    if LAST.iter().any(|w| n.contains(w)) {
-        2
-    } else if FIRST.iter().any(|w| n.contains(w)) {
-        0
-    } else {
-        1
-    }
-}
-
-/// Search one online DLNA source through the browse this plugin
-/// already uses: walk containers from the root, keep the items
-/// whose name or tags contain the query. Returns the hits and
-/// whether the walk was partial: cut short by
-/// [`DLNA_SEARCH_MAX_BROWSES`], or with a container that would not
-/// browse.
-///
-/// The walk goes music first, by [`dlna_container_tier`], then the
-/// rest, then video and photo trees and the pseudo-containers; in
-/// the order the server lists them within a tier. A container that
-/// will not browse is skipped, counted and the walk goes on: the
-/// hits already found are kept. Only a root that will not browse is
-/// an error, because then nothing was searched. The same item
-/// reached by two routes is one hit.
-async fn dlna_search_via_browse(
-    dispatcher: &Arc<dyn ShelfRequestDispatcher>,
-    record: &SourceRecord,
-    service_id: &str,
-    query_lower: &str,
-) -> Result<(Vec<serde_json::Value>, bool), VerbError> {
-    let mut hits: Vec<serde_json::Value> = Vec::new();
-    let mut seen: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    let mut frontier: [std::collections::VecDeque<String>; 3] = [
-        std::collections::VecDeque::from([String::new()]),
-        std::collections::VecDeque::new(),
-        std::collections::VecDeque::new(),
-    ];
-    let mut browses = 0usize;
-    let mut skipped = 0usize;
-    'walk: loop {
-        let Some((parent_tier, container)) = frontier
-            .iter_mut()
-            .enumerate()
-            .find_map(|(i, tier)| tier.pop_front().map(|c| (i, c)))
-        else {
-            break;
-        };
-        let mut page = 0usize;
-        loop {
-            if browses >= DLNA_SEARCH_MAX_BROWSES {
-                return Ok((hits, true));
-            }
-            browses += 1;
-            let answer = match browse_dlna_via_source_dlna(
-                dispatcher,
-                &record.id,
-                service_id,
-                &container,
-                page,
-                evo_dlna::DLNA_PAGE_HARD_CAP as usize,
-                &record.state,
-            )
-            .await
-            {
-                Ok(a) => a,
-                // Nothing was searched: the source is down.
-                Err(e) if browses == 1 => return Err(e),
-                Err(e) => {
-                    tracing::debug!(
-                        plugin = PLUGIN_NAME,
-                        source_id = %record.id,
-                        container = %container,
-                        error = %e,
-                        "search_library: a dlna container would not browse; skipped"
-                    );
-                    skipped += 1;
-                    continue 'walk;
-                }
-            };
-            let entries = answer
-                .get("entries")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            for entry in entries {
-                let kind = entry.get("kind").and_then(|v| v.as_str());
-                match kind {
-                    Some("directory") => {
-                        if let Some(id) =
-                            entry.get("uri").and_then(|v| v.as_str())
-                        {
-                            let name = entry
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            // A container inside a video or photo tree
-                            // stays last; one the name does not place
-                            // follows the container it is in.
-                            let tier = match (
-                                parent_tier,
-                                dlna_container_tier(name),
-                            ) {
-                                (2, _) | (_, 2) => 2,
-                                (_, 0) => 0,
-                                (parent, _) => parent,
-                            };
-                            frontier[tier].push_back(id.to_string());
-                        }
-                    }
-                    _ => {
-                        if dlna_entry_matches(&entry, query_lower) {
-                            let key = entry
-                                .get("uri")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            if key.is_empty() || seen.insert(key) {
-                                hits.push(entry);
-                            }
-                        }
-                    }
-                }
-            }
-            match answer.get("next_page").and_then(|v| v.as_u64()) {
-                Some(next) => page = next as usize,
-                None => break,
-            }
-        }
-    }
-    Ok((hits, skipped > 0))
 }
 
 /// How well one hit matches the query, 0 to 100. The best match
@@ -4232,54 +4084,47 @@ pub(crate) async fn handle_search_library(
         }
     }
 
-    // DLNA, through its own browse.
+    // DLNA, through the index.
     let query_lower = payload.query.to_lowercase();
-    for (record, service_id) in &dlna {
-        let Some(dispatcher) = ctx.shelf_dispatcher.as_ref() else {
-            stale_sources.push(record.id.clone());
-            continue;
-        };
-        match dlna_search_via_browse(
-            dispatcher,
-            record,
-            service_id,
-            &query_lower,
-        )
-        .await
+    for (record, _service_id) in &dlna {
+        // The index, never a walk: a query does not wait on a media
+        // server. A source with no index yet is named stale and the
+        // worker is asked for one; one with a partial index is
+        // searched and named stale as well.
+        let hits = match ctx
+            .dlna_index
+            .search(&record.id, |item| dlna_entry_matches(item, &query_lower))
+            .await
         {
-            Ok((hits, cut_short)) => {
-                // A forgotten DLNA track is not a result either:
-                // the same set, matched on the `dlna:` identity
-                // the hit carries.
-                let stamped: Vec<serde_json::Value> =
-                    crate::forgotten_tracks::omit_forgotten(hits, &forgotten)
-                        .into_iter()
-                        .map(|mut h| {
-                            h.as_object_mut().unwrap().insert(
-                                "source_id".to_string(),
-                                serde_json::Value::String(record.id.clone()),
-                            );
-                            h
-                        })
-                        .collect();
-                by_source
-                    .entry(Some(record.id.clone()))
-                    .or_default()
-                    .extend(stamped);
-                if cut_short {
+            Some(answer) => {
+                if !answer.complete {
                     stale_sources.push(record.id.clone());
                 }
+                answer.hits
             }
-            Err(e) => {
-                tracing::warn!(
-                    plugin = PLUGIN_NAME,
-                    source_id = %record.id,
-                    error = %e,
-                    "search_library: dlna source asked and failed; named stale"
-                );
+            None => {
+                ctx.dlna_index.request();
                 stale_sources.push(record.id.clone());
+                continue;
             }
-        }
+        };
+        // A forgotten DLNA track is not a result either: the same
+        // set, matched on the `dlna:` identity the hit carries.
+        let stamped: Vec<serde_json::Value> =
+            crate::forgotten_tracks::omit_forgotten(hits, &forgotten)
+                .into_iter()
+                .map(|mut h| {
+                    h.as_object_mut().unwrap().insert(
+                        "source_id".to_string(),
+                        serde_json::Value::String(record.id.clone()),
+                    );
+                    h
+                })
+                .collect();
+        by_source
+            .entry(Some(record.id.clone()))
+            .or_default()
+            .extend(stamped);
     }
 
     // The one list: by rank, then source id, then the source's
@@ -7889,13 +7734,16 @@ mod search_tests {
                         ],
                         "m" => vec![
                             dir("Family Music", "fm"),
+                            dir("Pacanki's Music", "pm"),
                             dir("Music Queue", "mq"),
                             dir("Music Recommendations", "mr"),
                         ],
                         "fm" => vec![
                             item("Blue Monday trust", "bm"),
                             dir("Recently Added", "ra"),
+                            dir("Broken", "br"),
                         ],
+                        "pm" => vec![dir("Recently Added", "ra")],
                         "ra" => vec![
                             item("Blue Monday trust", "bm"),
                             item("Another trust", "at"),
@@ -8122,6 +7970,30 @@ mod search_tests {
         )
     }
 
+    /// Index every DLNA source in the registry, as the worker does,
+    /// with no pause between browses.
+    async fn index_all(h: &Harness) {
+        for record in h.ctx.registry.snapshot().await {
+            crate::dlna_index::refresh_source(
+                &h.ctx,
+                &record,
+                Duration::ZERO,
+                1_000,
+            )
+            .await;
+        }
+    }
+
+    fn browses_of(h: &Harness) -> Vec<String> {
+        h.dispatcher
+            .browses
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| b.rsplit(' ').next().unwrap().to_string())
+            .collect()
+    }
+
     fn cloud(id: &str) -> SourceRecord {
         record(
             id,
@@ -8205,6 +8077,7 @@ mod search_tests {
     async fn the_list_is_ranked_by_match_across_sources() {
         let mut h =
             harness(vec![dlna("dlna-1", "svc-1"), cloud("cloud-1")]).await;
+        index_all(&h).await;
         let v = search(&mut h, false).await;
         let ids: Vec<serde_json::Value> =
             stamps(&v).into_iter().map(|(_, id)| id).collect();
@@ -8228,6 +8101,7 @@ mod search_tests {
     #[tokio::test]
     async fn hits_that_tie_stay_in_source_order() {
         let mut h = harness(vec![dlna("dlna-tie", "svc-tie")]).await;
+        index_all(&h).await;
         let v = search(&mut h, false).await;
         let ids: Vec<serde_json::Value> =
             stamps(&v).into_iter().map(|(_, id)| id).collect();
@@ -8270,6 +8144,7 @@ mod search_tests {
     async fn the_exact_title_is_above_the_title_prefix_contains_artist_and_album(
     ) {
         let mut h = harness(vec![dlna("dlna-rank", "svc-rank")]).await;
+        index_all(&h).await;
         let v = search_for(&mut h, "autumn", 50).await;
         let order: Vec<String> =
             stamps(&v).into_iter().map(|(uri, _)| uri).collect();
@@ -8291,6 +8166,7 @@ mod search_tests {
     #[tokio::test]
     async fn the_cut_comes_after_the_ranking() {
         let mut h = harness(vec![dlna("dlna-rank", "svc-rank")]).await;
+        index_all(&h).await;
         let v = search_for(&mut h, "autumn", 2).await;
         let order: Vec<String> =
             stamps(&v).into_iter().map(|(uri, _)| uri).collect();
@@ -8347,43 +8223,31 @@ mod search_tests {
         assert_eq!(search_score(&t("anything"), ""), 0);
     }
 
-    fn plex_browses(h: &Harness) -> Vec<String> {
-        h.dispatcher
-            .browses
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|b| b.rsplit(' ').next().unwrap().to_string())
-            .collect()
-    }
-
-    /// Music is walked before video and photo trees and before the
-    /// pseudo-containers, whatever order the server listed them in.
+    /// A search never walks a media server and never waits on one: a
+    /// source with no index yet is named stale, the local and USB
+    /// hits are answered at once, and no browse is made.
     #[tokio::test]
-    async fn music_is_walked_before_video_and_photo() {
+    async fn a_search_never_walks_and_a_cold_source_is_named_stale() {
         let mut h = harness(vec![dlna("dlna-plex", "svc-plex")]).await;
         let v = search(&mut h, false).await;
-        let order = plex_browses(&h);
-        assert_eq!(
-            &order[..3],
-            &["0", "m", "fm"],
-            "root, Music, Family Music before Video/Photos: {order:?}"
-        );
+        assert!(h.dispatcher.browses.lock().unwrap().is_empty(), "no walk");
+        assert_eq!(v["stale_sources"], json!(["dlna-plex"]), "{v}");
         assert!(
-            stamps(&v).iter().any(|(uri, _)| uri == "dlna:svc-plex/bm"),
-            "the Music hit is in the list: {v}"
+            stamps(&v).iter().any(|(_, id)| id == "local-internal"),
+            "the local hits are still answered: {v}"
         );
     }
 
-    /// A container that will not browse is skipped and the walk goes
-    /// on; the hits already found are kept, the source is named stale
-    /// because the walk was partial, and the same item reached by two
-    /// routes is one hit.
+    /// Once the source is indexed, its music is in the list with no
+    /// browse made by the search, and the source is not stale: the
+    /// index is the music tree, whole.
     #[tokio::test]
-    async fn a_container_that_will_not_browse_is_skipped_and_the_hits_are_kept()
-    {
+    async fn a_warm_source_answers_from_the_index_with_no_browse() {
         let mut h = harness(vec![dlna("dlna-plex", "svc-plex")]).await;
+        index_all(&h).await;
+        let before = h.dispatcher.browses.lock().unwrap().len();
         let v = search(&mut h, false).await;
+        assert_eq!(h.dispatcher.browses.lock().unwrap().len(), before);
         let plex: Vec<String> = stamps(&v)
             .into_iter()
             .filter(|(_, id)| id == "dlna-plex")
@@ -8392,57 +8256,128 @@ mod search_tests {
         assert!(
             plex.contains(&"dlna:svc-plex/bm".to_string())
                 && plex.contains(&"dlna:svc-plex/at".to_string()),
-            "hits found before and after the failures are kept: {plex:?}"
+            "{plex:?}"
         );
+    }
+
+    /// Music is walked first, and the video and photo trees and the
+    /// pseudo-containers are not entered at all.
+    #[tokio::test]
+    async fn music_is_walked_first_and_video_and_photo_are_not_entered() {
+        let h = harness(vec![dlna("dlna-plex", "svc-plex")]).await;
+        index_all(&h).await;
+        let order = browses_of(&h);
+        assert_eq!(&order[..3], &["0", "m", "fm"], "{order:?}");
+        for never in ["v", "p", "wl", "rec", "mq", "mr", "pq", "arch0"] {
+            assert!(
+                !order.iter().any(|o| o == never),
+                "{never} must not be browsed: {order:?}"
+            );
+        }
+    }
+
+    /// A container that will not browse is skipped and the walk goes
+    /// on: the items found before and after it are indexed, the
+    /// source is named stale because the walk was partial, and a
+    /// container reached by two routes is browsed once.
+    #[tokio::test]
+    async fn a_container_that_will_not_browse_is_skipped_and_the_rest_is_indexed(
+    ) {
+        let mut h = harness(vec![dlna("dlna-plex", "svc-plex")]).await;
+        index_all(&h).await;
+        let order = browses_of(&h);
+        assert!(order.iter().any(|o| o == "br"), "the broken one was tried");
+        assert_eq!(
+            order.iter().filter(|o| *o == "ra").count(),
+            1,
+            "reached through Family Music and Pacanki's Music, browsed once: {order:?}"
+        );
+        let v = search(&mut h, false).await;
+        assert_eq!(v["stale_sources"], json!(["dlna-plex"]), "{v}");
+        let plex: Vec<String> = stamps(&v)
+            .into_iter()
+            .filter(|(_, id)| id == "dlna-plex")
+            .map(|(uri, _)| uri)
+            .collect();
         assert_eq!(
             plex.iter().filter(|u| *u == "dlna:svc-plex/bm").count(),
             1,
-            "one item reached twice is one hit: {plex:?}"
+            "an item reached twice is one hit: {plex:?}"
         );
-        let order = plex_browses(&h);
-        // `wl` (Watch Later) will not browse; the walk still reaches
-        // what was queued behind it.
-        let failed = order.iter().position(|o| o == "wl").expect("wl browsed");
-        let after = order
-            .iter()
-            .position(|o| o == "arch0")
-            .expect("arch0 browsed");
-        assert!(
-            after > failed,
-            "the walk went on past a failed container: {order:?}"
-        );
-        assert_eq!(v["stale_sources"], json!(["dlna-plex"]), "{v}");
+        assert!(plex.contains(&"dlna:svc-plex/at".to_string()), "{plex:?}");
     }
 
-    /// The video tree is bottomless; the music hits still arrive,
-    /// inside the budget, because the video tree is walked last.
+    /// A tree bigger than the walk's budget is indexed as far as the
+    /// walk got, and the source is named stale.
     #[tokio::test]
-    async fn a_bottomless_video_tree_does_not_starve_the_music() {
-        let mut h = harness(vec![dlna("dlna-plex", "svc-plex")]).await;
+    async fn a_bottomless_tree_is_indexed_as_far_as_the_budget_and_named_stale()
+    {
+        let mut h = harness(vec![dlna("dlna-deep", "svc-deep")]).await;
+        for record in h.ctx.registry.snapshot().await {
+            crate::dlna_index::refresh_source(
+                &h.ctx,
+                &record,
+                Duration::ZERO,
+                32,
+            )
+            .await;
+        }
+        assert_eq!(h.dispatcher.browses.lock().unwrap().len(), 32);
         let v = search(&mut h, false).await;
+        let hits = stamps(&v)
+            .iter()
+            .filter(|(_, id)| id == "dlna-deep")
+            .count();
+        assert_eq!(hits, 32, "one item per browse, then stop: {v}");
+        assert_eq!(v["stale_sources"], json!(["dlna-deep"]), "{v}");
+    }
+
+    /// The walk is paced: a pause between browses.
+    #[tokio::test]
+    async fn the_walk_pauses_between_browses() {
+        let h = harness(vec![dlna("dlna-1", "svc-1")]).await;
+        let started = std::time::Instant::now();
+        for record in h.ctx.registry.snapshot().await {
+            crate::dlna_index::refresh_source(
+                &h.ctx,
+                &record,
+                Duration::from_millis(60),
+                100,
+            )
+            .await;
+        }
+        // Two browses, one pause between them.
         assert!(
-            h.dispatcher.browses.lock().unwrap().len()
-                <= DLNA_SEARCH_MAX_BROWSES
-        );
-        assert!(
-            stamps(&v).iter().any(|(uri, _)| uri == "dlna:svc-plex/at"),
-            "{v}"
+            started.elapsed() >= Duration::from_millis(55),
+            "paced: {:?}",
+            started.elapsed()
         );
     }
 
-    /// Names that decide the walk order.
-    #[test]
-    fn the_container_tiers() {
-        assert_eq!(dlna_container_tier("Music"), 0);
-        assert_eq!(dlna_container_tier("Family Music"), 0);
-        assert_eq!(dlna_container_tier("Albums"), 0);
-        assert_eq!(dlna_container_tier("Recently Added"), 1);
-        assert_eq!(dlna_container_tier("Video"), 2);
-        assert_eq!(dlna_container_tier("Photos"), 2);
-        assert_eq!(dlna_container_tier("Watch Later"), 2);
-        assert_eq!(dlna_container_tier("Recommended"), 2);
-        assert_eq!(dlna_container_tier("Music Queue"), 2);
-        assert_eq!(dlna_container_tier("Music Recommendations"), 2);
+    /// A cold search asks the worker, and the worker indexes the
+    /// source; the next search is answered from the index.
+    #[tokio::test]
+    async fn the_worker_indexes_a_source_a_search_found_cold() {
+        let mut h = harness(vec![dlna("dlna-plex", "svc-plex")]).await;
+        let worker = crate::dlna_index::spawn_index_worker(
+            h.ctx.clone(),
+            Duration::from_secs(3600),
+            Duration::ZERO,
+            1_000,
+        );
+        // The first tick of the interval fires at once and finds the
+        // source due; wait for the index to appear.
+        let mut warm = false;
+        for _ in 0..100 {
+            let v = search(&mut h, false).await;
+            if stamps(&v).iter().any(|(u, _)| u == "dlna:svc-plex/bm") {
+                warm = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        worker.stop().await;
+        assert!(warm, "the worker must have indexed the source");
     }
 
     /// An online DLNA source is searched through its browse: the
@@ -8452,6 +8387,7 @@ mod search_tests {
     #[tokio::test]
     async fn a_dlna_hit_from_an_online_source_is_in_the_list() {
         let mut h = harness(vec![dlna("dlna-1", "svc-1")]).await;
+        index_all(&h).await;
         let v = search(&mut h, false).await;
         let dlna_hits: Vec<String> = stamps(&v)
             .into_iter()
@@ -8459,6 +8395,8 @@ mod search_tests {
             .map(|(uri, _)| uri)
             .collect();
         assert_eq!(dlna_hits, vec!["dlna:svc-1/i1", "dlna:svc-1/i2"], "{v}");
+        // The browses were the index's, made before the search; the
+        // search itself made none.
         let browses = h.dispatcher.browses.lock().unwrap().clone();
         assert_eq!(
             browses,
@@ -8488,6 +8426,7 @@ mod search_tests {
         let mut h =
             harness(vec![dlna("dlna-1", "svc-1"), dlna("dlna-2", "svc-fail")])
                 .await;
+        index_all(&h).await;
         let v = search(&mut h, false).await;
         assert_eq!(v["stale_sources"], json!(["dlna-2"]), "{v}");
         assert!(stamps(&v).iter().any(|(_, id)| id == "dlna-1"));
@@ -8510,6 +8449,7 @@ mod search_tests {
     #[tokio::test]
     async fn a_forgotten_dlna_uri_is_omitted() {
         let mut h = harness(vec![dlna("dlna-1", "svc-1")]).await;
+        index_all(&h).await;
         h.ctx.forgotten.forget("dlna:svc-1/i1").await;
         let v = search(&mut h, false).await;
         let dlna_hits: Vec<String> = stamps(&v)
@@ -8536,26 +8476,5 @@ mod search_tests {
         let v = search(&mut h, true).await;
         assert!(stamps(&v).iter().all(|(uri, _)| uri != NAS_OFF_HIT), "{v}");
         assert_eq!(v["stale_sources"], json!(["nas-off"]));
-    }
-
-    /// A DLNA tree deeper than the walk's budget is answered as
-    /// far as the walk got, and the source is named stale.
-    #[tokio::test]
-    async fn a_bottomless_dlna_tree_is_cut_short_and_named_stale() {
-        let mut h = harness(vec![dlna("dlna-deep", "svc-deep")]).await;
-        let v = search(&mut h, false).await;
-        let hits = stamps(&v)
-            .iter()
-            .filter(|(_, id)| id == "dlna-deep")
-            .count();
-        assert_eq!(
-            hits, DLNA_SEARCH_MAX_BROWSES,
-            "one hit per browse, then stop"
-        );
-        assert_eq!(
-            h.dispatcher.browses.lock().unwrap().len(),
-            DLNA_SEARCH_MAX_BROWSES
-        );
-        assert_eq!(v["stale_sources"], json!(["dlna-deep"]), "{v}");
     }
 }

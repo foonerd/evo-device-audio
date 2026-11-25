@@ -112,6 +112,7 @@ mod asound_watcher;
 mod availability;
 mod config;
 mod disposition_emitter;
+mod dlna_index;
 mod envelope_subscriber;
 mod favourites;
 mod forgotten_tracks;

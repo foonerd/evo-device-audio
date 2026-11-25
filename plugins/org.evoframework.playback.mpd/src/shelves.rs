@@ -105,6 +105,9 @@ pub(crate) struct ShelfBundle {
     /// discovered.json sidecar and probes them on a fixed
     /// cadence. Held so unload can stop the task cleanly.
     pub(crate) dlna_sync: Option<DlnaSyncHandle>,
+    /// Walks each online DLNA source into the search index. Held so
+    /// unload can stop it.
+    pub(crate) dlna_index_worker: Option<crate::dlna_index::DlnaIndexHandle>,
     /// Opens the library's scan gate once MPD has settled after
     /// load, then runs the one restart pass. Held so unload can
     /// release waiting kicks and stop it.
@@ -247,6 +250,12 @@ impl ShelfBundle {
             )
             .await,
         )
+        .with_dlna_index(
+            crate::dlna_index::DlnaIndex::open(
+                state_dir.join("dlna-index.json"),
+            )
+            .await,
+        )
         .with_scan_gate(scan_gate.clone())
         .with_artwork_hashes(artwork_hashes.clone());
         // The triage context clones the library, registry, and
@@ -373,6 +382,13 @@ impl ShelfBundle {
         ));
 
         let dlna_sync = Some(library::spawn_dlna_sync(library.clone()));
+        // Keeps the searchable copy of each online DLNA source.
+        let dlna_index_worker = Some(crate::dlna_index::spawn_index_worker(
+            library.clone(),
+            crate::dlna_index::INDEX_TICK,
+            crate::dlna_index::INDEX_BROWSE_GAP,
+            crate::dlna_index::INDEX_MAX_BROWSES,
+        ));
 
         let scan_settle = Some(crate::scan_door::spawn_settle(
             library.clone(),
@@ -401,6 +417,7 @@ impl ShelfBundle {
             sticker_reconciler,
             idle_observer,
             dlna_sync,
+            dlna_index_worker,
             scan_settle,
             play_history,
             endpoint,
@@ -592,6 +609,9 @@ impl ShelfBundle {
             handle.stop().await;
         }
         if let Some(handle) = self.dlna_sync.take() {
+            handle.stop().await;
+        }
+        if let Some(handle) = self.dlna_index_worker.take() {
             handle.stop().await;
         }
         if let Some(handle) = self.sticker_reconciler.take() {
