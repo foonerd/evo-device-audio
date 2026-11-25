@@ -129,18 +129,28 @@ holds, in the order given.
   the freed logical outputs may join another zone.
 - `zone.list {}`: every zone, in id order; an empty set is an
   empty list. Reads only.
-- `zone.set_eq_engaged { id, engaged }` and
-  `zone.set_eq_band { id, index, freq_hz, gain_db, q }`: the
-  zone's own EQ, stored beside its name and membership. The
-  flag starts false; there are exactly 10 bands, each
-  `freq_hz` 20 through 20000, `gain_db` -15.0 through 15.0, `q`
-  0.1 through 30.0 (the global EQ's ranges), starting at 1000
-  Hz, 0 dB, Q 1.0. An unknown zone, an index outside 0 through
-  9, and a field outside its range are refused before any
-  write, naming the field. Every zone answer carries the EQ.
-  A zones file written before the EQ existed loads with the
-  default. The EQ is stored and answered only: nothing here
-  renders it, and `eq_only` stays the one pipe.
+- `zone.set_eq_engaged { id, engaged }`,
+  `zone.set_eq_band { id, index, freq_hz, gain_db, q }` and
+  `zone.remove_eq_band { id, index }`: the zone's own EQ, stored
+  beside its name and membership. The flag starts false. A new
+  zone has 10 flat bands (1000 Hz, 0 dB, Q 1.0); the EQ holds from
+  1 to 31. `zone.set_eq_band` with an index the zone has changes
+  that band; with the index just past the last one it adds a band
+  at the end, until the zone has 31. `zone.remove_eq_band` takes
+  one out and the bands after it move up one place; the last band
+  stays. Each band has `freq_hz` 20 through 20000 (whole Hz),
+  `gain_db` -15.0 through 15.0 and `q` 0.1 through 30.0 (the
+  global EQ's ranges). A gain is kept to 0.1 dB and a Q to 0.01:
+  the value asked for is checked against the range, then rounded
+  to the step, and the answer carries the value kept. An unknown
+  zone, an index that is neither a band the zone has nor the next
+  one, a zone already at 31 bands, the removal of the last band,
+  and a field outside its range are refused before any write,
+  naming the cause. Every zone answer carries the EQ, whatever its
+  band count. A zones file written before the EQ existed loads
+  with the default; one with no bands gets the default flat ones.
+  The EQ is stored and answered here; it is heard when it claims
+  the pipe (below), and `eq_only` stays the one pipe.
 
 `zone.add` and `zone.update` hold the logical-output read lock
 from the membership check through the zone write, and

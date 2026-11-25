@@ -180,6 +180,7 @@ const REQUEST_TYPES: &[&str] = &[
     "zone.list",
     "zone.set_eq_engaged",
     "zone.set_eq_band",
+    "zone.remove_eq_band",
     "scene.save",
     "scene.list",
     "scene.recall",
@@ -2127,6 +2128,9 @@ impl Respondent for AlsaDeliveryPlugin {
                     self.handle_zone_set_eq_engaged(req).await
                 }
                 "zone.set_eq_band" => self.handle_zone_set_eq_band(req).await,
+                "zone.remove_eq_band" => {
+                    self.handle_zone_remove_eq_band(req).await
+                }
                 "scene.save" => self.handle_scene_save(req).await,
                 "scene.list" => self.handle_scene_list(req).await,
                 "scene.recall" => self.handle_scene_recall(req).await,
@@ -2731,8 +2735,9 @@ impl AlsaDeliveryPlugin {
         )
     }
 
-    /// `zone.set_eq_band` — one band of one zone's EQ. Answers
-    /// the zone. Stores and answers; renders nothing.
+    /// `zone.set_eq_band` — one band of one zone's EQ, or one more
+    /// band when the index is the next one past the last. Answers the
+    /// zone. Stores and answers; renders nothing.
     async fn handle_zone_set_eq_band(
         &self,
         req: &Request,
@@ -2759,6 +2764,37 @@ impl AlsaDeliveryPlugin {
             id = %zone.id,
             index = payload.index,
             "zone eq band set"
+        );
+        encode(
+            req,
+            &ZoneResponse {
+                v: PAYLOAD_VERSION,
+                zone,
+            },
+        )
+    }
+
+    /// `zone.remove_eq_band` — take one band out of one zone's EQ;
+    /// the bands after it move up one place. Answers the zone. The
+    /// zone keeps at least one band.
+    async fn handle_zone_remove_eq_band(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: ZoneRemoveEqBandRequest = parse_versioned_payload(req)?;
+        let zone = self
+            .zones
+            .write()
+            .await
+            .remove_eq_band(&payload.id, payload.index)
+            .map_err(|r| Self::zone_refused(req, r))?;
+        self.persist_zones().await;
+        self.publish_eq_claim().await;
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            id = %zone.id,
+            index = payload.index,
+            "zone eq band removed"
         );
         encode(
             req,
@@ -3221,6 +3257,21 @@ struct ZoneSetEqBandRequest {
 }
 
 impl HasPayloadVersion for ZoneSetEqBandRequest {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+/// `zone.remove_eq_band` request: one band out of one zone's EQ.
+#[derive(Debug, Deserialize)]
+struct ZoneRemoveEqBandRequest {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    id: String,
+    index: u32,
+}
+
+impl HasPayloadVersion for ZoneRemoveEqBandRequest {
     fn payload_version(&self) -> u32 {
         self.v
     }
@@ -3720,6 +3771,7 @@ mod tests {
             "zone.list",
             "zone.set_eq_engaged",
             "zone.set_eq_band",
+            "zone.remove_eq_band",
             "scene.save",
             "scene.list",
             "scene.recall",
@@ -6202,6 +6254,96 @@ pcm.evo {
         assert_eq!(rig.drop_in().await, "");
     }
 
+    /// A zone's EQ grows one band at a time to 31 and shrinks back,
+    /// through the verbs; the answer carries what was kept; the
+    /// limits are refusals that change nothing.
+    #[tokio::test]
+    async fn a_zone_eq_grows_and_shrinks_through_the_verbs() {
+        let rig = OutputRig::new().await.with_zones().await;
+        rig.call("zone.add", json!({ "v": 1, "name": "Down", "logical_output_ids": ["logical:1"] }))
+            .await
+            .unwrap();
+        let bands = |v: &serde_json::Value| {
+            v["zone"]["eq"]["bands"].as_array().unwrap().len()
+        };
+
+        // The first added band is index 10; the answer carries it kept
+        // to a tenth of a dB and a hundredth of a Q.
+        let grown = rig
+            .call("zone.set_eq_band", json!({ "v": 1, "id": "zone:1", "index": 10, "freq_hz": 8000, "gain_db": 3.12, "q": 1.234 }))
+            .await
+            .unwrap();
+        assert_eq!(bands(&grown), 11);
+        assert_eq!(grown["zone"]["eq"]["bands"][10]["freq_hz"], 8000);
+        assert_eq!(grown["zone"]["eq"]["bands"][10]["gain_db"], 3.1);
+        assert_eq!(grown["zone"]["eq"]["bands"][10]["q"], 1.23);
+
+        for n in 11..31 {
+            let r = rig
+                .call("zone.set_eq_band", json!({ "v": 1, "id": "zone:1", "index": n, "freq_hz": 100 + n, "gain_db": 0.0, "q": 1.0 }))
+                .await
+                .unwrap();
+            assert_eq!(bands(&r), n + 1);
+        }
+        let full = rig.call("zone.list", json!({ "v": 1 })).await.unwrap();
+        let err = rig
+            .call("zone.set_eq_band", json!({ "v": 1, "id": "zone:1", "index": 31, "freq_hz": 500, "gain_db": 0.0, "q": 1.0 }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("already has 31 bands"), "{err}");
+        assert_eq!(
+            rig.call("zone.list", json!({ "v": 1 })).await.unwrap(),
+            full
+        );
+
+        // Take one out: the rest move up.
+        let after = rig
+            .call(
+                "zone.remove_eq_band",
+                json!({ "v": 1, "id": "zone:1", "index": 10 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bands(&after), 30);
+        assert_eq!(after["zone"]["eq"]["bands"][10]["freq_hz"], 111);
+        let err = rig
+            .call(
+                "zone.remove_eq_band",
+                json!({ "v": 1, "id": "zone:1", "index": 99 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("band index 99 is out of range"), "{err}");
+        let err = rig
+            .call(
+                "zone.remove_eq_band",
+                json!({ "v": 1, "id": "zone:9", "index": 0 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown zone"), "{err}");
+
+        // Down to one band; the last stays.
+        for _ in 0..29 {
+            rig.call(
+                "zone.remove_eq_band",
+                json!({ "v": 1, "id": "zone:1", "index": 0 }),
+            )
+            .await
+            .unwrap();
+        }
+        let err = rig
+            .call(
+                "zone.remove_eq_band",
+                json!({ "v": 1, "id": "zone:1", "index": 0 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("keeps at least 1 band"), "{err}");
+        let one = rig.call("zone.list", json!({ "v": 1 })).await.unwrap();
+        assert_eq!(one["zones"][0]["eq"]["bands"].as_array().unwrap().len(), 1);
+    }
+
     /// Unknown zone, index out of range, and each field out of
     /// range are refused; the refusal names the field; the zone
     /// stays as it was.
@@ -6221,10 +6363,10 @@ pcm.evo {
             .unwrap_err();
         assert!(err.contains("unknown zone"), "{err}");
         let err = rig
-            .call("zone.set_eq_band", json!({ "v": 1, "id": "zone:1", "index": 10, "freq_hz": 1000, "gain_db": 0.0, "q": 1.0 }))
+            .call("zone.set_eq_band", json!({ "v": 1, "id": "zone:1", "index": 11, "freq_hz": 1000, "gain_db": 0.0, "q": 1.0 }))
             .await
             .unwrap_err();
-        assert!(err.contains("band index 10 is out of range"), "{err}");
+        assert!(err.contains("band index 11 is out of range"), "{err}");
         for (payload, field) in [
             (
                 json!({ "freq_hz": 19, "gain_db": 0.0, "q": 1.0 }),
@@ -6575,7 +6717,7 @@ pcm.evo {
     }
 
     /// Every path that can move the claim republishes it: the
-    /// eight logical-output and zone handlers, the output-verb
+    /// nine logical-output and zone handlers, the output-verb
     /// rebind, the binding release at unload, the options
     /// observer after its render, and both hardware-observer
     /// republishes. Nothing in the claim path renders or mixes.
@@ -6585,8 +6727,8 @@ pcm.evo {
         let production = lib.split("#[cfg(test)]\nmod tests").next().unwrap();
         assert_eq!(
             production.matches("self.publish_eq_claim().await;").count(),
-            11,
-            "eight handlers, the rebind, the release, the scene recall"
+            12,
+            "nine handlers, the rebind, the release, the scene recall"
         );
         let observer_start =
             production.find("async fn spawn_options_observer").unwrap();

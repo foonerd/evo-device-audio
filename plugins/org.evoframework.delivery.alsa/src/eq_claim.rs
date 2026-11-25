@@ -33,7 +33,7 @@ pub(crate) enum EqClaim {
     Claimed {
         /// The one engaged zone on the terminus.
         zone_id: String,
-        /// Its ten bands.
+        /// Its bands: from one to thirty-one, as the zone has them.
         bands: Vec<EqBand>,
     },
 }
@@ -210,5 +210,28 @@ mod tests {
             w["bands"][0],
             json!({ "freq_hz": 1000, "gain_db": 3.0, "q": 1.0 })
         );
+    }
+
+    /// The claim carries as many bands as the zone has, in order:
+    /// a grown zone claims with all of them, a cut one with fewer.
+    #[test]
+    fn the_claim_carries_every_band_the_zone_has() {
+        for n in [1usize, 6, 10, 21, 31] {
+            let (l, mut z) = fixtures();
+            z[0].eq.bands = (0..n)
+                .map(|i| crate::zones::EqBand {
+                    freq_hz: 100 + i as u32,
+                    gain_db: i as f32 / 10.0,
+                    q: 1.5,
+                })
+                .collect();
+            let w = compute_claim(Some("hw:0,0"), &l, &z).to_wire();
+            let bands = w["bands"].as_array().unwrap();
+            assert_eq!(bands.len(), n, "{n} bands");
+            for (i, b) in bands.iter().enumerate() {
+                assert_eq!(b["freq_hz"], 100 + i as u32);
+                assert_eq!(b["q"], 1.5);
+            }
+        }
     }
 }
