@@ -118,6 +118,12 @@ impl Biquad {
         self.z2 = 0.0;
     }
 
+    /// True when the delay line holds nothing. For tests.
+    #[cfg(test)]
+    pub(crate) fn is_clear(&self) -> bool {
+        self.z1 == 0.0 && self.z2 == 0.0
+    }
+
     /// Process a single sample. Transposed direct form II:
     /// ```text
     /// y[n]   = b0 * x[n] + z1

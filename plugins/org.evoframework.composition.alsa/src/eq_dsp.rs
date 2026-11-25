@@ -15,7 +15,7 @@
 //! function dispatches on `(sample_format, channels)`; the
 //! biquad-cascade-per-channel state lives in
 //! [`EqProcessor`]. Coefficient updates take a fresh
-//! `[EqBandParams; EQ_BAND_COUNT]` snapshot; the per-channel
+//! `[EqBandParams]` snapshot; the per-channel
 //! cascades recompute in place, preserving delay state.
 
 use crate::biquad::Biquad;
@@ -25,6 +25,10 @@ use crate::biquad::Biquad;
 /// consumer plugins on the audio.composition shelf honour
 /// this count.
 pub const EQ_BAND_COUNT: usize = 10;
+
+/// The most bands one cascade holds. The operator's own EQ has
+/// [`EQ_BAND_COUNT`]; a zone's EQ can have up to this many.
+pub const EQ_BAND_MAX_COUNT: usize = 31;
 
 /// Maximum channel count the DSP handles internally.
 /// Sample-format dispatch covers mono + stereo for the
@@ -78,53 +82,71 @@ impl EqSampleFormat {
     }
 }
 
-/// Per-channel biquad cascade. Owns 10 biquads (one per
-/// band); processes one channel's interleaved samples through
-/// all 10 in sequence.
+/// One band of a cascade: its filter, and whether it does anything.
+/// A band at 0 dB is an identity filter, so it is left out of the
+/// cascade's work rather than run for nothing.
+#[derive(Debug, Clone)]
+struct CascadeBand {
+    biquad: Biquad,
+    active: bool,
+}
+
+/// Per-channel biquad cascade. Owns one biquad per band, up to
+/// [`EQ_BAND_MAX_COUNT`]; processes one channel's interleaved
+/// samples through the bands that do something, in sequence.
 #[derive(Debug, Clone)]
 struct ChannelCascade {
-    biquads: [Biquad; EQ_BAND_COUNT],
+    bands: Vec<CascadeBand>,
 }
 
 impl ChannelCascade {
     fn new() -> Self {
-        Self {
-            biquads: std::array::from_fn(|_| Biquad::identity()),
-        }
+        Self { bands: Vec::new() }
     }
 
-    fn configure(
-        &mut self,
-        bands: &[EqBandParams; EQ_BAND_COUNT],
-        sample_rate: f64,
-    ) {
-        for (b, params) in self.biquads.iter_mut().zip(bands.iter()) {
-            b.configure_peaking(
+    /// Take a fresh band list. The filter memory of a band that
+    /// stays is kept, so a change of one band does not click the
+    /// others; a band that is new starts clear.
+    fn configure(&mut self, bands: &[EqBandParams], sample_rate: f64) {
+        let wanted = bands.len().min(EQ_BAND_MAX_COUNT);
+        self.bands.resize_with(wanted, || CascadeBand {
+            biquad: Biquad::identity(),
+            active: false,
+        });
+        for (band, params) in self.bands.iter_mut().zip(bands.iter()) {
+            band.biquad.configure_peaking(
                 params.freq_hz as f64,
                 params.gain_db as f64,
                 params.q as f64,
                 sample_rate,
             );
+            let active = params.gain_db != 0.0;
+            if active && !band.active {
+                // It was not running; its memory is from before it
+                // stopped, so it starts clear rather than clicking.
+                band.biquad.reset();
+            }
+            band.active = active;
         }
     }
 
     fn process(&mut self, sample: f32) -> f32 {
         let mut s = sample;
-        for b in self.biquads.iter_mut() {
-            s = b.process_sample(s);
+        for band in self.bands.iter_mut().filter(|b| b.active) {
+            s = band.biquad.process_sample(s);
         }
         s
     }
 
     #[allow(dead_code)]
     fn reset(&mut self) {
-        for b in self.biquads.iter_mut() {
-            b.reset();
+        for band in self.bands.iter_mut() {
+            band.biquad.reset();
         }
     }
 }
 
-/// 10-band parametric EQ processor. Holds one cascade per
+/// Parametric EQ processor (up to [`EQ_BAND_MAX_COUNT`] bands). Holds one cascade per
 /// channel; `process_bytes` consumes interleaved PCM in the
 /// configured format and writes back the filtered stream
 /// in place.
@@ -163,7 +185,7 @@ impl EqProcessor {
     /// Recompute all biquad coefficients from a fresh band
     /// parameter snapshot. Preserves the per-channel delay
     /// state (no pop on parameter change).
-    pub fn configure_bands(&mut self, bands: &[EqBandParams; EQ_BAND_COUNT]) {
+    pub fn configure_bands(&mut self, bands: &[EqBandParams]) {
         for ch in 0..self.channels {
             self.cascades[ch].configure(bands, self.sample_rate);
         }
@@ -434,5 +456,151 @@ mod tests {
         p1.process_bytes(&mut buf1).unwrap();
         p2.process_bytes(&mut buf2).unwrap();
         assert_eq!(buf1, buf2, "EQ DSP must be deterministic");
+    }
+
+    // ----- more bands -------------------------------------------
+
+    fn tone_s16(freq: f32, frames: usize, amp: f32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(frames * 4);
+        for n in 0..frames {
+            let v = (amp
+                * (2.0 * std::f32::consts::PI * freq * n as f32 / 44_100.0)
+                    .sin()) as i16;
+            for _ in 0..2 {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    fn peak_db(buf: &[u8], freq: f32, skip: usize) -> f64 {
+        let frames = buf.len() / 4;
+        let (mut c, mut s) = (0f64, 0f64);
+        let k = 2.0 * std::f64::consts::PI * freq as f64 / 44_100.0;
+        for f in skip..frames {
+            let v = i16::from_le_bytes([buf[f * 4], buf[f * 4 + 1]]) as f64;
+            c += v * (k * f as f64).cos();
+            s += v * (k * f as f64).sin();
+        }
+        let n = (frames - skip) as f64;
+        20.0 * (2.0 * c.hypot(s) / n / 32768.0).log10()
+    }
+
+    /// A 31-band cascade applies several bands at once, each at its
+    /// own frequency: three tones, three different gains.
+    #[test]
+    fn thirty_one_bands_each_act_at_their_own_frequency() {
+        let mut bands = vec![EqBandParams::default(); EQ_BAND_MAX_COUNT];
+        for (i, b) in bands.iter_mut().enumerate() {
+            b.freq_hz = 20 + (i as u32) * 20;
+        }
+        bands[5] = EqBandParams {
+            freq_hz: 125,
+            gain_db: 6.1,
+            q: 4.0,
+        };
+        bands[17] = EqBandParams {
+            freq_hz: 1000,
+            gain_db: -4.7,
+            q: 4.0,
+        };
+        bands[28] = EqBandParams {
+            freq_hz: 8000,
+            gain_db: 2.3,
+            q: 4.0,
+        };
+        let mut p = EqProcessor::new(2, EqSampleFormat::S16Le, 44_100);
+        p.configure_bands(&bands);
+        for (freq, want) in
+            [(125.0_f32, 6.1_f64), (1000.0, -4.7), (8000.0, 2.3)]
+        {
+            let input = tone_s16(freq, 44_100, 3000.0);
+            let mut out = input.clone();
+            p.reset();
+            p.configure_bands(&bands);
+            p.process_bytes(&mut out).unwrap();
+            let got = peak_db(&out, freq, 8000) - peak_db(&input, freq, 8000);
+            assert!(
+                (got - want).abs() < 0.15,
+                "{freq} Hz: wanted {want} dB, got {got:.2} dB"
+            );
+        }
+    }
+
+    /// The cascade follows the band count it is given, in either
+    /// direction, and a flat band changes nothing.
+    #[test]
+    fn the_band_count_can_change_under_a_running_cascade() {
+        let mut p = EqProcessor::new(2, EqSampleFormat::S16Le, 44_100);
+        let one = vec![EqBandParams {
+            freq_hz: 1000,
+            gain_db: 6.0,
+            q: 2.0,
+        }];
+        let mut many = one.clone();
+        many.extend(vec![EqBandParams::default(); 30]);
+        for set in [&one, &many, &one, &many] {
+            p.configure_bands(set);
+            let input = tone_s16(1000.0, 44_100, 3000.0);
+            let mut out = input.clone();
+            p.reset();
+            p.process_bytes(&mut out).unwrap();
+            let got =
+                peak_db(&out, 1000.0, 8000) - peak_db(&input, 1000.0, 8000);
+            assert!(
+                (got - 6.0).abs() < 0.15,
+                "{} bands: {got:.2} dB",
+                set.len()
+            );
+        }
+    }
+
+    /// A cascade never holds more than the most, however many it is
+    /// handed, and an empty list is a flat, silent-of-effect cascade.
+    #[test]
+    fn a_cascade_is_capped_and_an_empty_list_is_transparent() {
+        let mut p = EqProcessor::new(2, EqSampleFormat::S16Le, 44_100);
+        p.configure_bands(&vec![
+            EqBandParams {
+                freq_hz: 1000,
+                gain_db: 3.0,
+                q: 1.0
+            };
+            40
+        ]);
+        assert_eq!(p.cascades[0].bands.len(), EQ_BAND_MAX_COUNT);
+        p.configure_bands(&[]);
+        let input = tone_s16(1000.0, 4410, 3000.0);
+        let mut out = input.clone();
+        p.process_bytes(&mut out).unwrap();
+        assert_eq!(out, input);
+    }
+
+    /// A band that was flat and is brought back starts clear, so
+    /// bringing it in does not play what it held before it stopped.
+    #[test]
+    fn a_band_brought_back_from_flat_starts_with_clear_memory() {
+        let mut p = EqProcessor::new(2, EqSampleFormat::S16Le, 44_100);
+        let on = vec![EqBandParams {
+            freq_hz: 200,
+            gain_db: 12.0,
+            q: 1.0,
+        }];
+        let off = vec![EqBandParams {
+            freq_hz: 200,
+            gain_db: 0.0,
+            q: 1.0,
+        }];
+        p.configure_bands(&on);
+        let mut loud = tone_s16(200.0, 4410, 20000.0);
+        p.process_bytes(&mut loud).unwrap();
+        p.configure_bands(&off);
+        let mut quiet = tone_s16(200.0, 4410, 100.0);
+        p.process_bytes(&mut quiet).unwrap();
+        p.configure_bands(&on);
+        assert!(
+            p.cascades[0].bands[0].biquad.is_clear(),
+            "its memory starts clear"
+        );
     }
 }

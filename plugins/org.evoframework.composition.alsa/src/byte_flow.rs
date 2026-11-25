@@ -463,7 +463,10 @@ mod tests {
             gain_db,
             q: 1.0,
         };
-        EqRuntimeState { engaged, bands }
+        EqRuntimeState {
+            engaged,
+            bands: bands.to_vec(),
+        }
     }
 
     /// `frames` of a 1 kHz stereo sine at amplitude `amp`, s16le.

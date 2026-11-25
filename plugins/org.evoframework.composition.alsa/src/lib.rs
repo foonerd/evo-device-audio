@@ -228,17 +228,20 @@ pub struct EqRuntimeState {
     /// bytes through unchanged even when the active mode is
     /// `eq_only`. Operator A/B switch within the EQ mode.
     pub engaged: bool,
-    /// 10 parametric band parameters. Schema-pinned count;
-    /// consumer DSP cascades 10 biquads per channel.
-    pub bands: [crate::eq_dsp::EqBandParams; crate::eq_dsp::EQ_BAND_COUNT],
+    /// The parametric bands. The operator's own EQ always has ten
+    /// (schema-pinned); a claimed zone's has from one to thirty-one.
+    /// The cascade runs one biquad per band that is not flat.
+    pub bands: Vec<crate::eq_dsp::EqBandParams>,
 }
 
 impl Default for EqRuntimeState {
     fn default() -> Self {
         Self {
             engaged: false,
-            bands: [crate::eq_dsp::EqBandParams::default();
-                crate::eq_dsp::EQ_BAND_COUNT],
+            bands: vec![
+                crate::eq_dsp::EqBandParams::default();
+                crate::eq_dsp::EQ_BAND_COUNT
+            ],
         }
     }
 }
@@ -256,8 +259,8 @@ pub enum ZoneEqClaim {
     Claimed {
         /// The claiming zone, for the log.
         zone_id: String,
-        /// Its ten bands.
-        bands: [crate::eq_dsp::EqBandParams; crate::eq_dsp::EQ_BAND_COUNT],
+        /// Its bands: from one to thirty-one.
+        bands: Vec<crate::eq_dsp::EqBandParams>,
     },
 }
 
@@ -281,7 +284,7 @@ pub fn sounding_eq(inputs: &EqInputs) -> EqRuntimeState {
     match &inputs.claim {
         ZoneEqClaim::Claimed { bands, .. } => EqRuntimeState {
             engaged: true,
-            bands: *bands,
+            bands: bands.clone(),
         },
         ZoneEqClaim::None => inputs.options.clone(),
     }
@@ -1023,8 +1026,10 @@ fn parse_eq_runtime_state_from_state(
         .get("eq_engaged")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let mut bands =
-        [crate::eq_dsp::EqBandParams::default(); crate::eq_dsp::EQ_BAND_COUNT];
+    let mut bands = vec![
+        crate::eq_dsp::EqBandParams::default();
+        crate::eq_dsp::EQ_BAND_COUNT
+    ];
     if let Some(arr) = state.get("eq_bands").and_then(|v| v.as_array()) {
         for (i, entry) in
             arr.iter().take(crate::eq_dsp::EQ_BAND_COUNT).enumerate()
@@ -1056,9 +1061,9 @@ fn parse_eq_runtime_state_from_state(
 
 /// Extract the zone EQ claim from an `evo.audio.zones` /
 /// `eq_claim` subject-state payload. Only
-/// `{ claimed: true, engaged: true, bands: [10] }` with every
+/// `{ claimed: true, engaged: true, bands: [1 to 31] }` with every
 /// band carrying its three fields is a claim; anything else —
-/// `claimed: false`, a missing or short or long band list, a
+/// `claimed: false`, a missing or empty or over-long band list, a
 /// band missing a field — is `None`, and the options EQ sounds.
 fn parse_zone_eq_claim_from_state(state: &serde_json::Value) -> ZoneEqClaim {
     let claimed = state
@@ -1075,11 +1080,10 @@ fn parse_zone_eq_claim_from_state(state: &serde_json::Value) -> ZoneEqClaim {
     let Some(arr) = state.get("bands").and_then(|v| v.as_array()) else {
         return ZoneEqClaim::None;
     };
-    if arr.len() != crate::eq_dsp::EQ_BAND_COUNT {
+    if arr.is_empty() || arr.len() > crate::eq_dsp::EQ_BAND_MAX_COUNT {
         return ZoneEqClaim::None;
     }
-    let mut bands =
-        [crate::eq_dsp::EqBandParams::default(); crate::eq_dsp::EQ_BAND_COUNT];
+    let mut bands = vec![crate::eq_dsp::EqBandParams::default(); arr.len()];
     for (i, entry) in arr.iter().enumerate() {
         let (Some(freq_hz), Some(gain_db), Some(q)) = (
             entry.get("freq_hz").and_then(|v| v.as_u64()),
@@ -3408,7 +3412,7 @@ mod tests {
         };
         p.eq_state_tx.send_replace(EqRuntimeState {
             engaged: true,
-            bands,
+            bands: bands.to_vec(),
         });
 
         p.spawn_worker().await.unwrap();
@@ -3552,11 +3556,11 @@ mod tests {
 
     // ---- the zone EQ claim: which bands the one cascade sounds ----
 
-    fn boosted(
-        gain: f32,
-    ) -> [crate::eq_dsp::EqBandParams; crate::eq_dsp::EQ_BAND_COUNT] {
-        let mut b = [crate::eq_dsp::EqBandParams::default();
-            crate::eq_dsp::EQ_BAND_COUNT];
+    fn boosted(gain: f32) -> Vec<crate::eq_dsp::EqBandParams> {
+        let mut b = vec![
+            crate::eq_dsp::EqBandParams::default();
+            crate::eq_dsp::EQ_BAND_COUNT
+        ];
         b[0].gain_db = gain;
         b
     }
@@ -3630,12 +3634,12 @@ mod tests {
                 json!({ "v": 1, "claimed": true, "engaged": false, "bands": vec![band.clone(); 10] }),
             ),
             (
-                "nine bands",
-                json!({ "v": 1, "claimed": true, "engaged": true, "bands": vec![band.clone(); 9] }),
+                "an empty band list",
+                json!({ "v": 1, "claimed": true, "engaged": true, "bands": Vec::<serde_json::Value>::new() }),
             ),
             (
-                "eleven bands",
-                json!({ "v": 1, "claimed": true, "engaged": true, "bands": vec![band.clone(); 11] }),
+                "thirty-two bands, one over the most",
+                json!({ "v": 1, "claimed": true, "engaged": true, "bands": vec![band.clone(); 32] }),
             ),
             (
                 "no bands",
@@ -3651,6 +3655,30 @@ mod tests {
                 ZoneEqClaim::None,
                 "{what}"
             );
+        }
+    }
+
+    /// A zone's EQ can have from one to thirty-one bands, and the claim
+    /// carries them all, in order, whatever the count.
+    #[test]
+    fn a_claim_carries_from_one_to_thirty_one_bands_in_order() {
+        for n in [1usize, 9, 10, 11, 20, 31] {
+            let bands: Vec<serde_json::Value> = (0..n)
+                .map(|i| json!({ "freq_hz": 100 + i as u32, "gain_db": i as f64 / 10.0, "q": 1.5 }))
+                .collect();
+            let state = json!({ "v": 1, "claimed": true, "zone_id": "zone:2", "engaged": true, "bands": bands });
+            match parse_zone_eq_claim_from_state(&state) {
+                ZoneEqClaim::Claimed { zone_id, bands } => {
+                    assert_eq!(zone_id, "zone:2");
+                    assert_eq!(bands.len(), n, "{n} bands in, {n} out");
+                    for (i, b) in bands.iter().enumerate() {
+                        assert_eq!(b.freq_hz, 100 + i as u32);
+                        assert_eq!(b.gain_db, (i as f64 / 10.0) as f32);
+                        assert_eq!(b.q, 1.5);
+                    }
+                }
+                other => panic!("{n} bands: {other:?}"),
+            }
         }
     }
 
@@ -3802,7 +3830,7 @@ mod tests {
             &p.eq_state_tx,
             ZoneEqClaim::Claimed {
                 zone_id: "zone:1".to_string(),
-                bands,
+                bands: bands.to_vec(),
             },
         );
 
@@ -3934,7 +3962,7 @@ mod tests {
             &p.eq_state_tx,
             ZoneEqClaim::Claimed {
                 zone_id: "zone:1".to_string(),
-                bands,
+                bands: bands.to_vec(),
             },
         );
 
