@@ -175,6 +175,46 @@ impl GlobalMixer {
         }
     }
 
+    /// The chain's hardware mixer, whether or not the operator has
+    /// chosen one.
+    ///
+    /// The operator's settings win when they name a hardware mixer,
+    /// and an explicit `software` or `none` choice means the card's
+    /// own control is not the global volume. When the operator has
+    /// chosen no mixer at all (no options saved, or the field
+    /// unset) the chain is the bootstrap baseline, whose volume is
+    /// the active DAC's own mixer control: the catalogue's
+    /// `mixer_hint` on the card its `alsacard_hint` names. Without
+    /// this the guard saw no global mixer on a device that had
+    /// never saved an option, and a per-output volume on the DAC
+    /// moved the global volume.
+    pub(crate) fn resolve(
+        settings: &OptionsSettings,
+        card_hint: Option<&str>,
+        mixer_hint: Option<&str>,
+    ) -> Option<Self> {
+        if let Some(named) = Self::from_settings(settings) {
+            return Some(named);
+        }
+        if settings.mixer_type.is_some() {
+            return None;
+        }
+        let control = mixer_hint.filter(|c| !c.is_empty())?;
+        let card = card_hint.filter(|c| !c.is_empty()).map(str::to_string);
+        let card = card.unwrap_or_else(|| {
+            let device = settings
+                .output_device
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(crate::options_render::DEFAULT_OUTPUT_DEVICE);
+            parse_card_name(device).to_string()
+        });
+        Some(Self {
+            card,
+            control: control.to_string(),
+        })
+    }
+
     fn is_control_of(&self, output: &ResolvedAlsaOutput) -> bool {
         output.default_mixer_control.as_deref() == Some(self.control.as_str())
             && (self.card == output.card_idx.to_string()
@@ -734,6 +774,60 @@ pub(crate) mod tests {
         };
         let global = GlobalMixer::from_settings(&by_index).unwrap();
         assert!(p.volume_target(&outs, Some(&global), "hw:0,0", 50).is_err());
+    }
+
+    /// A device that never saved an option has the baseline chain,
+    /// whose volume is the active DAC's own mixer control: the
+    /// per-output volume on that card is the global volume and is
+    /// refused; another card's control is not. An explicit
+    /// software or no-mixer choice leaves the card's control free.
+    #[test]
+    fn unsaved_options_fall_back_to_the_active_dacs_mixer() {
+        let outs = vec![
+            output(3, "DAC", Some("Digital")),
+            output(1, "Other", Some("PCM")),
+        ];
+        let p = OutputPolicy::default();
+        let unsaved = OptionsSettings::default();
+        let global =
+            GlobalMixer::resolve(&unsaved, Some("DAC"), Some("Digital"))
+                .expect("the baseline chain has a global mixer");
+        assert_eq!(
+            p.volume_target(&outs, Some(&global), "hw:3,0", 40),
+            Err(Refusal::GlobalMixer {
+                output: "hw:3,0".to_string(),
+                control: "Digital".to_string()
+            })
+        );
+        assert!(p.volume_target(&outs, Some(&global), "hw:1,0", 40).is_ok());
+
+        // No DAC mixer hint: nothing to refuse on.
+        assert_eq!(GlobalMixer::resolve(&unsaved, Some("DAC"), None), None);
+        assert_eq!(GlobalMixer::resolve(&unsaved, Some("DAC"), Some("")), None);
+
+        // An explicit software or no-mixer choice is not the card's control.
+        for kind in [MixerType::Software, MixerType::None] {
+            let chosen = OptionsSettings {
+                mixer_type: Some(kind),
+                ..Default::default()
+            };
+            assert_eq!(
+                GlobalMixer::resolve(&chosen, Some("DAC"), Some("Digital")),
+                None
+            );
+        }
+
+        // The operator's own hardware mixer wins over the hint.
+        let named = OptionsSettings {
+            mixer_type: Some(MixerType::Hardware),
+            mixer_control: Some("Master".to_string()),
+            output_device: Some("hw:CARD=Other,DEV=0".to_string()),
+            ..Default::default()
+        };
+        let global =
+            GlobalMixer::resolve(&named, Some("DAC"), Some("Digital")).unwrap();
+        assert_eq!(global.control, "Master");
+        assert_eq!(global.card, "Other");
     }
 
     /// Out of range and no mixer control are refused.

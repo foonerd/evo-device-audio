@@ -781,6 +781,24 @@ pub struct ActiveDacConfig {
     pub boot_config_path: String,
 }
 
+/// Whether an `asound.conf` body defines `pcm.evo_local`.
+///
+/// Only a definition counts: a line outside a comment that opens
+/// the name. The reference template's comments talk about
+/// `pcm.evo_local`, and reading those as a definition sent every
+/// rebind to a PCM that nothing opens, so a paused output kept
+/// playing.
+fn defines_evo_local(body: &str) -> bool {
+    body.lines().any(|line| {
+        let line = line.trim_start();
+        !line.starts_with('#')
+            && line.strip_prefix("pcm.evo_local").is_some_and(|rest| {
+                let rest = rest.trim_start();
+                rest.is_empty() || rest.starts_with('{')
+            })
+    })
+}
+
 impl AlsaDeliveryPlugin {
     /// Resolve which options-render target to use for the active
     /// on-disk ALSA topology.
@@ -795,7 +813,7 @@ impl AlsaDeliveryPlugin {
     ) -> options_render::RenderTarget {
         match std::fs::read_to_string(asound_conf_path) {
             Ok(body) => {
-                if body.contains("pcm.evo_local") {
+                if defines_evo_local(&body) {
                     options_render::RenderTarget::SourceLocal
                 } else {
                     options_render::RenderTarget::Main
@@ -2284,12 +2302,25 @@ impl AlsaDeliveryPlugin {
         let payload: OutputVolumeRequest = parse_versioned_payload(req)?;
         let outputs = self.cached_outputs.read().await.clone();
         let follow = self.follow_device().await;
-        let global = self
+        let (card_hint, mixer_hint) = self
+            .active_dac_config
+            .read()
+            .await
+            .as_ref()
+            .map(|a| (a.alsacard_hint.clone(), a.mixer_hint.clone()))
+            .unwrap_or((None, None));
+        let settings = self
             .last_options
             .read()
             .await
             .as_ref()
-            .and_then(|l| GlobalMixer::from_settings(&l.settings));
+            .map(|l| l.settings.clone())
+            .unwrap_or_default();
+        let global = GlobalMixer::resolve(
+            &settings,
+            card_hint.as_deref(),
+            mixer_hint.as_deref(),
+        );
         let id = payload.output_id.as_str();
         let target = self
             .outputs
@@ -3410,6 +3441,52 @@ fn asound_conf_defines_pcm_evo(asound_conf: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The reference template's comments name `pcm.evo_local`; only a
+    /// definition makes a box source-local. Reading the comment as a
+    /// definition rendered every rebind to a PCM nothing opens.
+    #[test]
+    fn the_templates_comment_is_not_an_evo_local_definition() {
+        let template = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../dist/alsa/asound.conf"),
+        )
+        .expect("the reference asound.conf");
+        assert!(
+            template.contains("pcm.evo_local"),
+            "the template still mentions the name in a comment"
+        );
+        assert!(!defines_evo_local(&template));
+        assert!(defines_evo_local("pcm.evo_local {\n    type plug\n}\n"));
+        assert!(defines_evo_local("  pcm.evo_local{\n}\n"));
+        assert!(!defines_evo_local("# pcm.evo_local {\n"));
+        assert!(!defines_evo_local("pcm.evo_local_terminus {\n}\n"));
+    }
+
+    /// On the box that said "quiet" while sound played, the drop-in
+    /// renders the chain head `pcm.evo`, the PCM MPD opens, with the
+    /// null terminus a pause asks for.
+    #[test]
+    fn a_pause_on_the_reference_template_renders_the_pcm_mpd_opens() {
+        let template = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../dist/alsa/asound.conf"),
+        )
+        .expect("the reference asound.conf");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conf = dir.path().join("asound.conf");
+        std::fs::write(&conf, template).expect("write");
+        let target = AlsaDeliveryPlugin::detect_options_render_target(&conf);
+        assert_eq!(target, options_render::RenderTarget::Main);
+        let body = options_render::render_drop_in_bound(
+            &OptionsSettings::default(),
+            target,
+            &options_render::OutputBinding::Silent,
+        );
+        assert!(body.contains("pcm.evo {"), "{body}");
+        assert!(body.contains("pcm.evo_terminus {\n    type null"), "{body}");
+        assert!(!body.contains("evo_local"), "{body}");
+    }
+
     use super::*;
 
     use std::sync::Mutex;
@@ -4819,6 +4896,41 @@ pcm.evo {
             "a refused volume is not recorded"
         );
         assert_eq!(rig.mixer.calls.lock().unwrap().len(), 1);
+    }
+
+    /// A device that never saved an option still has a global
+    /// volume: the active DAC's own mixer. A per-output volume on
+    /// that card is refused and moves nothing; another card is not.
+    #[tokio::test]
+    async fn volume_on_the_dac_is_refused_when_no_option_was_ever_saved() {
+        let rig = OutputRig::new().await;
+        *rig.plugin.active_dac_config.write().await = Some(ActiveDacConfig {
+            overlay: "i-sabre-q2m".into(),
+            catalogue_id: None,
+            display_name: None,
+            alsacard_hint: Some("DAC".into()),
+            mixer_hint: Some("Digital".into()),
+            interface: Some("i2s".into()),
+            boot_config_path: String::new(),
+        });
+        assert!(rig.plugin.last_options.read().await.is_none());
+        let err = rig
+            .call(
+                "delivery.set_output_volume",
+                json!({ "v": 1, "output_id": "hw:0,0", "volume": 40 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("global volume"), "{err}");
+        assert!(rig.mixer.calls.lock().unwrap().is_empty());
+        let b = rig
+            .call(
+                "delivery.set_output_volume",
+                json!({ "v": 1, "output_id": "hw:1,0", "volume": 40 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(b["output"]["volume"], 40);
     }
 
     /// Enabled flags and volumes survive a restart on the same
