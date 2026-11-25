@@ -60,18 +60,26 @@ use alsa::pcm::{Access, Format, HwParams, PCM};
 use alsa::{Direction, ValueOr};
 use evo_plugin_sdk::audio::{AudioFormat, PcmCodec};
 use evo_plugin_sdk::contract::audio_routing::CompositionEndpoints;
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 
-use crate::byte_flow::ByteFlowError;
+use crate::byte_flow::{ByteFlowError, EqStage};
+use crate::EqRuntimeState;
 
 /// Async wrapper around the blocking ALSA pump loop. Spawns
 /// the loop on `spawn_blocking`; mirrors the cancel signal
 /// onto an `AtomicBool` the loop polls; awaits completion.
 ///
+/// `mode_rx` and `eq_state_rx` are the channels the named-pipe
+/// pump reads too: the pump runs the frames it moves through the
+/// shared [`EqStage`], so `eq_only` with the EQ engaged is heard
+/// and every other combination passes the frames byte-identical.
+///
 /// Returns `Ok(())` on graceful exit (cancel observed or
 /// input EOF), `Err` on substrate failure.
 pub(crate) async fn run_alsa_pcm(
     endpoints: CompositionEndpoints,
+    mode_rx: watch::Receiver<String>,
+    eq_state_rx: watch::Receiver<EqRuntimeState>,
     cancel: Arc<Notify>,
 ) -> Result<(), ByteFlowError> {
     let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -87,7 +95,7 @@ pub(crate) async fn run_alsa_pcm(
     });
 
     let blocking_result = tokio::task::spawn_blocking(move || {
-        run_alsa_pcm_blocking(&endpoints, cancel_flag)
+        run_alsa_pcm_blocking(&endpoints, mode_rx, eq_state_rx, cancel_flag)
     })
     .await;
 
@@ -110,6 +118,8 @@ const PCM_WAIT_TIMEOUT_MS: u32 = 50;
 
 fn run_alsa_pcm_blocking(
     endpoints: &CompositionEndpoints,
+    mut mode_rx: watch::Receiver<String>,
+    mut eq_state_rx: watch::Receiver<EqRuntimeState>,
     cancel_flag: Arc<AtomicBool>,
 ) -> Result<(), ByteFlowError> {
     let pcm_format = match &endpoints.input.format {
@@ -160,9 +170,18 @@ fn run_alsa_pcm_blocking(
     input_pcm.start().map_err(|e| {
         ByteFlowError::OpenFailed(format!("alsa input start: {e}"))
     })?;
-    output_pcm.start().map_err(|e| {
-        ByteFlowError::OpenFailed(format!("alsa output start: {e}"))
-    })?;
+    // The output is not started here. It has nothing to play until
+    // the first buffer is written, and a playback stream started on
+    // an empty buffer underruns at once; the first write starts it.
+
+    // The EQ stage for the negotiated input format. The channels
+    // are tokio watches; both calls below are synchronous and are
+    // safe from this blocking thread.
+    let mut stage = {
+        let mode = mode_rx.borrow_and_update().clone();
+        let state = eq_state_rx.borrow_and_update().clone();
+        EqStage::new(&endpoints.input.format, &mode, &state)
+    };
 
     let frame_size_bytes = bytes_per_frame(pcm_format, channels)?;
     let frames_per_pump = 1024usize;
@@ -170,6 +189,11 @@ fn run_alsa_pcm_blocking(
 
     let input_io = input_pcm.io_bytes();
     let output_io = output_pcm.io_bytes();
+
+    // Recoveries since the last buffer that made it through. A pcm
+    // that goes quiet while the source pauses, or restarts, comes
+    // back through `recover`; one that never settles is a failure.
+    let mut recoveries = 0u32;
 
     loop {
         if cancel_flag.load(Ordering::Acquire) {
@@ -183,9 +207,8 @@ fn run_alsa_pcm_blocking(
             Ok(true) => {}
             Ok(false) => continue,
             Err(e) => {
-                return Err(ByteFlowError::ReadFailed(format!(
-                    "alsa input wait: {e}"
-                )));
+                recover(&input_pcm, e, "input wait", &mut recoveries, true)?;
+                continue;
             }
         }
 
@@ -195,9 +218,8 @@ fn run_alsa_pcm_blocking(
                 continue;
             }
             Err(e) => {
-                return Err(ByteFlowError::ReadFailed(format!(
-                    "alsa input readi: {e}"
-                )));
+                recover(&input_pcm, e, "input readi", &mut recoveries, true)?;
+                continue;
             }
         };
         if frames_read == 0 {
@@ -205,6 +227,20 @@ fn run_alsa_pcm_blocking(
         }
 
         let bytes_to_write = frames_read * frame_size_bytes;
+
+        // Pick up a mode or EQ change made since the last buffer,
+        // then run the cascade over what was just read. The stage
+        // leaves the frames alone unless it applies.
+        if mode_rx.has_changed().unwrap_or(false) {
+            let mode = mode_rx.borrow_and_update().clone();
+            stage.set_mode(&mode);
+        }
+        if eq_state_rx.has_changed().unwrap_or(false) {
+            let state = eq_state_rx.borrow_and_update().clone();
+            stage.set_state(&state);
+        }
+        stage.apply(&mut buf[..bytes_to_write])?;
+
         let mut written_frames = 0usize;
         while written_frames < frames_read {
             let frames_remaining = frames_read - written_frames;
@@ -222,19 +258,69 @@ fn run_alsa_pcm_blocking(
                     if let Err(wait_err) =
                         output_pcm.wait(Some(PCM_WAIT_TIMEOUT_MS))
                     {
-                        return Err(ByteFlowError::WriteFailed(format!(
-                            "alsa output wait: {wait_err}"
-                        )));
+                        recover(
+                            &output_pcm,
+                            wait_err,
+                            "output wait",
+                            &mut recoveries,
+                            false,
+                        )?;
                     }
                 }
                 Err(e) => {
-                    return Err(ByteFlowError::WriteFailed(format!(
-                        "alsa output writei (frames={frames_remaining}): {e}"
-                    )));
+                    tracing::debug!(
+                        frames = frames_remaining,
+                        error = %e,
+                        "alsa output write failed; recovering"
+                    );
+                    recover(
+                        &output_pcm,
+                        e,
+                        "output writei",
+                        &mut recoveries,
+                        false,
+                    )?;
                 }
             }
         }
+        recoveries = 0;
     }
+}
+
+/// How many recoveries in a row, with no buffer getting through
+/// between them, before the pump gives up and reports a failure.
+const MAX_CONSECUTIVE_RECOVERIES: u32 = 100;
+
+/// Bring `pcm` back from an xrun or a suspend, the way ALSA
+/// expects: `try_recover` prepares it again (and resumes it first
+/// after a suspend). A capture stream is started again after, since
+/// a prepared capture does not run until it is. Anything that
+/// cannot be recovered, or recoveries that come without a buffer
+/// getting through, end the pump with the cause.
+fn recover(
+    pcm: &PCM,
+    err: alsa::Error,
+    what: &str,
+    recoveries: &mut u32,
+    restart: bool,
+) -> Result<(), ByteFlowError> {
+    *recoveries += 1;
+    if *recoveries > MAX_CONSECUTIVE_RECOVERIES {
+        return Err(ByteFlowError::ReadFailed(format!(
+            "alsa {what}: {err} (recovered {MAX_CONSECUTIVE_RECOVERIES} \
+             times with no audio getting through)"
+        )));
+    }
+    pcm.try_recover(err, true).map_err(|e| {
+        ByteFlowError::ReadFailed(format!(
+            "alsa {what}: could not recover: {e}"
+        ))
+    })?;
+    if restart {
+        // Already running is fine; the stream is what is wanted.
+        let _ = pcm.start();
+    }
+    Ok(())
 }
 
 fn pcm_path(path: &std::path::Path) -> Result<&str, ByteFlowError> {

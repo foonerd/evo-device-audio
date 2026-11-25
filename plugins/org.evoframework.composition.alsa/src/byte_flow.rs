@@ -113,6 +113,138 @@ pub enum ByteFlowError {
 /// here is a sensible default.
 const PUMP_BUFFER_BYTES: usize = 4096;
 
+/// How many times the ALSA substrate tries to open its two
+/// PCMs before the failure is reported.
+///
+/// A rewire hands the output PCM to this stage while the source
+/// that held it is still being restarted, so the first open can
+/// find the device busy. A short, bounded window rides that out;
+/// a device that stays unopenable for the whole window is a real
+/// failure and is reported as one.
+#[cfg_attr(not(feature = "alsa-substrate"), allow(dead_code))]
+const ALSA_OPEN_ATTEMPTS: u32 = 20;
+
+/// Pause between two open attempts.
+#[cfg_attr(not(feature = "alsa-substrate"), allow(dead_code))]
+const ALSA_OPEN_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
+/// Run `attempt` until it stops failing to open, at most
+/// `attempts` times, pausing `delay` between tries.
+///
+/// Only [`ByteFlowError::OpenFailed`] is retried: a read or write
+/// that fails mid-flow, or a kind the build does not drive, is
+/// reported at once. `cancel` ends the wait immediately and the
+/// call answers `Ok(())`, as a cancelled pump does. The last
+/// error is returned when the attempts run out.
+#[cfg_attr(not(feature = "alsa-substrate"), allow(dead_code))]
+pub(crate) async fn retry_open<F, Fut>(
+    attempts: u32,
+    delay: std::time::Duration,
+    cancel: Arc<Notify>,
+    mut attempt: F,
+) -> Result<(), ByteFlowError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), ByteFlowError>>,
+{
+    let mut tried = 0u32;
+    loop {
+        tried += 1;
+        match attempt().await {
+            Err(ByteFlowError::OpenFailed(reason)) if tried < attempts => {
+                tracing::debug!(
+                    attempt = tried,
+                    attempts,
+                    reason = %reason,
+                    "substrate open failed; retrying"
+                );
+                tokio::select! {
+                    biased;
+                    _ = cancel.notified() => return Ok(()),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+            other => return other,
+        }
+    }
+}
+
+/// The EQ branch of a pump: whether the cascade runs on the
+/// frames about to be written, and the cascade itself.
+///
+/// One stage serves every substrate, so the rule is stated once:
+/// the cascade runs only when the mode is `eq_only`, the EQ is
+/// engaged, and the format is one the DSP covers (s16le, f32le;
+/// mono or stereo). Anything else leaves the bytes alone.
+pub(crate) struct EqStage {
+    processor: Option<EqProcessor>,
+    mode: String,
+    engaged: bool,
+}
+
+impl EqStage {
+    /// A stage for the negotiated input `format`, in `mode`, with
+    /// the bands and engagement of `state`.
+    pub(crate) fn new(
+        format: &AudioFormat,
+        mode: &str,
+        state: &EqRuntimeState,
+    ) -> Self {
+        let (sample_fmt, channels, rate_hz) =
+            eq_format_from_audio_format(format);
+        let supported = !matches!(sample_fmt, EqSampleFormat::Other(_))
+            && (1..=2).contains(&channels);
+        let processor = supported.then(|| {
+            let mut p = EqProcessor::new(channels, sample_fmt, rate_hz);
+            p.configure_bands(&state.bands);
+            p
+        });
+        Self {
+            processor,
+            mode: mode.to_string(),
+            engaged: state.engaged,
+        }
+    }
+
+    /// The operator changed the composition mode.
+    pub(crate) fn set_mode(&mut self, mode: &str) {
+        self.mode = mode.to_string();
+    }
+
+    /// The sounding EQ changed: take its bands in place (the
+    /// filter memory is kept, so nothing pops) and its engagement.
+    pub(crate) fn set_state(&mut self, state: &EqRuntimeState) {
+        self.engaged = state.engaged;
+        if let Some(p) = self.processor.as_mut() {
+            p.configure_bands(&state.bands);
+        }
+    }
+
+    /// True when the next buffer will go through the cascade.
+    pub(crate) fn applies(&self) -> bool {
+        self.mode == MODE_EQ_ONLY && self.engaged && self.processor.is_some()
+    }
+
+    /// Run the cascade over `buf` when [`Self::applies`], else
+    /// leave it untouched. A buffer the DSP cannot take (a
+    /// misaligned length) is a substrate-boundary fault and is
+    /// reported as a failed read.
+    pub(crate) fn apply(
+        &mut self,
+        buf: &mut [u8],
+    ) -> Result<(), ByteFlowError> {
+        if !self.applies() {
+            return Ok(());
+        }
+        let Some(p) = self.processor.as_mut() else {
+            return Ok(());
+        };
+        p.process_bytes(buf)
+            .map_err(|e| ByteFlowError::ReadFailed(format!("eq dsp: {e}")))
+    }
+}
+
 /// Run the byte-flow substrate appropriate to the
 /// endpoint pair. Returns `Ok(())` on graceful exit
 /// (cancel signalled, or input EOF), `Err` on any
@@ -138,16 +270,29 @@ pub async fn run_substrate(
         }
         #[cfg(feature = "alsa-substrate")]
         EndpointKind::AlsaPcm => {
-            // The ALSA substrate path is opaque to the mode +
-            // eq-state channels in this build — the existing
-            // alsa-substrate worker pumps frames through
-            // libasound without an in-loop transform hook. Once
-            // the alsa-substrate worker grows the same
-            // mode-aware pump shape as the named-pipe path,
-            // these channels thread through identically.
-            let _ = mode_rx;
-            let _ = eq_state_rx;
-            crate::byte_flow_alsa::run_alsa_pcm(endpoints.clone(), cancel).await
+            // The ALSA pump applies the same EQ stage as the
+            // named-pipe pump: in `eq_only`, with the EQ
+            // engaged and a format the DSP covers, frames go
+            // through the cascade; otherwise they pass
+            // byte-identical. Opening is retried for a bounded
+            // window, because a rewire hands the DAC to this
+            // stage while the source is still letting go of it.
+            let ep = endpoints.clone();
+            let attempt_cancel = Arc::clone(&cancel);
+            retry_open(
+                ALSA_OPEN_ATTEMPTS,
+                ALSA_OPEN_RETRY_DELAY,
+                cancel,
+                move || {
+                    crate::byte_flow_alsa::run_alsa_pcm(
+                        ep.clone(),
+                        mode_rx.clone(),
+                        eq_state_rx.clone(),
+                        Arc::clone(&attempt_cancel),
+                    )
+                },
+            )
+            .await
         }
         #[cfg(not(feature = "alsa-substrate"))]
         EndpointKind::AlsaPcm => {
@@ -233,31 +378,18 @@ async fn run_named_pipe(
             ))
         })?;
 
-    // Build the EQ processor from the negotiated input
-    // format. Sample format outside the DSP's coverage
-    // collapses the EQ path to passthrough so the substrate
-    // pumps cleanly even when the operator selected eq_only
-    // on a stream the DSP does not handle — the schema's
-    // `eq-only-sample-format-coverage` acceptance row pins
-    // refusal at the mode-select gesture, not at byte time;
-    // here we honour the safer fallthrough.
-    let (sample_fmt, channels, rate_hz) =
-        eq_format_from_audio_format(&endpoints.input.format);
-    let eq_supported = !matches!(sample_fmt, EqSampleFormat::Other(_))
-        && (1..=2).contains(&channels);
-    let mut processor = if eq_supported {
-        let mut p = EqProcessor::new(channels, sample_fmt, rate_hz);
-        let initial = eq_state_rx.borrow_and_update().clone();
-        p.configure_bands(&initial.bands);
-        Some(p)
-    } else {
-        None
+    // The EQ stage for the negotiated input format. A format
+    // outside the DSP's coverage collapses the stage to
+    // passthrough so the substrate pumps cleanly even when the
+    // operator selected eq_only on a stream the DSP does not
+    // handle — the schema's `eq-only-sample-format-coverage`
+    // acceptance row pins refusal at the mode-select gesture,
+    // not at byte time; here we honour the safer fallthrough.
+    let mut stage = {
+        let mode = mode_rx.borrow_and_update().clone();
+        let state = eq_state_rx.borrow_and_update().clone();
+        EqStage::new(&endpoints.input.format, &mode, &state)
     };
-
-    // Read the initial mode + engaged state into local
-    // values; the select arms refresh these inline.
-    let mut current_mode = mode_rx.borrow_and_update().clone();
-    let mut eq_engaged = eq_state_rx.borrow().engaged;
 
     let mut buf = vec![0u8; PUMP_BUFFER_BYTES];
     loop {
@@ -270,7 +402,8 @@ async fn run_named_pipe(
                 if changed.is_err() {
                     return Ok(());
                 }
-                current_mode = mode_rx.borrow().clone();
+                let mode = mode_rx.borrow().clone();
+                stage.set_mode(&mode);
             }
             // Operator changed an EQ band parameter or
             // engagement flag. Reconfigure the processor in
@@ -280,33 +413,16 @@ async fn run_named_pipe(
                     return Ok(());
                 }
                 let new_state = eq_state_rx.borrow().clone();
-                eq_engaged = new_state.engaged;
-                if let Some(p) = processor.as_mut() {
-                    p.configure_bands(&new_state.bands);
-                }
+                stage.set_state(&new_state);
             }
             result = input.read(&mut buf) => {
                 match result {
                     Ok(0) => return Ok(()),
                     Ok(n) => {
-                        let apply_eq = current_mode == MODE_EQ_ONLY
-                            && eq_engaged
-                            && processor.is_some();
-                        if apply_eq {
-                            // process_bytes errors only on
-                            // misalignment / unsupported
-                            // format. Misalignment is a
-                            // substrate-boundary bug; surface
-                            // as ReadFailed so the worker
-                            // exits the substrate and waits
-                            // for the next route change.
-                            let p = processor.as_mut().unwrap();
-                            if let Err(e) = p.process_bytes(&mut buf[..n]) {
-                                return Err(ByteFlowError::ReadFailed(
-                                    format!("eq dsp: {e}"),
-                                ));
-                            }
-                        }
+                        // A buffer the DSP cannot take surfaces as
+                        // ReadFailed so the worker exits the substrate
+                        // and waits for the next route change.
+                        stage.apply(&mut buf[..n])?;
                         output
                             .write_all(&buf[..n])
                             .await
@@ -320,5 +436,250 @@ async fn run_named_pipe(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::eq_dsp::{EqBandParams, EQ_BAND_COUNT};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const RATE: u32 = 44_100;
+
+    fn pcm(codec: PcmCodec) -> AudioFormat {
+        AudioFormat::Pcm {
+            codec,
+            rate_hz: RATE,
+            channels: 2,
+        }
+    }
+
+    /// Bands flat except band 2, set to `gain_db` at 1 kHz, Q 1.
+    fn state(engaged: bool, gain_db: f32) -> EqRuntimeState {
+        let mut bands = [EqBandParams::default(); EQ_BAND_COUNT];
+        bands[2] = EqBandParams {
+            freq_hz: 1000,
+            gain_db,
+            q: 1.0,
+        };
+        EqRuntimeState { engaged, bands }
+    }
+
+    /// `frames` of a 1 kHz stereo sine at amplitude `amp`, s16le.
+    fn sine(frames: usize, amp: f32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(frames * 4);
+        for n in 0..frames {
+            let t = n as f32 / RATE as f32;
+            let v =
+                (amp * (2.0 * std::f32::consts::PI * 1000.0 * t).sin()) as i16;
+            for _ in 0..2 {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// RMS of the left channel of an s16le stereo buffer, skipping
+    /// the first `skip` frames so the filter has settled.
+    fn rms(buf: &[u8], skip: usize) -> f64 {
+        let frames = buf.len() / 4;
+        let mut sum = 0f64;
+        let mut n = 0f64;
+        for f in skip..frames {
+            let v = i16::from_le_bytes([buf[f * 4], buf[f * 4 + 1]]) as f64;
+            sum += v * v;
+            n += 1.0;
+        }
+        (sum / n).sqrt()
+    }
+
+    fn db(ratio: f64) -> f64 {
+        20.0 * ratio.log10()
+    }
+
+    #[test]
+    fn eq_only_engaged_raises_a_boosted_band_by_its_gain() {
+        let input = sine(RATE as usize / 2, 4000.0);
+        let mut out = input.clone();
+        let mut stage = EqStage::new(
+            &pcm(PcmCodec::PcmS16Le),
+            MODE_EQ_ONLY,
+            &state(true, 12.0),
+        );
+        assert!(stage.applies());
+        stage.apply(&mut out).unwrap();
+        let delta = db(rms(&out, 4000) / rms(&input, 4000));
+        assert!(
+            (delta - 12.0).abs() < 1.0,
+            "a +12 dB band at 1 kHz should lift a 1 kHz tone by about 12 dB, got {delta:.2} dB"
+        );
+    }
+
+    #[test]
+    fn a_cut_band_lowers_the_tone() {
+        let input = sine(RATE as usize / 2, 8000.0);
+        let mut out = input.clone();
+        let mut stage = EqStage::new(
+            &pcm(PcmCodec::PcmS16Le),
+            MODE_EQ_ONLY,
+            &state(true, -9.0),
+        );
+        stage.apply(&mut out).unwrap();
+        let delta = db(rms(&out, 4000) / rms(&input, 4000));
+        assert!((delta + 9.0).abs() < 1.0, "got {delta:.2} dB");
+    }
+
+    #[test]
+    fn passthrough_mode_leaves_the_bytes_identical_even_when_engaged() {
+        let input = sine(4096, 4000.0);
+        let mut out = input.clone();
+        let mut stage = EqStage::new(
+            &pcm(PcmCodec::PcmS16Le),
+            "passthrough",
+            &state(true, 12.0),
+        );
+        assert!(!stage.applies());
+        stage.apply(&mut out).unwrap();
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn eq_only_with_the_eq_not_engaged_leaves_the_bytes_identical() {
+        let input = sine(4096, 4000.0);
+        let mut out = input.clone();
+        let mut stage = EqStage::new(
+            &pcm(PcmCodec::PcmS16Le),
+            MODE_EQ_ONLY,
+            &state(false, 12.0),
+        );
+        assert!(!stage.applies());
+        stage.apply(&mut out).unwrap();
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn a_format_the_dsp_does_not_cover_passes_through_even_in_eq_only() {
+        let input = sine(4096, 4000.0);
+        let mut out = input.clone();
+        let mut stage = EqStage::new(
+            &pcm(PcmCodec::PcmS24Le),
+            MODE_EQ_ONLY,
+            &state(true, 12.0),
+        );
+        assert!(!stage.applies());
+        stage.apply(&mut out).unwrap();
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn the_mode_and_the_bands_can_change_while_the_stage_runs() {
+        let input = sine(RATE as usize / 2, 4000.0);
+        let mut stage = EqStage::new(
+            &pcm(PcmCodec::PcmS16Le),
+            "passthrough",
+            &state(true, 12.0),
+        );
+        let mut a = input.clone();
+        stage.apply(&mut a).unwrap();
+        assert_eq!(a, input, "passthrough first");
+
+        stage.set_mode(MODE_EQ_ONLY);
+        let mut b = input.clone();
+        stage.apply(&mut b).unwrap();
+        assert!(db(rms(&b, 4000) / rms(&input, 4000)) > 10.0, "then boosted");
+
+        stage.set_state(&state(true, 0.0));
+        let mut c = input.clone();
+        stage.apply(&mut c).unwrap();
+        let flat = db(rms(&c, 4000) / rms(&input, 4000));
+        assert!(flat.abs() < 0.5, "then flat again, got {flat:.2} dB");
+    }
+
+    #[test]
+    fn a_misaligned_buffer_is_a_read_failure_not_a_panic() {
+        let mut out = vec![0u8; 7];
+        let mut stage = EqStage::new(
+            &pcm(PcmCodec::PcmS16Le),
+            MODE_EQ_ONLY,
+            &state(true, 6.0),
+        );
+        let err = stage.apply(&mut out).unwrap_err();
+        assert!(matches!(err, ByteFlowError::ReadFailed(_)), "got {err:?}");
+    }
+
+    fn quick() -> std::time::Duration {
+        std::time::Duration::from_millis(1)
+    }
+
+    #[tokio::test]
+    async fn an_open_that_succeeds_on_a_later_try_is_a_success() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let c = Arc::clone(&calls);
+        let r = retry_open(5, quick(), Arc::new(Notify::new()), move || {
+            let n = c.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                if n < 3 {
+                    Err(ByteFlowError::OpenFailed("busy".into()))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert_eq!(r, Ok(()));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn an_open_that_never_succeeds_fails_after_the_attempts_run_out() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let c = Arc::clone(&calls);
+        let r = retry_open(4, quick(), Arc::new(Notify::new()), move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            async { Err(ByteFlowError::OpenFailed("busy".into())) }
+        })
+        .await;
+        assert_eq!(r, Err(ByteFlowError::OpenFailed("busy".into())));
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn a_failure_that_is_not_an_open_is_not_retried() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let c = Arc::clone(&calls);
+        let r = retry_open(9, quick(), Arc::new(Notify::new()), move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            async { Err(ByteFlowError::ReadFailed("xrun".into())) }
+        })
+        .await;
+        assert_eq!(r, Err(ByteFlowError::ReadFailed("xrun".into())));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_during_the_wait_ends_the_retry_quietly() {
+        let cancel = Arc::new(Notify::new());
+        let calls = Arc::new(AtomicU32::new(0));
+        let c = Arc::clone(&calls);
+        let to_cancel = Arc::clone(&cancel);
+        let r = retry_open(
+            50,
+            std::time::Duration::from_secs(30),
+            cancel,
+            move || {
+                let first = c.fetch_add(1, Ordering::SeqCst) == 0;
+                let to_cancel = Arc::clone(&to_cancel);
+                async move {
+                    if first {
+                        to_cancel.notify_one();
+                    }
+                    Err(ByteFlowError::OpenFailed("busy".into()))
+                }
+            },
+        )
+        .await;
+        assert_eq!(r, Ok(()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

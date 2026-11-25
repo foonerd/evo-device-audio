@@ -106,6 +106,55 @@ the subject is missing or malformed, the options EQ sounds again.
 A zone's bands are applied in no mode but `eq_only`. This plugin
 does not read `zones.toml`.
 
+## Where the EQ sits in the audio path
+
+With `passthrough` selected the audio goes from the source straight
+into the DAC's pcm (`evo`): the distribution publishes a two-stage
+chain, source then delivery, and this plugin is not in the path. It
+holds no sound device in that state, whatever endpoints it was last
+given.
+
+Selecting `eq_only` changes the chain. The plugin announces its mode
+as the plugin event `composition.mode_changed` (payload
+`{ "v": 1, "mode": "<mode>" }`) when it loads, on every mode change,
+and when it takes a mode back (below). The distribution follows that
+event and publishes a three-stage chain: the source writes
+`evo_comp_in`, a fixed-format pcm on snd-aloop playback subdevice 3;
+this plugin captures subdevice 3 of the other half
+(`hw:Loopback,1,3`), runs its cascade, and plays the result into
+`evo`; delivery reads `evo` as before. Choosing `passthrough` again
+publishes the two-stage chain back, and the plugin closes its devices
+as soon as the mode leaves `eq_only`. The chain carries one format,
+44.1 kHz / 16-bit / stereo, which is what the source already renders
+in either chain.
+
+The cascade runs on the frames it moves when the mode is `eq_only`,
+the EQ is engaged, and the format is one the DSP covers (s16le and
+f32le, mono or stereo). Otherwise the frames pass byte-identical. The
+bands come from the operator's EQ, or from the engaged zone's bands
+while the delivery plugin's `eq_claim` names a zone (see above).
+
+The pcm `evo_comp_in` is defined in the distribution's `asound.conf`.
+Subdevices 0 and 7 of the loopback belong to multi-room source mode
+and the terminus tap; the EQ chain uses 3.
+
+### Opening the devices, and failing safe
+
+A rewire hands the output pcm to this plugin while the source that
+held it is still restarting, so the first open can find it busy. The
+ALSA substrate retries the open for a bounded window (20 tries,
+500 ms apart) and ends the wait at once if the chain changes. A
+device that stays unopenable for the whole window, or a read or write
+that breaks, puts the worker in `Failed`.
+
+With the EQ in the path a failed worker reads nothing and the listener
+hears silence, so the plugin takes the mode back: while the mode is
+`eq_only` and the worker is `Failed`, the mode becomes `passthrough`,
+is recorded so the next load does not repeat the failure, and is
+announced and reported to the options as above. The distribution then
+publishes the two-stage chain. `Unsupported` (a build that cannot
+drive the substrate at all) is left to say so.
+
 ## Route changes
 
 The plugin registers a `RouteChangeCallback` on `load`. On

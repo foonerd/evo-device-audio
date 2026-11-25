@@ -114,9 +114,9 @@ use evo_plugin_sdk::contract::audio_routing::{
     RouteChange, RouteChangeCallback,
 };
 use evo_plugin_sdk::contract::{
-    BuildInfo, ExternalAddressing, HealthReport, LoadContext, Plugin,
-    PluginDescription, PluginError, PluginIdentity, Request, Respondent,
-    Response, RuntimeCapabilities, ShelfRequestDispatcher,
+    BuildInfo, ExternalAddressing, HappeningEmitter, HealthReport, LoadContext,
+    Plugin, PluginDescription, PluginError, PluginIdentity, Request,
+    Respondent, Response, RuntimeCapabilities, ShelfRequestDispatcher,
     SubjectStateStreamError,
 };
 use evo_plugin_sdk::Manifest;
@@ -147,6 +147,13 @@ const REQUEST_COMPOSITION_SELECT_MODE: &str = "composition.select_mode";
 /// readable by an operator looking at why their device came back
 /// in the mode it did.
 const MODE_STATE_FILE: &str = "composition_mode";
+
+/// The plugin event announcing the composition mode in force. Emitted
+/// at load (restored or default), on every mode change, and when the
+/// fail-safe takes `eq_only` back. Not deduplicated: a consumer that
+/// starts after the plugin still learns the mode the first time the
+/// plugin loads, which a state-change feed would not tell it.
+const MODE_EVENT: &str = "composition.mode_changed";
 
 /// Wire-protocol payload version for the request/response
 /// envelope.
@@ -293,7 +300,7 @@ pub struct AlsaCompositionPlugin {
     /// pump loop observes mode changes inline and branches
     /// between passthrough and eq_only processing without
     /// restarting the substrate lifecycle.
-    mode_tx: watch::Sender<String>,
+    mode_tx: Arc<watch::Sender<String>>,
     /// Cross-shelf dispatcher, from
     /// [`LoadContext::shelf_request_dispatcher`]. Used to report
     /// the active mode onto the operator's audio-options
@@ -301,6 +308,10 @@ pub struct AlsaCompositionPlugin {
     /// mount. `None` in an in-process test harness; the steward's
     /// wire adapter always populates it in production.
     shelf_dispatcher: Option<Arc<dyn ShelfRequestDispatcher>>,
+    /// The plugin-event emitter, from [`LoadContext::happening_emitter`].
+    /// Used to announce the mode as [`MODE_EVENT`]. `None` in a unit
+    /// harness.
+    happening_emitter: Option<Arc<dyn HappeningEmitter>>,
     /// Waits between attempts to report the mode. A field so a
     /// test can shorten them; production takes
     /// [`REPORT_RETRY_DELAYS_MS`].
@@ -378,6 +389,9 @@ struct WorkerHandle {
     task: JoinHandle<()>,
     shutdown: Arc<Notify>,
     status_rx: watch::Receiver<WorkerStatus>,
+    /// The task that drops `eq_only` back to passthrough when the
+    /// worker fails (see [`fall_back_when_the_worker_fails`]).
+    fallback: JoinHandle<()>,
 }
 
 /// Handle on the reactor task spawned at load. Owns the
@@ -405,13 +419,14 @@ impl AlsaCompositionPlugin {
         let (eq_state_tx, _) = watch::channel(EqRuntimeState::default());
         Self {
             shelf_dispatcher: None,
+            happening_emitter: None,
             report_delays: REPORT_RETRY_DELAYS_MS
                 .iter()
                 .map(|ms| std::time::Duration::from_millis(*ms))
                 .collect(),
             state_dir: None,
             loaded: false,
-            mode_tx,
+            mode_tx: Arc::new(mode_tx),
             eq_state_tx,
             eq_inputs: Arc::new(std::sync::Mutex::new(EqInputs::default())),
             audio_routing: None,
@@ -487,66 +502,13 @@ impl AlsaCompositionPlugin {
     /// (an in-process harness) is silent. When the attempts run
     /// out, or the failure is an answer, it is logged once.
     fn report_mode_to_options(&self, asked: &str) {
-        let Some(dispatcher) = self.shelf_dispatcher.clone() else {
-            return;
-        };
-        let asked = asked.to_string();
-        let current = self.mode_tx.subscribe();
-        let delays = self.report_delays.clone();
-        tokio::spawn(async move {
-            let mut attempt = 0usize;
-            loop {
-                // The mode now, which is the mode asked for unless the
-                // operator has chosen again since.
-                let mode = current.borrow().clone();
-                let payload = serde_json::json!({ "v": 1, "mode": mode });
-                let Ok(bytes) = serde_json::to_vec(&payload) else {
-                    return;
-                };
-                let failure = match dispatcher
-                    .dispatch(
-                        "audio.options",
-                        "options.set_composition_mode",
-                        bytes,
-                        None,
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        if attempt > 0 {
-                            tracing::info!(
-                                plugin = PLUGIN_NAME,
-                                mode = %mode,
-                                attempts = attempt + 1,
-                                "reported the composition mode to audio \
-                                 options after retrying"
-                            );
-                        }
-                        return;
-                    }
-                    Err(e) => e,
-                };
-                if report_is_retryable(&failure) {
-                    if let Some(wait) = delays.get(attempt) {
-                        tokio::time::sleep(*wait).await;
-                        attempt += 1;
-                        continue;
-                    }
-                }
-                tracing::warn!(
-                    plugin = PLUGIN_NAME,
-                    mode = %mode,
-                    asked = %asked,
-                    attempts = attempt + 1,
-                    error = %failure,
-                    "could not report the composition mode to audio \
-                     options; the glass may paint a stale mode until the \
-                     next change. LOGGING.md §2: operator-visible state \
-                     diverging from the device."
-                );
-                return;
-            }
-        });
+        announce_mode(self.happening_emitter.clone(), self.mode_tx.subscribe());
+        report_mode_via(
+            self.shelf_dispatcher.clone(),
+            self.report_delays.clone(),
+            self.mode_tx.subscribe(),
+            asked.to_string(),
+        );
     }
 
     /// Record the active mode so the next load restores it.
@@ -556,20 +518,7 @@ impl AlsaCompositionPlugin {
     /// to warn about. A write that fails is logged, because the
     /// operator's next boot will not carry their choice.
     fn persist_mode(&self, mode: &str) {
-        let Some(path) = self.mode_state_path() else {
-            return;
-        };
-        if let Err(e) = std::fs::write(&path, format!("{}\n", mode.trim())) {
-            tracing::warn!(
-                plugin = PLUGIN_NAME,
-                path = %path.display(),
-                error = %e,
-                "could not record the active composition mode; the next \
-                 load will fall back to the default. LOGGING.md §2: an \
-                 operator's processing choice silently not surviving a \
-                 restart is the defect this records."
-            );
-        }
+        persist_mode_at(self.mode_state_path(), mode);
     }
 
     /// Read back the mode recorded by a previous load.
@@ -739,10 +688,23 @@ impl AlsaCompositionPlugin {
             .await;
         });
 
+        // A worker that fails while the EQ is the chosen path leaves
+        // the source writing into a pipe nobody reads. Drop back to
+        // passthrough so the direct chain carries the audio again.
+        let fallback = tokio::spawn(fall_back_when_the_worker_fails(
+            status_rx.clone(),
+            Arc::clone(&self.mode_tx),
+            self.mode_state_path(),
+            self.shelf_dispatcher.clone(),
+            self.happening_emitter.clone(),
+            self.report_delays.clone(),
+        ));
+
         self.worker = Some(WorkerHandle {
             task,
             shutdown,
             status_rx,
+            fallback,
         });
         Ok(())
     }
@@ -750,6 +712,7 @@ impl AlsaCompositionPlugin {
     /// Wind down the byte-flow worker task. Idempotent.
     async fn stop_worker(&mut self) {
         if let Some(handle) = self.worker.take() {
+            handle.fallback.abort();
             handle.shutdown.notify_one();
             let _ = handle.task.await;
         }
@@ -1251,9 +1214,183 @@ async fn resolve_addressing_with_backoff(
     None
 }
 
+/// Report `asked` onto the operator's audio-options settings, then
+/// keep reporting the mode in force (not `asked`) while the
+/// failure is one that passes. The body of
+/// [`AlsaCompositionPlugin::report_mode_to_options`], free of the
+/// plugin so a task that outlives a call can use it too.
+fn report_mode_via(
+    dispatcher: Option<Arc<dyn ShelfRequestDispatcher>>,
+    delays: Vec<std::time::Duration>,
+    current: watch::Receiver<String>,
+    asked: String,
+) {
+    let Some(dispatcher) = dispatcher else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut attempt = 0usize;
+        loop {
+            // The mode now, which is the mode asked for unless the
+            // operator has chosen again since.
+            let mode = current.borrow().clone();
+            let payload = serde_json::json!({ "v": 1, "mode": mode });
+            let Ok(bytes) = serde_json::to_vec(&payload) else {
+                return;
+            };
+            let failure = match dispatcher
+                .dispatch(
+                    "audio.options",
+                    "options.set_composition_mode",
+                    bytes,
+                    None,
+                )
+                .await
+            {
+                Ok(_) => {
+                    if attempt > 0 {
+                        tracing::info!(
+                            plugin = PLUGIN_NAME,
+                            mode = %mode,
+                            attempts = attempt + 1,
+                            "reported the composition mode to audio \
+                             options after retrying"
+                        );
+                    }
+                    return;
+                }
+                Err(e) => e,
+            };
+            if report_is_retryable(&failure) {
+                if let Some(wait) = delays.get(attempt) {
+                    tokio::time::sleep(*wait).await;
+                    attempt += 1;
+                    continue;
+                }
+            }
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                mode = %mode,
+                asked = %asked,
+                attempts = attempt + 1,
+                error = %failure,
+                "could not report the composition mode to audio \
+                 options; the glass may paint a stale mode until the \
+                 next change. LOGGING.md §2: operator-visible state \
+                 diverging from the device."
+            );
+            return;
+        }
+    });
+}
+
+/// Announce the mode in force as a [`MODE_EVENT`] plugin event.
+///
+/// Detached and best-effort: a refused emit is logged once and not
+/// retried, because the next mode change announces again and the
+/// chain a missed event would leave is the direct one, which is a
+/// working path. The payload carries the mode as it is when the
+/// task runs, not as it was when it was asked for.
+fn announce_mode(
+    emitter: Option<Arc<dyn HappeningEmitter>>,
+    current: watch::Receiver<String>,
+) {
+    let Some(emitter) = emitter else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mode = current.borrow().clone();
+        if let Err(e) = emitter
+            .emit_plugin_event(
+                MODE_EVENT.to_string(),
+                serde_json::json!({ "v": 1, "mode": mode }),
+            )
+            .await
+        {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                mode = %mode,
+                error = %e,
+                "could not announce the composition mode; the audio chain \
+                 follows the next announcement. LOGGING.md §2: the chain \
+                 may not match the mode until then."
+            );
+        }
+    });
+}
+
+/// Write `mode` to `path` so the next load restores it. `None` is
+/// silent: a plugin with no state directory has nothing to write to
+/// and nothing to warn about. A failed write is logged, because the
+/// operator's next boot will not carry their choice.
+fn persist_mode_at(path: Option<PathBuf>, mode: &str) {
+    let Some(path) = path else {
+        return;
+    };
+    if let Err(e) = std::fs::write(&path, format!("{}\n", mode.trim())) {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            path = %path.display(),
+            error = %e,
+            "could not record the active composition mode; the next \
+             load will fall back to the default. LOGGING.md §2: an \
+             operator's processing choice silently not surviving a \
+             restart is the defect this records."
+        );
+    }
+}
+
+/// Drop `eq_only` back to passthrough when the byte-flow worker
+/// fails.
+///
+/// With the EQ in the path the source writes into a pipe this
+/// worker reads. A worker that has failed (its devices would not
+/// open for the whole retry window, or a read or write broke) reads
+/// nothing, and the listener hears silence. The plugin owns the
+/// mode, so it takes it back: the mode becomes passthrough, is
+/// recorded so the next load does not repeat the failure, and is
+/// reported to the options so the glass and the chain controller
+/// follow. Only `Failed` counts. `Unsupported` is a build that
+/// cannot drive the substrate at all, and is left to say so.
+async fn fall_back_when_the_worker_fails(
+    mut status_rx: watch::Receiver<WorkerStatus>,
+    mode_tx: Arc<watch::Sender<String>>,
+    state_path: Option<PathBuf>,
+    dispatcher: Option<Arc<dyn ShelfRequestDispatcher>>,
+    emitter: Option<Arc<dyn HappeningEmitter>>,
+    delays: Vec<std::time::Duration>,
+) {
+    while status_rx.changed().await.is_ok() {
+        let reason = match &*status_rx.borrow_and_update() {
+            WorkerStatus::Failed { reason } => reason.clone(),
+            _ => continue,
+        };
+        if *mode_tx.borrow() != MODE_EQ_ONLY {
+            continue;
+        }
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            reason = %reason,
+            "the byte-flow worker failed while the EQ was the chosen \
+             path; returning to passthrough so the direct chain carries \
+             the audio. LOGGING.md §2: the operator's EQ is not being \
+             heard and this names why."
+        );
+        mode_tx.send_replace(MODE_PASSTHROUGH.to_string());
+        persist_mode_at(state_path.clone(), MODE_PASSTHROUGH);
+        announce_mode(emitter.clone(), mode_tx.subscribe());
+        report_mode_via(
+            dispatcher.clone(),
+            delays.clone(),
+            mode_tx.subscribe(),
+            MODE_PASSTHROUGH.to_string(),
+        );
+    }
+}
+
 async fn run_worker(
     mut endpoints_rx: watch::Receiver<Option<CompositionEndpoints>>,
-    mode_rx: watch::Receiver<String>,
+    mut mode_rx: watch::Receiver<String>,
     eq_state_rx: watch::Receiver<EqRuntimeState>,
     shutdown: Arc<Notify>,
     status_tx: watch::Sender<WorkerStatus>,
@@ -1263,11 +1400,28 @@ async fn run_worker(
         // seen so a subsequent `changed()` only fires for
         // the next publication.
         let snapshot = endpoints_rx.borrow_and_update().clone();
+        let mode = mode_rx.borrow_and_update().clone();
 
         let outcome = match snapshot {
             None => {
                 let _ = status_tx.send(WorkerStatus::Idle);
                 wait_for_next_event(&mut endpoints_rx, &shutdown).await
+            }
+            // An ALSA stage sits between the source and the
+            // output only while the EQ is in the path. In any other
+            // mode the direct chain carries the audio, and this
+            // stage must hold no device: the endpoints it was last
+            // given may be stale (a withdrawn chain is not pushed
+            // to a plugin), and opening them would take the output
+            // from the source that has it back.
+            Some(endpoints) if holds_off(&endpoints, &mode) => {
+                let _ = status_tx.send(WorkerStatus::Idle);
+                wait_for_endpoints_or_mode(
+                    &mut endpoints_rx,
+                    &mut mode_rx,
+                    &shutdown,
+                )
+                .await
             }
             Some(endpoints) => {
                 run_substrate_lifecycle(
@@ -1285,6 +1439,37 @@ async fn run_worker(
         if matches!(outcome, EventOutcome::Shutdown) {
             return;
         }
+    }
+}
+
+/// True when the worker must not drive `endpoints` in `mode`.
+///
+/// ALSA endpoints are driven only in `eq_only`. The test is made
+/// after the substrate-kind precheck so a build that cannot drive
+/// ALSA at all still reports `Unsupported` rather than going quiet.
+fn holds_off(endpoints: &CompositionEndpoints, mode: &str) -> bool {
+    alsa_waits_for_eq_only(endpoints.input.kind, mode)
+        && precheck_substrate(endpoints).is_ok()
+}
+
+/// The rule behind [`holds_off`], without the build's substrate
+/// support: an ALSA stage waits for `eq_only`; no other kind waits.
+fn alsa_waits_for_eq_only(kind: EndpointKind, mode: &str) -> bool {
+    kind == EndpointKind::AlsaPcm && mode != MODE_EQ_ONLY
+}
+
+/// Like [`wait_for_next_event`], and also wakes when the mode
+/// changes, so a held-off stage starts the moment `eq_only` is chosen.
+async fn wait_for_endpoints_or_mode(
+    endpoints_rx: &mut watch::Receiver<Option<CompositionEndpoints>>,
+    mode_rx: &mut watch::Receiver<String>,
+    shutdown: &Notify,
+) -> EventOutcome {
+    tokio::select! {
+        biased;
+        _ = shutdown.notified() => EventOutcome::Shutdown,
+        _ = endpoints_rx.changed() => EventOutcome::EndpointChanged,
+        _ = mode_rx.changed() => EventOutcome::EndpointChanged,
     }
 }
 
@@ -1353,6 +1538,11 @@ async fn run_substrate_lifecycle(
     let cancel = Arc::new(Notify::new());
     let cancel_for_run = Arc::clone(&cancel);
     let endpoints_for_run = endpoints.clone();
+    // A running ALSA stage stops when the mode leaves `eq_only`, so
+    // the output it holds goes back to the source at once. Other
+    // substrates keep pumping across a mode change, as before.
+    let mut mode_watch = mode_rx.clone();
+    let is_alsa = endpoints.input.kind == EndpointKind::AlsaPcm;
     let mode_rx_for_run = mode_rx.clone();
     let eq_state_rx_for_run = eq_state_rx.clone();
     let mut run_handle = tokio::spawn(async move {
@@ -1365,41 +1555,58 @@ async fn run_substrate_lifecycle(
         .await
     });
 
-    tokio::select! {
-        biased;
-        _ = shutdown.notified() => {
-            cancel.notify_one();
-            let _ = (&mut run_handle).await;
-            EventOutcome::Shutdown
-        }
-        res = endpoints_rx.changed() => {
-            cancel.notify_one();
-            let _ = (&mut run_handle).await;
-            if res.is_err() {
-                EventOutcome::Shutdown
-            } else {
-                EventOutcome::EndpointChanged
+    loop {
+        let outcome = tokio::select! {
+            biased;
+            _ = shutdown.notified() => {
+                cancel.notify_one();
+                let _ = (&mut run_handle).await;
+                Some(EventOutcome::Shutdown)
             }
-        }
-        result = &mut run_handle => {
-            match result {
-                Ok(Ok(())) => {
+            res = endpoints_rx.changed() => {
+                cancel.notify_one();
+                let _ = (&mut run_handle).await;
+                if res.is_err() {
+                    Some(EventOutcome::Shutdown)
+                } else {
+                    Some(EventOutcome::EndpointChanged)
+                }
+            }
+            res = mode_watch.changed(), if is_alsa => {
+                // Only a change away from `eq_only` ends the run; the
+                // same mode chosen again leaves the pump as it is.
+                if res.is_err() || *mode_watch.borrow_and_update() == MODE_EQ_ONLY {
+                    None
+                } else {
+                    cancel.notify_one();
+                    let _ = (&mut run_handle).await;
                     let _ = status_tx.send(WorkerStatus::Idle);
-                }
-                Ok(Err(e)) => {
-                    let _ = status_tx.send(WorkerStatus::Failed {
-                        reason: e.to_string(),
-                    });
-                }
-                Err(join_err) => {
-                    let _ = status_tx.send(WorkerStatus::Failed {
-                        reason: format!(
-                            "substrate task panicked: {join_err}"
-                        ),
-                    });
+                    Some(EventOutcome::EndpointChanged)
                 }
             }
-            wait_for_next_event(endpoints_rx, &shutdown).await
+            result = &mut run_handle => {
+                match result {
+                    Ok(Ok(())) => {
+                        let _ = status_tx.send(WorkerStatus::Idle);
+                    }
+                    Ok(Err(e)) => {
+                        let _ = status_tx.send(WorkerStatus::Failed {
+                            reason: e.to_string(),
+                        });
+                    }
+                    Err(join_err) => {
+                        let _ = status_tx.send(WorkerStatus::Failed {
+                            reason: format!(
+                                "substrate task panicked: {join_err}"
+                            ),
+                        });
+                    }
+                }
+                Some(wait_for_next_event(endpoints_rx, &shutdown).await)
+            }
+        };
+        if let Some(outcome) = outcome {
+            return outcome;
         }
     }
 }
@@ -1520,6 +1727,7 @@ impl Plugin for AlsaCompositionPlugin {
             self.state_dir = Some(ctx.state_dir.clone());
             self.shelf_dispatcher =
                 ctx.shelf_request_dispatcher.as_ref().map(Arc::clone);
+            self.happening_emitter = Some(Arc::clone(&ctx.happening_emitter));
             // Take the routing handle first. `install_routing` puts the
             // mode back to the default as part of coming up, so it has
             // to run before the recorded mode is restored: the other
@@ -3829,5 +4037,261 @@ mod tests {
         );
         assert!(p.worker.is_none());
         assert!(p.reactor.is_none());
+    }
+
+    // ----- the EQ-in-path fail-safe and the eq_only gate ----------
+
+    #[test]
+    fn an_alsa_stage_waits_for_eq_only_and_no_other_kind_does() {
+        assert!(alsa_waits_for_eq_only(EndpointKind::AlsaPcm, "passthrough"));
+        assert!(!alsa_waits_for_eq_only(EndpointKind::AlsaPcm, MODE_EQ_ONLY));
+        assert!(!alsa_waits_for_eq_only(
+            EndpointKind::NamedPipe,
+            "passthrough"
+        ));
+        assert!(!alsa_waits_for_eq_only(
+            EndpointKind::NamedPipe,
+            MODE_EQ_ONLY
+        ));
+    }
+
+    /// Run the fail-safe against a status channel the test drives.
+    struct FailSafe {
+        status_tx: watch::Sender<WorkerStatus>,
+        mode_tx: Arc<watch::Sender<String>>,
+        dispatcher: Arc<RecordingDispatcher>,
+        emitter: Arc<RecordingEmitter>,
+        dir: tempfile::TempDir,
+        task: JoinHandle<()>,
+    }
+
+    fn fail_safe_in(mode: &str) -> FailSafe {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dispatcher = Arc::new(RecordingDispatcher::default());
+        let emitter = Arc::new(RecordingEmitter::default());
+        let (status_tx, status_rx) = watch::channel(WorkerStatus::Idle);
+        let (mode_tx, _) = watch::channel(mode.to_string());
+        let mode_tx = Arc::new(mode_tx);
+        let task = tokio::spawn(fall_back_when_the_worker_fails(
+            status_rx,
+            Arc::clone(&mode_tx),
+            Some(dir.path().join(MODE_STATE_FILE)),
+            Some(Arc::clone(&dispatcher) as Arc<dyn ShelfRequestDispatcher>),
+            Some(Arc::clone(&emitter) as Arc<dyn HappeningEmitter>),
+            vec![std::time::Duration::from_millis(5); 2],
+        ));
+        FailSafe {
+            status_tx,
+            mode_tx,
+            dispatcher,
+            emitter,
+            dir,
+            task,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_worker_in_eq_only_returns_to_passthrough_and_says_so() {
+        let f = fail_safe_in(MODE_EQ_ONLY);
+        f.status_tx
+            .send(WorkerStatus::Failed {
+                reason: "substrate open failed: busy".into(),
+            })
+            .unwrap();
+        let calls = wait_for_dispatch(&f.dispatcher, 1).await;
+        assert_eq!(
+            *f.mode_tx.borrow(),
+            MODE_PASSTHROUGH,
+            "the mode is taken back"
+        );
+        assert_eq!(calls.len(), 1, "one report: {calls:?}");
+        assert_eq!(calls[0].0, "audio.options");
+        assert_eq!(calls[0].1, "options.set_composition_mode");
+        assert!(calls[0].2.contains("passthrough"), "{}", calls[0].2);
+        let recorded =
+            std::fs::read_to_string(f.dir.path().join(MODE_STATE_FILE))
+                .unwrap();
+        assert_eq!(
+            recorded.trim(),
+            MODE_PASSTHROUGH,
+            "so the next load does not repeat it"
+        );
+        f.task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_failed_worker_in_passthrough_changes_nothing() {
+        let f = fail_safe_in(MODE_PASSTHROUGH);
+        f.status_tx
+            .send(WorkerStatus::Failed { reason: "x".into() })
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(*f.mode_tx.borrow(), MODE_PASSTHROUGH);
+        assert!(f.dispatcher.calls.lock().unwrap().is_empty());
+        assert!(!f.dir.path().join(MODE_STATE_FILE).exists());
+        f.task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_substrate_does_not_take_the_mode_back() {
+        let f = fail_safe_in(MODE_EQ_ONLY);
+        f.status_tx
+            .send(WorkerStatus::Unsupported {
+                kind: EndpointKind::AlsaPcm,
+            })
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(*f.mode_tx.borrow(), MODE_EQ_ONLY, "left to say so");
+        assert!(f.dispatcher.calls.lock().unwrap().is_empty());
+        f.task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_running_or_idle_worker_leaves_the_mode_alone() {
+        let f = fail_safe_in(MODE_EQ_ONLY);
+        f.status_tx
+            .send(WorkerStatus::Running {
+                kind: EndpointKind::AlsaPcm,
+            })
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        f.status_tx.send(WorkerStatus::Idle).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert_eq!(*f.mode_tx.borrow(), MODE_EQ_ONLY);
+        assert!(f.dispatcher.calls.lock().unwrap().is_empty());
+        f.task.abort();
+    }
+
+    /// An emitter that records the plugin events it is asked to emit.
+    #[derive(Default)]
+    struct RecordingEmitter {
+        events: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    impl HappeningEmitter for RecordingEmitter {
+        fn emit_plugin_event<'a>(
+            &'a self,
+            event_type: String,
+            payload: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            (),
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.events.lock().unwrap().push((event_type, payload));
+                Ok(())
+            })
+        }
+        fn emit_audio_playback_ended<'a>(
+            &'a self,
+            _claim_uri: Option<String>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            (),
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Wait for the detached announcement to land, or give up.
+    async fn wait_for_events(
+        e: &Arc<RecordingEmitter>,
+        n: usize,
+    ) -> Vec<(String, serde_json::Value)> {
+        for _ in 0..100 {
+            {
+                let events = e.events.lock().unwrap();
+                if events.len() >= n {
+                    return events.clone();
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        e.events.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn the_fail_safe_announces_the_mode_it_returns_to() {
+        let f = fail_safe_in(MODE_EQ_ONLY);
+        f.status_tx
+            .send(WorkerStatus::Failed {
+                reason: "substrate open failed: busy".into(),
+            })
+            .unwrap();
+        let events = wait_for_events(&f.emitter, 1).await;
+        assert_eq!(events.len(), 1, "one announcement: {events:?}");
+        assert_eq!(events[0].0, MODE_EVENT);
+        assert_eq!(events[0].1["mode"], "passthrough");
+        assert_eq!(events[0].1["v"], 1);
+        f.task.abort();
+    }
+
+    #[tokio::test]
+    async fn choosing_a_mode_announces_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let emitter = Arc::new(RecordingEmitter::default());
+        let mut p = AlsaCompositionPlugin::new();
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.happening_emitter =
+            Some(Arc::clone(&emitter) as Arc<dyn HappeningEmitter>);
+        p.install_routing(Some(Arc::new(StubAudioRouting::new()) as _))
+            .unwrap();
+        let req = Request {
+            request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
+            payload: json!({ "v": 1, "mode": "eq_only" })
+                .to_string()
+                .into_bytes(),
+            correlation_id: 11,
+            deadline: None,
+            instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
+        };
+        let resp = p.handle_request(&req).await.unwrap();
+        assert_eq!(decode_payload(&resp.payload)["status"], "ok");
+        let events = wait_for_events(&emitter, 1).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].0, "composition.mode_changed");
+        assert_eq!(events[0].1["mode"], "eq_only");
+    }
+
+    #[tokio::test]
+    async fn a_refused_mode_is_not_announced() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let emitter = Arc::new(RecordingEmitter::default());
+        let mut p = AlsaCompositionPlugin::new();
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.happening_emitter =
+            Some(Arc::clone(&emitter) as Arc<dyn HappeningEmitter>);
+        p.install_routing(Some(Arc::new(StubAudioRouting::new()) as _))
+            .unwrap();
+        let req = Request {
+            request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
+            payload: json!({ "v": 1, "mode": "no_such_mode" })
+                .to_string()
+                .into_bytes(),
+            correlation_id: 12,
+            deadline: None,
+            instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
+        };
+        let _ = p.handle_request(&req).await;
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(emitter.events.lock().unwrap().is_empty());
     }
 }
