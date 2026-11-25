@@ -3896,11 +3896,55 @@ fn dlna_entry_matches(entry: &serde_json::Value, query_lower: &str) -> bool {
     })
 }
 
+/// Which part of a DLNA tree to walk first, from a container's name.
+///
+/// The browse answer carries no `upnp:class` for a container, so the
+/// name is what there is. Last (2): video, photo and image trees,
+/// and the pseudo-containers a media server lists beside the library
+/// (Watch Later, Recommended, `* Queue`, `* Recommendations`), which
+/// answer a browse with an error or with what is not the library.
+/// First (0): what names music. Everything else between (1). The
+/// pseudo-container check comes first, so "Music Queue" is last.
+/// A container the name does not place follows the one it is in, so
+/// a video tree stays last all the way down and a music tree first.
+fn dlna_container_tier(name: &str) -> usize {
+    const LAST: &[&str] = &[
+        "video",
+        "photo",
+        "image",
+        "picture",
+        "movie",
+        "watch later",
+        "recommended",
+        "recommendations",
+        "queue",
+    ];
+    const FIRST: &[&str] =
+        &["music", "audio", "album", "artist", "song", "track"];
+    let n = name.to_lowercase();
+    if LAST.iter().any(|w| n.contains(w)) {
+        2
+    } else if FIRST.iter().any(|w| n.contains(w)) {
+        0
+    } else {
+        1
+    }
+}
+
 /// Search one online DLNA source through the browse this plugin
-/// already uses: walk containers from the root, breadth-first,
-/// keep the items whose name or tags contain the query, in the
-/// order the server lists them. Returns the hits and whether the
-/// walk was cut short by [`DLNA_SEARCH_MAX_BROWSES`].
+/// already uses: walk containers from the root, keep the items
+/// whose name or tags contain the query. Returns the hits and
+/// whether the walk was partial: cut short by
+/// [`DLNA_SEARCH_MAX_BROWSES`], or with a container that would not
+/// browse.
+///
+/// The walk goes music first, by [`dlna_container_tier`], then the
+/// rest, then video and photo trees and the pseudo-containers; in
+/// the order the server lists them within a tier. A container that
+/// will not browse is skipped, counted and the walk goes on: the
+/// hits already found are kept. Only a root that will not browse is
+/// an error, because then nothing was searched. The same item
+/// reached by two routes is one hit.
 async fn dlna_search_via_browse(
     dispatcher: &Arc<dyn ShelfRequestDispatcher>,
     record: &SourceRecord,
@@ -3908,17 +3952,30 @@ async fn dlna_search_via_browse(
     query_lower: &str,
 ) -> Result<(Vec<serde_json::Value>, bool), VerbError> {
     let mut hits: Vec<serde_json::Value> = Vec::new();
-    let mut queue: std::collections::VecDeque<String> =
-        std::collections::VecDeque::from([String::new()]);
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut frontier: [std::collections::VecDeque<String>; 3] = [
+        std::collections::VecDeque::from([String::new()]),
+        std::collections::VecDeque::new(),
+        std::collections::VecDeque::new(),
+    ];
     let mut browses = 0usize;
-    while let Some(container) = queue.pop_front() {
+    let mut skipped = 0usize;
+    'walk: loop {
+        let Some((parent_tier, container)) = frontier
+            .iter_mut()
+            .enumerate()
+            .find_map(|(i, tier)| tier.pop_front().map(|c| (i, c)))
+        else {
+            break;
+        };
         let mut page = 0usize;
         loop {
             if browses >= DLNA_SEARCH_MAX_BROWSES {
                 return Ok((hits, true));
             }
             browses += 1;
-            let answer = browse_dlna_via_source_dlna(
+            let answer = match browse_dlna_via_source_dlna(
                 dispatcher,
                 &record.id,
                 service_id,
@@ -3927,7 +3984,23 @@ async fn dlna_search_via_browse(
                 evo_dlna::DLNA_PAGE_HARD_CAP as usize,
                 &record.state,
             )
-            .await?;
+            .await
+            {
+                Ok(a) => a,
+                // Nothing was searched: the source is down.
+                Err(e) if browses == 1 => return Err(e),
+                Err(e) => {
+                    tracing::debug!(
+                        plugin = PLUGIN_NAME,
+                        source_id = %record.id,
+                        container = %container,
+                        error = %e,
+                        "search_library: a dlna container would not browse; skipped"
+                    );
+                    skipped += 1;
+                    continue 'walk;
+                }
+            };
             let entries = answer
                 .get("entries")
                 .and_then(|v| v.as_array())
@@ -3940,12 +4013,34 @@ async fn dlna_search_via_browse(
                         if let Some(id) =
                             entry.get("uri").and_then(|v| v.as_str())
                         {
-                            queue.push_back(id.to_string());
+                            let name = entry
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            // A container inside a video or photo tree
+                            // stays last; one the name does not place
+                            // follows the container it is in.
+                            let tier = match (
+                                parent_tier,
+                                dlna_container_tier(name),
+                            ) {
+                                (2, _) | (_, 2) => 2,
+                                (_, 0) => 0,
+                                (parent, _) => parent,
+                            };
+                            frontier[tier].push_back(id.to_string());
                         }
                     }
                     _ => {
                         if dlna_entry_matches(&entry, query_lower) {
-                            hits.push(entry);
+                            let key = entry
+                                .get("uri")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if key.is_empty() || seen.insert(key) {
+                                hits.push(entry);
+                            }
                         }
                     }
                 }
@@ -3956,7 +4051,57 @@ async fn dlna_search_via_browse(
             }
         }
     }
-    Ok((hits, false))
+    Ok((hits, skipped > 0))
+}
+
+/// How well one hit matches the query, 0 to 100. The best match
+/// wins: the title equal to the query 100, starting with it 80,
+/// containing it 60; then the artist 40, the album 30, the file's
+/// own name 20. A hit that matched on some other tag scores 0 and
+/// is still in the list, after those that matched on these.
+///
+/// A DLNA item has no file name: its `name` is its title.
+fn search_score(item: &serde_json::Value, query_lower: &str) -> u32 {
+    let q = query_lower.trim();
+    if q.is_empty() {
+        return 0;
+    }
+    let field = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_lowercase())
+    };
+    let uri = item.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+    let is_dlna = uri.starts_with("dlna:");
+    let title =
+        field("title").or_else(|| if is_dlna { field("name") } else { None });
+    if let Some(t) = &title {
+        let t = t.trim();
+        if t == q {
+            return 100;
+        }
+        if t.starts_with(q) {
+            return 80;
+        }
+        if t.contains(q) {
+            return 60;
+        }
+    }
+    if field("artist").is_some_and(|a| a.contains(q)) {
+        return 40;
+    }
+    if field("album").is_some_and(|a| a.contains(q)) {
+        return 30;
+    }
+    let leaf = if is_dlna {
+        None
+    } else {
+        uri.rsplit('/').next().map(|s| s.to_lowercase())
+    };
+    if leaf.is_some_and(|l| l.contains(q)) {
+        return 20;
+    }
+    0
 }
 
 /// `library.search_library` — one query, one ranked list.
@@ -3970,9 +4115,12 @@ async fn dlna_search_via_browse(
 /// filled with invented hits. A source that was asked and failed,
 /// or whose DLNA walk was cut short, is named there too.
 ///
-/// Order: the local library, then USB and NAS, then DLNA, then
-/// cloud; two sources of the same rank by source id; within one
-/// source, that source's own order. A forgotten track is omitted.
+/// Order: by how well the hit matches the query ([`search_score`]),
+/// best first; hits that match alike stay in source order: the
+/// local library, then USB and NAS, then DLNA, then cloud; two
+/// sources of the same rank by source id; within one source, that
+/// source's own order. The list is cut after it is ranked. A
+/// forgotten track is omitted.
 /// An offline or retired source stays out, as before.
 pub(crate) async fn handle_search_library(
     ctx: &LibraryContext,
@@ -4150,6 +4298,11 @@ pub(crate) async fn handle_search_library(
     if let Some(hits) = by_source.remove(&None) {
         results.extend(hits);
     }
+    // Rank by how well each hit matches. The sort is stable, so hits
+    // that score alike stay in the source order built above: local,
+    // then USB and NAS, then DLNA, then cloud. The cut comes after.
+    let q = payload.query.trim().to_lowercase();
+    results.sort_by_key(|r| std::cmp::Reverse(search_score(r, &q)));
     let truncated = results.len() > max_results;
     results.truncate(max_results);
     Ok(json!({
@@ -7718,6 +7871,102 @@ mod search_tests {
                         shelf: "audio.dlna".to_string(),
                     });
                 }
+                // A media server shaped like Plex: video, music and
+                // photo trees, and pseudo-containers that will not browse.
+                if service == "svc-plex" {
+                    let dir = |name: &str, id: &str| json!({ "kind": "directory", "name": name, "path": id, "uri": id });
+                    let item = |title: &str, id: &str| json!({ "kind": "item", "name": title, "title": title, "path": id, "uri": format!("dlna:svc-plex/{id}") });
+                    let entries = match object.as_str() {
+                        "0" => vec![
+                            dir("Video", "v"),
+                            dir("Music", "m"),
+                            dir("Photos", "p"),
+                        ],
+                        "v" => vec![
+                            dir("Watch Later", "wl"),
+                            dir("Recommended", "rec"),
+                            dir("Archive", "arch0"),
+                        ],
+                        "m" => vec![
+                            dir("Family Music", "fm"),
+                            dir("Music Queue", "mq"),
+                            dir("Music Recommendations", "mr"),
+                        ],
+                        "fm" => vec![
+                            item("Blue Monday trust", "bm"),
+                            dir("Recently Added", "ra"),
+                        ],
+                        "ra" => vec![
+                            item("Blue Monday trust", "bm"),
+                            item("Another trust", "at"),
+                        ],
+                        "p" => vec![dir("Photo Queue", "pq")],
+                        id if id.starts_with("arch") => {
+                            let n: usize = id[4..].parse().unwrap_or(0);
+                            vec![
+                                dir("Archive", &format!("arch{}", n + 1)),
+                                item("Home trust video", &format!("hv{n}")),
+                            ]
+                        }
+                        // wl, rec, mq, mr, pq: pseudo-containers.
+                        _ => {
+                            return Err(ShelfDispatchError::Permanent {
+                                detail: "soap: HTTP 500 Internal Server Error"
+                                    .to_string(),
+                            })
+                        }
+                    };
+                    let body = json!({
+                        "v": 1, "status": "ok", "service_id": service,
+                        "path": object, "entries": entries,
+                        "page": 0, "page_size": 100, "total": 2,
+                        "truncated": false, "next_page": null,
+                    });
+                    return Ok(serde_json::to_vec(&body).unwrap());
+                }
+                // Hits that match "autumn" in each way the score knows.
+                if service == "svc-rank" {
+                    let it = |title: &str,
+                              artist: Option<&str>,
+                              album: Option<&str>,
+                              id: &str| {
+                        let mut v = json!({ "kind": "item", "name": title, "title": title, "path": id, "uri": format!("dlna:svc-rank/{id}") });
+                        if let Some(a) = artist {
+                            v["artist"] = json!(a);
+                        }
+                        if let Some(a) = album {
+                            v["album"] = json!(a);
+                        }
+                        v
+                    };
+                    let entries = vec![
+                        it("Zzz", None, Some("Autumn Songs"), "album"),
+                        it("Other", Some("Autumn Band"), None, "artist"),
+                        it("Last Autumn", None, None, "contains"),
+                        it("Autumn Leaves", None, None, "prefix"),
+                        it("Autumn", None, None, "exact"),
+                    ];
+                    let body = json!({
+                        "v": 1, "status": "ok", "service_id": service,
+                        "path": object, "entries": entries,
+                        "page": 0, "page_size": 100, "total": 5,
+                        "truncated": false, "next_page": null,
+                    });
+                    return Ok(serde_json::to_vec(&body).unwrap());
+                }
+                // One hit that ties the USB hit's score.
+                if service == "svc-tie" {
+                    let entries = vec![
+                        json!({ "kind": "item", "name": "the trust", "title": "the trust", "path": "t", "uri": "dlna:svc-tie/t" }),
+                    ];
+                    let body = json!({
+                        "v": 1, "status": "ok", "service_id": service,
+                        "path": object, "entries": entries,
+                        "page": 0, "page_size": 100, "total": 1,
+                        "truncated": false, "next_page": null,
+                    });
+                    return Ok(serde_json::to_vec(&body).unwrap());
+                }
                 let entries = if service == "svc-deep" {
                     vec![
                         json!({ "kind": "directory", "name": "deeper", "path": format!("{object}/d"), "uri": format!("{object}/d") }),
@@ -7935,21 +8184,25 @@ mod search_tests {
         let s = stamps(&v);
         assert_eq!(
             s,
+            // Ranked by match: the title "trust" is exact, "song trust"
+            // contains it, and the file under no source has no title.
             vec![
                 (LOCAL_HIT.to_string(), json!("local-internal")),
-                (NOWHERE_HIT.to_string(), serde_json::Value::Null),
                 (USB_HIT.to_string(), json!("usb-1")),
+                (NOWHERE_HIT.to_string(), serde_json::Value::Null),
             ],
             "{v}"
         );
         assert!(v["stale_sources"].as_array().unwrap().is_empty(), "{v}");
     }
 
-    /// The list is ranked: the local library, then USB and NAS,
-    /// then DLNA, then cloud — whatever order MPD or the registry
-    /// answered in. Within a source, that source's own order.
+    /// The list is one list, ranked by how well each hit matches,
+    /// across every source: the title "trust" exactly (local, 100),
+    /// a DLNA title starting with it (80), a USB title containing it
+    /// (60), a DLNA album match (30), a file that matched only on its
+    /// own name (20). The cloud source is named, not listed.
     #[tokio::test]
-    async fn the_list_is_ranked_local_then_usb_then_dlna() {
+    async fn the_list_is_ranked_by_match_across_sources() {
         let mut h =
             harness(vec![dlna("dlna-1", "svc-1"), cloud("cloud-1")]).await;
         let v = search(&mut h, false).await;
@@ -7959,13 +8212,237 @@ mod search_tests {
             ids,
             vec![
                 json!("local-internal"),
-                serde_json::Value::Null,
+                json!("dlna-1"),
                 json!("usb-1"),
                 json!("dlna-1"),
-                json!("dlna-1"),
+                serde_json::Value::Null,
             ],
             "{v}"
         );
+        assert_eq!(v["stale_sources"], json!(["cloud-1"]), "{v}");
+    }
+
+    /// Hits that score alike keep the source order: local, then USB
+    /// and NAS, then DLNA, then cloud. The USB title "song trust" and
+    /// the DLNA title "the trust" both contain the query.
+    #[tokio::test]
+    async fn hits_that_tie_stay_in_source_order() {
+        let mut h = harness(vec![dlna("dlna-tie", "svc-tie")]).await;
+        let v = search(&mut h, false).await;
+        let ids: Vec<serde_json::Value> =
+            stamps(&v).into_iter().map(|(_, id)| id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                json!("local-internal"),
+                json!("usb-1"),
+                json!("dlna-tie"),
+                serde_json::Value::Null,
+            ],
+            "{v}"
+        );
+    }
+
+    async fn search_for(
+        h: &mut Harness,
+        query: &str,
+        max_results: u32,
+    ) -> serde_json::Value {
+        handle_search_library(
+            &h.ctx,
+            &mut h.conn,
+            SearchLibraryPayload {
+                v: 1,
+                query: query.into(),
+                source_ids: Some(vec!["dlna-rank".into()]),
+                include_offline: false,
+                max_results,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The score order, from one source that lists the hits worst
+    /// first: exact title 100, title prefix 80, title contains 60,
+    /// artist 40, album 30. The exact title is above its album-mates.
+    #[tokio::test]
+    async fn the_exact_title_is_above_the_title_prefix_contains_artist_and_album(
+    ) {
+        let mut h = harness(vec![dlna("dlna-rank", "svc-rank")]).await;
+        let v = search_for(&mut h, "autumn", 50).await;
+        let order: Vec<String> =
+            stamps(&v).into_iter().map(|(uri, _)| uri).collect();
+        assert_eq!(
+            order,
+            vec![
+                "dlna:svc-rank/exact",
+                "dlna:svc-rank/prefix",
+                "dlna:svc-rank/contains",
+                "dlna:svc-rank/artist",
+                "dlna:svc-rank/album",
+            ],
+            "{v}"
+        );
+    }
+
+    /// The list is cut after it is ranked: the best match survives a
+    /// cut that would have dropped it in the order the server listed.
+    #[tokio::test]
+    async fn the_cut_comes_after_the_ranking() {
+        let mut h = harness(vec![dlna("dlna-rank", "svc-rank")]).await;
+        let v = search_for(&mut h, "autumn", 2).await;
+        let order: Vec<String> =
+            stamps(&v).into_iter().map(|(uri, _)| uri).collect();
+        assert_eq!(
+            order,
+            vec!["dlna:svc-rank/exact", "dlna:svc-rank/prefix"],
+            "{v}"
+        );
+        assert_eq!(v["truncated"], json!(true), "{v}");
+    }
+
+    /// Pure scores, so a change to a weight is a failing line here.
+    #[test]
+    fn the_scores_are_the_ruled_ones() {
+        let t =
+            |title: &str| json!({ "title": title, "uri": "INTERNAL/x/y.flac" });
+        assert_eq!(search_score(&t("Autumn"), "autumn"), 100);
+        assert_eq!(search_score(&t("Autumn Leaves"), "autumn"), 80);
+        assert_eq!(search_score(&t("Last Autumn"), "autumn"), 60);
+        assert_eq!(
+            search_score(
+                &json!({ "title": "x", "artist": "The Autumn", "uri": "a/b.flac" }),
+                "autumn"
+            ),
+            40
+        );
+        assert_eq!(
+            search_score(
+                &json!({ "title": "x", "album": "Autumn", "uri": "a/b.flac" }),
+                "autumn"
+            ),
+            30
+        );
+        assert_eq!(
+            search_score(
+                &json!({ "uri": "INTERNAL/autumn/01.flac", "name": "01.flac" }),
+                "autumn"
+            ),
+            0,
+            "a folder name is not the file's own name"
+        );
+        assert_eq!(
+            search_score(&json!({ "uri": "INTERNAL/a/autumn.flac" }), "autumn"),
+            20
+        );
+        // A DLNA item's name is its title.
+        assert_eq!(
+            search_score(
+                &json!({ "name": "Autumn", "uri": "dlna:s/1" }),
+                "autumn"
+            ),
+            100
+        );
+        assert_eq!(search_score(&t("anything"), ""), 0);
+    }
+
+    fn plex_browses(h: &Harness) -> Vec<String> {
+        h.dispatcher
+            .browses
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| b.rsplit(' ').next().unwrap().to_string())
+            .collect()
+    }
+
+    /// Music is walked before video and photo trees and before the
+    /// pseudo-containers, whatever order the server listed them in.
+    #[tokio::test]
+    async fn music_is_walked_before_video_and_photo() {
+        let mut h = harness(vec![dlna("dlna-plex", "svc-plex")]).await;
+        let v = search(&mut h, false).await;
+        let order = plex_browses(&h);
+        assert_eq!(
+            &order[..3],
+            &["0", "m", "fm"],
+            "root, Music, Family Music before Video/Photos: {order:?}"
+        );
+        assert!(
+            stamps(&v).iter().any(|(uri, _)| uri == "dlna:svc-plex/bm"),
+            "the Music hit is in the list: {v}"
+        );
+    }
+
+    /// A container that will not browse is skipped and the walk goes
+    /// on; the hits already found are kept, the source is named stale
+    /// because the walk was partial, and the same item reached by two
+    /// routes is one hit.
+    #[tokio::test]
+    async fn a_container_that_will_not_browse_is_skipped_and_the_hits_are_kept()
+    {
+        let mut h = harness(vec![dlna("dlna-plex", "svc-plex")]).await;
+        let v = search(&mut h, false).await;
+        let plex: Vec<String> = stamps(&v)
+            .into_iter()
+            .filter(|(_, id)| id == "dlna-plex")
+            .map(|(uri, _)| uri)
+            .collect();
+        assert!(
+            plex.contains(&"dlna:svc-plex/bm".to_string())
+                && plex.contains(&"dlna:svc-plex/at".to_string()),
+            "hits found before and after the failures are kept: {plex:?}"
+        );
+        assert_eq!(
+            plex.iter().filter(|u| *u == "dlna:svc-plex/bm").count(),
+            1,
+            "one item reached twice is one hit: {plex:?}"
+        );
+        let order = plex_browses(&h);
+        // `wl` (Watch Later) will not browse; the walk still reaches
+        // what was queued behind it.
+        let failed = order.iter().position(|o| o == "wl").expect("wl browsed");
+        let after = order
+            .iter()
+            .position(|o| o == "arch0")
+            .expect("arch0 browsed");
+        assert!(
+            after > failed,
+            "the walk went on past a failed container: {order:?}"
+        );
+        assert_eq!(v["stale_sources"], json!(["dlna-plex"]), "{v}");
+    }
+
+    /// The video tree is bottomless; the music hits still arrive,
+    /// inside the budget, because the video tree is walked last.
+    #[tokio::test]
+    async fn a_bottomless_video_tree_does_not_starve_the_music() {
+        let mut h = harness(vec![dlna("dlna-plex", "svc-plex")]).await;
+        let v = search(&mut h, false).await;
+        assert!(
+            h.dispatcher.browses.lock().unwrap().len()
+                <= DLNA_SEARCH_MAX_BROWSES
+        );
+        assert!(
+            stamps(&v).iter().any(|(uri, _)| uri == "dlna:svc-plex/at"),
+            "{v}"
+        );
+    }
+
+    /// Names that decide the walk order.
+    #[test]
+    fn the_container_tiers() {
+        assert_eq!(dlna_container_tier("Music"), 0);
+        assert_eq!(dlna_container_tier("Family Music"), 0);
+        assert_eq!(dlna_container_tier("Albums"), 0);
+        assert_eq!(dlna_container_tier("Recently Added"), 1);
+        assert_eq!(dlna_container_tier("Video"), 2);
+        assert_eq!(dlna_container_tier("Photos"), 2);
+        assert_eq!(dlna_container_tier("Watch Later"), 2);
+        assert_eq!(dlna_container_tier("Recommended"), 2);
+        assert_eq!(dlna_container_tier("Music Queue"), 2);
+        assert_eq!(dlna_container_tier("Music Recommendations"), 2);
     }
 
     /// An online DLNA source is searched through its browse: the
