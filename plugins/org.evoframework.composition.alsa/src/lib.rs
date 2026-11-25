@@ -1520,6 +1520,12 @@ impl Plugin for AlsaCompositionPlugin {
             self.state_dir = Some(ctx.state_dir.clone());
             self.shelf_dispatcher =
                 ctx.shelf_request_dispatcher.as_ref().map(Arc::clone);
+            // Take the routing handle first. `install_routing` puts the
+            // mode back to the default as part of coming up, so it has
+            // to run before the recorded mode is restored: the other
+            // way round it overwrote the operator's saved mode with
+            // passthrough on every load, after the report had gone out.
+            self.install_routing(ctx.audio_routing.clone())?;
             // Restore the operator's mode before the substrate
             // starts, so the first worker subscribes to the mode
             // they chose rather than to the default and then
@@ -1539,7 +1545,6 @@ impl Plugin for AlsaCompositionPlugin {
             // eq_only since before the glass existed still has to
             // say so the first time anything asks.
             self.report_mode_to_options(&self.current_mode());
-            self.install_routing(ctx.audio_routing.clone())?;
             self.spawn_reactor().await?;
             self.spawn_worker().await?;
             // Subscribe to `audio.options.settings` so operator
@@ -1927,6 +1932,22 @@ mod tests {
             restore < spawn,
             "the mode must be restored before the substrate starts"
         );
+        // And after the routing handle is taken. `install_routing`
+        // resets the mode to the default; a restore made before it
+        // is overwritten, and the device comes up in passthrough
+        // over a saved eq_only.
+        let install = body
+            .find("self.install_routing(")
+            .expect("load must install the routing handle");
+        assert!(
+            install < restore,
+            "the recorded mode must be restored after install_routing, \
+             which resets the mode"
+        );
+        let report = body
+            .find("self.report_mode_to_options(")
+            .expect("load must report the mode");
+        assert!(restore < report, "the mode reported is the restored one");
 
         // And the glass is told what this load came up in.
         // Persisting the mode is invisible to an operator whose
