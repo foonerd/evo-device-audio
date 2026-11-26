@@ -388,6 +388,45 @@ fn render_mixer_block(mixer: &MixerConfig) -> String {
     }
 }
 
+/// The mixer an already-rendered fragment carries: the `mixer_type`
+/// (and for hardware, `mixer_device` and `mixer_control`) of its first
+/// `audio_output` block, the one this renderer writes for the
+/// operator's output. `None` when the text carries no usable mixer: no
+/// `audio_output`, an unknown `mixer_type`, or a hardware mixer missing
+/// its device or control.
+///
+/// The fragment on disk is what the operator's options produced the
+/// last time they were applied. A worker that starts from it renders
+/// what is already there, rather than a default it must then correct,
+/// and so does not restart MPD twice to arrive where it began.
+pub fn mixer_config_from_fragment(text: &str) -> Option<MixerConfig> {
+    let start = text.find("audio_output")?;
+    let rest = &text[start..];
+    let open = rest.find('{')?;
+    let close = rest[open..].find('}')? + open;
+    let block = &rest[open + 1..close];
+    let value = |key: &str| -> Option<String> {
+        block.lines().find_map(|l| {
+            let l = l.trim();
+            let tail = l.strip_prefix(key)?;
+            if !tail.starts_with(|c: char| c.is_whitespace()) {
+                return None;
+            }
+            let v = tail.trim().strip_prefix('"')?.strip_suffix('"')?;
+            Some(v.to_string())
+        })
+    };
+    match value("mixer_type")?.as_str() {
+        "hardware" => Some(MixerConfig::Hardware {
+            mixer_device: value("mixer_device")?,
+            mixer_control: value("mixer_control")?,
+        }),
+        "software" => Some(MixerConfig::Software),
+        "none" => Some(MixerConfig::None),
+        _ => None,
+    }
+}
+
 /// Render an [`AudioFormat`] into MPD's `<rate>:<bits>:<channels>`
 /// audio-output format string.
 ///
@@ -1015,6 +1054,78 @@ mod tests {
             other => {
                 panic!("expected MixerDeviceCardIndexNotFound, got {other:?}")
             }
+        }
+    }
+
+    // ----- the mixer a fragment already carries ------------------
+
+    fn ep() -> WriteEndpoint {
+        WriteEndpoint {
+            kind: EndpointKind::AlsaPcm,
+            path: std::path::PathBuf::from("evo"),
+            format: AudioFormat::Pcm {
+                codec: PcmCodec::PcmS16Le,
+                rate_hz: 44_100,
+                channels: 2,
+            },
+            buffer_frames: 0,
+        }
+    }
+
+    /// What the renderer writes, the parser reads back, for every mixer
+    /// the renderer can write.
+    #[test]
+    fn the_mixer_a_fragment_carries_reads_back_as_it_was_rendered() {
+        for mixer in [
+            MixerConfig::Software,
+            MixerConfig::None,
+            MixerConfig::Hardware {
+                mixer_device: "hw:CARD=DAC".to_string(),
+                mixer_control: "Digital".to_string(),
+            },
+            MixerConfig::Hardware {
+                mixer_device: "hw:0".to_string(),
+                mixer_control: "PCM Playback Volume".to_string(),
+            },
+        ] {
+            let text = render_audio_output_fragment(&ep(), &mixer).unwrap();
+            assert_eq!(
+                mixer_config_from_fragment(&text),
+                Some(mixer.clone()),
+                "{mixer:?}\n{text}"
+            );
+        }
+    }
+
+    /// Only the first output's mixer counts: the terminus tap that
+    /// follows it always has `mixer_type "none"`.
+    #[test]
+    fn only_the_first_outputs_mixer_is_read() {
+        let hw = MixerConfig::Hardware {
+            mixer_device: "hw:CARD=DAC".to_string(),
+            mixer_control: "Digital".to_string(),
+        };
+        let text = render_audio_output_fragment(&ep(), &hw).unwrap();
+        assert!(text.contains("mixer_type      \"none\""), "the tap is none");
+        assert_eq!(mixer_config_from_fragment(&text), Some(hw));
+    }
+
+    /// Anything that is not a usable mixer reads as nothing, so the
+    /// worker keeps its default rather than a guess.
+    #[test]
+    fn a_fragment_without_a_usable_mixer_reads_as_none() {
+        for text in [
+            "",
+            "restore_paused \"yes\"\n",
+            "audio_output {\n    type \"alsa\"\n}\n",
+            "audio_output {\n    mixer_type \"hardware\"\n}\n",
+            "audio_output {\n    mixer_type \"hardware\"\n    mixer_device \"hw:0\"\n}\n",
+            "audio_output {\n    mixer_type \"hardware\"\n    mixer_control \"Digital\"\n}\n",
+            "audio_output {\n    mixer_type \"magic\"\n}\n",
+            "audio_output {\n    mixer_type hardware\n}\n",
+            "audio_output {\n    mixer_type \"software",
+        ] {
+            assert_eq!(mixer_config_from_fragment(text), None, "{text:?}");
         }
     }
 }

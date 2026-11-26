@@ -983,6 +983,9 @@ impl MpdPlaybackPlugin {
             .expect("reactor populated")
             .endpoints_rx
             .clone();
+        // Before the worker subscribes, so it starts from the operator's
+        // last-applied mixer and not from the default.
+        seed_mixer_from_fragment(&self.fragment_path, &self.mixer_config_tx);
         let mixer_rx = self.mixer_config_tx.subscribe();
         let (status_tx, status_rx) = watch::channel(FragmentWorkerStatus::Idle);
         let shutdown = Arc::new(Notify::new());
@@ -1928,6 +1931,34 @@ async fn apply_fragment_cycle(
 ///
 /// Isolated from `apply_fragment_cycle` so the dedupe rule is
 /// unit-testable without a filesystem or a restarter mock.
+/// Start the mixer channel from the fragment already on disk.
+///
+/// The channel is seeded with `MixerConfig::Software` before the
+/// operator's options have been read. A fragment worker that rendered
+/// from that default wrote a software mixer over the operator's
+/// hardware one and restarted MPD, then wrote the hardware one back a
+/// second later and restarted it again: two restarts at every boot to
+/// end where it began. The fragment on disk is what the options last
+/// produced, so the worker starts from it, finds nothing to change,
+/// and leaves MPD alone; the options subscriber then confirms the same
+/// value, or corrects it once when the operator has changed it since.
+///
+/// An unreadable or unparseable fragment seeds nothing, and the
+/// default stands, as before. Returns whether the channel was seeded.
+fn seed_mixer_from_fragment(
+    path: &std::path::Path,
+    tx: &watch::Sender<MixerConfig>,
+) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Some(cfg) = mpd_fragment::mixer_config_from_fragment(&text) else {
+        return false;
+    };
+    tx.send_replace(cfg);
+    true
+}
+
 /// Publish a mixer config only when it differs from the one
 /// already on the channel. Returns `true` when subscribers were
 /// notified.
@@ -6914,5 +6945,93 @@ mod tests {
 
         drop(tx);
         handle.shutdown().await;
+    }
+
+    // ----- the worker starts from the fragment on disk ----------
+
+    fn hw() -> MixerConfig {
+        MixerConfig::Hardware {
+            mixer_device: "hw:CARD=DAC".to_string(),
+            mixer_control: "Digital".to_string(),
+        }
+    }
+
+    /// The channel starts from what the fragment on disk carries, so a
+    /// worker that renders at once renders what is already there and
+    /// the dedupe finds nothing to change.
+    #[test]
+    fn the_mixer_channel_starts_from_the_fragment_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mpd.conf");
+        let text = render_audio_output_fragment(
+            &WriteEndpoint {
+                kind: evo_plugin_sdk::contract::audio_routing::EndpointKind::AlsaPcm,
+                path: PathBuf::from("evo"),
+                format: evo_plugin_sdk::audio::AudioFormat::Pcm {
+                    codec: evo_plugin_sdk::audio::PcmCodec::PcmS16Le,
+                    rate_hz: 44_100,
+                    channels: 2,
+                },
+                buffer_frames: 0,
+            },
+            &hw(),
+        )
+        .unwrap();
+        std::fs::write(&path, &text).unwrap();
+        let (tx, rx) = watch::channel(MixerConfig::Software);
+        assert!(seed_mixer_from_fragment(&path, &tx));
+        assert_eq!(*rx.borrow(), hw());
+        // The options subscriber then confirms the same value: nothing
+        // to publish, so no render cycle wakes.
+        assert!(!publish_mixer_config_if_changed(&tx, hw()));
+    }
+
+    /// A missing, unreadable or unusable fragment seeds nothing.
+    #[test]
+    fn a_missing_or_unusable_fragment_leaves_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = watch::channel(MixerConfig::Software);
+        assert!(!seed_mixer_from_fragment(&dir.path().join("absent"), &tx));
+        let junk = dir.path().join("junk");
+        std::fs::write(&junk, "not a fragment").unwrap();
+        assert!(!seed_mixer_from_fragment(&junk, &tx));
+        assert_eq!(*rx.borrow(), MixerConfig::Software);
+    }
+
+    /// The first cycle from the seed is a no-op against the file it
+    /// came from: nothing is written and MPD is not restarted.
+    #[tokio::test]
+    async fn the_first_cycle_from_the_seed_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mpd.conf");
+        let ep = WriteEndpoint {
+            kind:
+                evo_plugin_sdk::contract::audio_routing::EndpointKind::AlsaPcm,
+            path: PathBuf::from("evo"),
+            format: evo_plugin_sdk::audio::AudioFormat::Pcm {
+                codec: evo_plugin_sdk::audio::PcmCodec::PcmS16Le,
+                rate_hz: 44_100,
+                channels: 2,
+            },
+            buffer_frames: 0,
+        };
+        std::fs::write(
+            &path,
+            render_audio_output_fragment(&ep, &hw()).unwrap(),
+        )
+        .unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let (tx, rx) = watch::channel(MixerConfig::Software);
+        seed_mixer_from_fragment(&path, &tx);
+        let restarter = crate::mpd_restart::NoOpRestarter::new();
+        let status =
+            apply_fragment_cycle(&ep, &rx.borrow().clone(), &path, &restarter)
+                .await;
+        assert_eq!(status, FragmentWorkerStatus::Idle);
+        assert_eq!(restarter.call_count(), 0, "MPD is not restarted");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
     }
 }
