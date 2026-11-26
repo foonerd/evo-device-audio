@@ -261,13 +261,78 @@ fn os_is_pretty_name_with_its_quotes_removed() {
 fn the_cpu_is_the_first_model_name_and_the_processor_count() {
     let arm = "processor\t: 0\nBogoMIPS\t: 108.00\n\nprocessor\t: 1\n\n\
                processor\t: 2\n\nprocessor\t: 3\nModel\t\t: Raspberry Pi 5\n";
-    assert_eq!(cpu_model(arm), None, "no model name line on this ARM");
+    assert_eq!(
+        cpu_model(arm),
+        None,
+        "no model name line and no implementer or part: no guess"
+    );
     assert_eq!(cpu_cores(arm), Some(4));
     assert_eq!(
         cpu_model("model name : First\nmodel name : Second\n").as_deref(),
         Some("First")
     );
     assert_eq!(cpu_cores("model name : X\n"), None);
+}
+
+/// An Arm kernel writes no `model name`; the core comes from the first
+/// `CPU implementer` and `CPU part`, for Arm Ltd cores this knows, and
+/// is `None` for any other part or implementer. A `model name`, where
+/// there is one, wins.
+#[test]
+fn an_arm_core_is_named_from_its_implementer_and_part() {
+    let pi = |part: &str| {
+        format!(
+            "processor\t: 0\nBogoMIPS\t: 108.00\nCPU implementer\t: 0x41\n\
+             CPU architecture: 8\nCPU variant\t: 0x4\nCPU part\t: {part}\n\
+             CPU revision\t: 1\n\nprocessor\t: 1\nCPU implementer\t: 0x41\n\
+             CPU part\t: {part}\n"
+        )
+    };
+    for (part, core) in [
+        ("0xd0b", "Cortex-A76"),
+        ("0xd08", "Cortex-A72"),
+        ("0xd03", "Cortex-A53"),
+        ("0xD0B", "Cortex-A76"),
+    ] {
+        assert_eq!(cpu_model(&pi(part)).as_deref(), Some(core), "{part}");
+    }
+    assert_eq!(cpu_model(&pi("0xd99")), None, "a part this does not know");
+    assert_eq!(
+        cpu_model("CPU implementer\t: 0x51\nCPU part\t: 0xd0b\n"),
+        None,
+        "another implementer's 0xd0b is not a Cortex-A76"
+    );
+    assert_eq!(cpu_model("CPU implementer\t: 0x41\n"), None, "no part");
+    assert_eq!(cpu_model("CPU part\t: 0xd0b\n"), None, "no implementer");
+    assert_eq!(
+        cpu_model("model name\t: Some CPU\nCPU implementer\t: 0x41\nCPU part\t: 0xd0b\n")
+            .as_deref(),
+        Some("Some CPU"),
+        "a model name wins"
+    );
+}
+
+/// A Raspberry Pi 5 as `/proc/cpuinfo` shows it: the answer carries the
+/// core and the processor count, and the board stays in `model`.
+#[test]
+fn a_raspberry_pi_5_answers_its_core_and_its_board() {
+    let pi = Fixture::new();
+    pi.put("proc/device-tree/model", "Raspberry Pi 5 Model B Rev 1.0\0")
+        .put(
+            "proc/cpuinfo",
+            "processor\t: 0\nBogoMIPS\t: 108.00\nCPU implementer\t: 0x41\n\
+             CPU part\t: 0xd0b\n\nprocessor\t: 1\nCPU implementer\t: 0x41\n\
+             CPU part\t: 0xd0b\n\nprocessor\t: 2\nCPU implementer\t: 0x41\n\
+             CPU part\t: 0xd0b\n\nprocessor\t: 3\nCPU implementer\t: 0x41\n\
+             CPU part\t: 0xd0b\n",
+        );
+    let info = pi.host(|| Some("aarch64".to_string())).info();
+    assert_eq!(info.cpu.model.as_deref(), Some("Cortex-A76"));
+    assert_eq!(info.cpu.cores, Some(4));
+    assert_eq!(
+        info.model.as_deref(),
+        Some("Raspberry Pi 5 Model B Rev 1.0")
+    );
 }
 
 #[test]

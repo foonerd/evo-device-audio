@@ -14,7 +14,10 @@
 //!   - `model`: `/proc/device-tree/model` when it has text,
 //!     otherwise `sys_vendor` and `product_name` under
 //!     `/sys/class/dmi/id/` joined by one space;
-//!   - `cpu.model`: the first `model name` in `/proc/cpuinfo`;
+//!   - `cpu.model`: the first `model name` in `/proc/cpuinfo`, or,
+//!     on an Arm kernel that writes none, the Arm Ltd core named by
+//!     its first `CPU implementer` and `CPU part` (`Cortex-A76` for
+//!     a Raspberry Pi 5); `null` for a core not known;
 //!   - `cpu.cores`: the number of `processor` lines there;
 //!   - `memory_total_bytes`: `MemTotal` in `/proc/meminfo`, kB to
 //!     bytes;
@@ -102,7 +105,8 @@ pub struct SystemInfo {
 /// The processor part of [`SystemInfo`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Cpu {
-    /// The first `model name` in `/proc/cpuinfo`.
+    /// The first `model name` in `/proc/cpuinfo`, or the Arm core its
+    /// `CPU implementer` and `CPU part` name.
     pub model: Option<String>,
     /// The number of `processor` lines in `/proc/cpuinfo`.
     pub cores: Option<u32>,
@@ -262,9 +266,41 @@ fn values<'a>(body: &'a str, key: &'a str) -> impl Iterator<Item = &'a str> {
     })
 }
 
-/// The first `model name` in `/proc/cpuinfo`.
+/// The processor `/proc/cpuinfo` names: the first `model name`, as an
+/// x86 kernel writes it; or, where there is none, as an Arm kernel
+/// writes none, the Arm Ltd core its first `CPU implementer` and
+/// `CPU part` name. A core this does not know answers `None`: the
+/// board is already in `model`, and a part number is not a name.
 fn cpu_model(cpuinfo: &str) -> Option<String> {
-    values(cpuinfo, "model name").next().and_then(text)
+    if let Some(name) = values(cpuinfo, "model name").next().and_then(text) {
+        return Some(name);
+    }
+    let implementer =
+        values(cpuinfo, "CPU implementer").next().and_then(text)?;
+    let part = values(cpuinfo, "CPU part").next().and_then(text)?;
+    arm_core(&implementer, &part).map(str::to_string)
+}
+
+/// The Arm Ltd core name for a `CPU part`, as the Arm architecture
+/// documents number them. Only Arm Ltd (`CPU implementer` `0x41`)
+/// is known here; another implementer's part numbers mean other
+/// cores.
+fn arm_core(implementer: &str, part: &str) -> Option<&'static str> {
+    if !implementer.eq_ignore_ascii_case("0x41") {
+        return None;
+    }
+    let name = match part.to_ascii_lowercase().as_str() {
+        "0xd03" => "Cortex-A53",
+        "0xd05" => "Cortex-A55",
+        "0xd07" => "Cortex-A57",
+        "0xd08" => "Cortex-A72",
+        "0xd09" => "Cortex-A73",
+        "0xd0a" => "Cortex-A75",
+        "0xd0b" => "Cortex-A76",
+        "0xd0d" => "Cortex-A77",
+        _ => return None,
+    };
+    Some(name)
 }
 
 /// The number of `processor` lines in `/proc/cpuinfo`.
