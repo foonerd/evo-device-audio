@@ -10,6 +10,9 @@
 //! the names; `scene.remove` takes one away; `scene.recall`
 //! replaces the live zones with a snapshot, which is the zone
 //! registry's work (`Zones::recall`), not this module's.
+//! `scene.get` answers one whole scene and changes nothing;
+//! `scene.put` stores a scene as it is given, which a backup needs
+//! to put one back. Neither touches the live zones.
 //!
 //! A name is trimmed, non-empty, at most [`NAME_MAX_CHARS`]
 //! characters, and unique among scenes without regard to case.
@@ -46,6 +49,8 @@ pub(crate) enum Refusal {
     NameTooLong(usize),
     /// A new scene would be one past [`SCENE_CAP`].
     TooManyScenes,
+    /// A put for a name a scene already holds, without `overwrite`.
+    SceneHeld(String),
 }
 
 impl std::fmt::Display for Refusal {
@@ -59,6 +64,11 @@ impl std::fmt::Display for Refusal {
             Refusal::TooManyScenes => write!(
                 f,
                 "there are already {SCENE_CAP} scenes; remove one first"
+            ),
+            Refusal::SceneHeld(name) => write!(
+                f,
+                "a scene named {name:?} already exists; pass overwrite=true \
+                 to replace it"
             ),
         }
     }
@@ -159,6 +169,28 @@ impl Scenes {
             }
         }
         Ok(scene)
+    }
+
+    /// `scene.put`: a scene as it is given, its zones already checked.
+    /// A scene of that name, without regard to case, is refused unless
+    /// `overwrite` is true, and is then replaced in place as `save`
+    /// does; otherwise a new scene is added unless there are already
+    /// [`SCENE_CAP`]. The zones are stored as given.
+    pub(crate) fn put(
+        &mut self,
+        name: &str,
+        zones: Vec<Zone>,
+        overwrite: bool,
+    ) -> Result<Scene, Refusal> {
+        let name = clean_name(name)?;
+        if let Some(at) = self.position(&name) {
+            if !overwrite {
+                return Err(Refusal::SceneHeld(
+                    self.state.scenes[at].name.clone(),
+                ));
+            }
+        }
+        self.save(&name, zones)
     }
 
     /// `scene.list`: the names, in the order first saved.

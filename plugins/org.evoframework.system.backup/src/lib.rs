@@ -7,8 +7,10 @@
 //!
 //! - `export_backup { v: 1 }` answers `{ v: 1, backup: { v: 1,
 //!   config, playlists, settings } }`:
-//!   - `config` is `{ logical_outputs, zones }`, as
-//!     `delivery.list_logical_outputs` and `zone.list` answer them;
+//!   - `config` is `{ logical_outputs, zones, scenes }`, as
+//!     `delivery.list_logical_outputs` and `zone.list` answer the
+//!     first two, and `scenes` the scenes `scene.list` names, each
+//!     read whole with `scene.get`;
 //!   - `playlists` is `[{ name, m3u }]`, every stored playlist as
 //!     `playlist.export_file` answers its text, format `m3u`,
 //!     library-relative rows;
@@ -34,6 +36,14 @@
 //!     that name; a favourite already held is a no-op.
 //!   - A playlist with no rows goes back as an empty playlist
 //!     through `playlist.create_playlist`.
+//!   - Scenes go back after the zones, through `scene.put`, which
+//!     stores a scene as given and never over one the device holds.
+//!     A scene's logical outputs are mapped to the ids the device
+//!     minted; a scene whose logical output did not go back is
+//!     reported and skipped. A restore never recalls, saves or
+//!     removes a scene, so the live zones are those the zones
+//!     import put back and nothing else. A backup without `scenes`
+//!     puts back none.
 //!   - `output_device` is put back only if the device has that
 //!     output, checked against `delivery.list_outputs` the way the
 //!     delivery plugin resolves the descriptor; the empty string,
@@ -175,6 +185,17 @@ struct Backup {
 struct Config {
     logical_outputs: Vec<LogicalOutput>,
     zones: Vec<Zone>,
+    /// Absent in a backup taken before scenes were part of one.
+    #[serde(default)]
+    scenes: Vec<SceneBackup>,
+}
+
+/// A scene as `scene.get` answers it. Its zones stay JSON: only their
+/// logical output ids are mapped, and the owner checks the rest.
+#[derive(Debug, Deserialize)]
+struct SceneBackup {
+    name: String,
+    zones: Vec<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -371,9 +392,28 @@ async fn export(d: &dyn ShelfRequestDispatcher) -> Result<Value, String> {
     let outputs =
         call(d, DELIVERY, "delivery.list_logical_outputs", v.clone()).await?;
     let zones = call(d, ZONES, "zone.list", v.clone()).await?;
+    let scene_names = call(d, ZONES, "scene.list", v.clone()).await?;
+    let mut scenes = Vec::new();
+    for name in field(&scene_names, "scene.list", "scenes")?
+        .as_array()
+        .ok_or("scene.list answered no list")?
+    {
+        let name = name
+            .as_str()
+            .ok_or("scene.list answered a nameless scene")?;
+        let got = call(
+            d,
+            ZONES,
+            "scene.get",
+            json!({ "v": PAYLOAD_VERSION, "name": name }),
+        )
+        .await?;
+        scenes.push(field(&got, "scene.get", "scene")?);
+    }
     let config = json!({
         "logical_outputs": field(&outputs, "delivery.list_logical_outputs", "logical_outputs")?,
         "zones": field(&zones, "zone.list", "zones")?,
+        "scenes": scenes,
     });
 
     let stored =
@@ -548,6 +588,30 @@ async fn import(
         put("config", format!("zone {} EQ engaged", zone.name), r);
     }
 
+    // Scenes, once the logical outputs they name are back. Stored as
+    // given and never over one the device holds; nothing is recalled.
+    for scene in &backup.config.scenes {
+        let item = format!("scene {}", scene.name);
+        match remap_scene(scene, &minted) {
+            Ok(zones) => {
+                let r = call(
+                    d,
+                    ZONES,
+                    "scene.put",
+                    json!({
+                        "v": PAYLOAD_VERSION,
+                        "scene": { "name": scene.name, "zones": zones },
+                    }),
+                )
+                .await;
+                put("config", item, r);
+            }
+            Err(reason) => {
+                put("config", item, Err(reason));
+            }
+        }
+    }
+
     // Settings: the record through its setters, then the presets.
     let record = &backup.settings.record;
     for (name, verb, key) in SETTERS {
@@ -682,6 +746,36 @@ async fn import(
     }
 
     refused
+}
+
+/// A scene's zones with each logical output id replaced by the id the
+/// device minted for it. A scene that names one that did not go back is
+/// not put.
+fn remap_scene(
+    scene: &SceneBackup,
+    minted: &HashMap<String, String>,
+) -> Result<Vec<Value>, String> {
+    let mut zones = Vec::with_capacity(scene.zones.len());
+    for zone in &scene.zones {
+        let mut zone = zone.clone();
+        let ids = zone
+            .get("logical_output_ids")
+            .and_then(Value::as_array)
+            .ok_or("a zone of the scene names no logical_output_ids list")?
+            .iter()
+            .map(|old| {
+                let old = old
+                    .as_str()
+                    .ok_or("a scene's logical output id is not text")?;
+                minted.get(old).cloned().ok_or_else(|| {
+                    format!("its logical output {old} did not go back")
+                })
+            })
+            .collect::<Result<Vec<String>, String>>()?;
+        zone["logical_output_ids"] = json!(ids);
+        zones.push(zone);
+    }
+    Ok(zones)
 }
 
 /// The rows of an m3u: every line that is not blank and not a

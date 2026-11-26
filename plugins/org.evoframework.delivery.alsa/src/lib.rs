@@ -183,6 +183,8 @@ const REQUEST_TYPES: &[&str] = &[
     "zone.remove_eq_band",
     "scene.save",
     "scene.list",
+    "scene.get",
+    "scene.put",
     "scene.recall",
     "scene.remove",
 ];
@@ -2133,6 +2135,8 @@ impl Respondent for AlsaDeliveryPlugin {
                 }
                 "scene.save" => self.handle_scene_save(req).await,
                 "scene.list" => self.handle_scene_list(req).await,
+                "scene.get" => self.handle_scene_get(req).await,
+                "scene.put" => self.handle_scene_put(req).await,
                 "scene.recall" => self.handle_scene_recall(req).await,
                 "scene.remove" => self.handle_scene_remove(req).await,
                 other => Err(PluginError::Permanent(format!(
@@ -2855,6 +2859,68 @@ impl AlsaDeliveryPlugin {
         )
     }
 
+    /// `scene.get` — one scene, whole. Reads only: no zone, claim or
+    /// scene changes. An unknown name is refused.
+    async fn handle_scene_get(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SceneNameRequest = parse_versioned_payload(req)?;
+        let scene = self
+            .scenes
+            .read()
+            .await
+            .get(&payload.name)
+            .map_err(|r| Self::scene_refused(req, r))?
+            .clone();
+        encode(
+            req,
+            &SceneResponse {
+                v: PAYLOAD_VERSION,
+                scene,
+            },
+        )
+    }
+
+    /// `scene.put` — a scene stored as it is given. The scene's zones
+    /// are checked first, against the logical outputs the plugin has
+    /// now, and a scene that would not recall is refused before any
+    /// write. A name a scene already holds is refused unless
+    /// `overwrite` is true. The live zones, the logical outputs, the
+    /// options EQ and the claim are not touched. Answers the scene.
+    async fn handle_scene_put(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: ScenePutRequest = parse_versioned_payload(req)?;
+        let zones = {
+            let logical = self.logical.read().await;
+            let known = Self::known_logical_ids(&logical);
+            zones::check_scene_zones(&known, payload.scene.zones)
+                .map_err(|r| Self::zone_refused(req, r))?
+        };
+        let scene = self
+            .scenes
+            .write()
+            .await
+            .put(&payload.scene.name, zones, payload.overwrite)
+            .map_err(|r| Self::scene_refused(req, r))?;
+        self.persist_scenes().await;
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            name = %scene.name,
+            zones = scene.zones.len(),
+            "scene stored"
+        );
+        encode(
+            req,
+            &SceneResponse {
+                v: PAYLOAD_VERSION,
+                scene,
+            },
+        )
+    }
+
     /// `scene.recall` — replace the live zones with the snapshot.
     /// An unknown name and a bad snapshot are refused before any
     /// write; the logical outputs, the physical outputs and the
@@ -3199,8 +3265,8 @@ struct ZoneListResponse {
     zones: Vec<Zone>,
 }
 
-/// `scene.save`, `scene.recall` and `scene.remove` request: a
-/// name.
+/// `scene.save`, `scene.get`, `scene.recall` and `scene.remove`
+/// request: a name.
 #[derive(Debug, Deserialize)]
 struct SceneNameRequest {
     #[serde(default = "default_payload_version")]
@@ -3214,7 +3280,33 @@ impl HasPayloadVersion for SceneNameRequest {
     }
 }
 
-/// `scene.save`, `scene.recall` and `scene.remove` answer with
+/// `scene.put` request: a scene to store as it is given, and whether
+/// it may replace one of that name.
+#[derive(Debug, Deserialize)]
+struct ScenePutRequest {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    scene: ScenePutBody,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+/// The scene inside a `scene.put`.
+#[derive(Debug, Deserialize)]
+struct ScenePutBody {
+    name: String,
+    #[serde(default)]
+    zones: Vec<Zone>,
+}
+
+impl HasPayloadVersion for ScenePutRequest {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+/// `scene.save`, `scene.get`, `scene.put`, `scene.recall` and
+/// `scene.remove` answer with
 /// the scene.
 #[derive(Debug, Serialize)]
 struct SceneResponse {
@@ -3774,6 +3866,8 @@ mod tests {
             "zone.remove_eq_band",
             "scene.save",
             "scene.list",
+            "scene.get",
+            "scene.put",
             "scene.recall",
             "scene.remove",
         ];
@@ -6902,6 +6996,295 @@ pcm.evo {
             rig.call("scene.list", json!({ "v": 1 })).await.unwrap()["scenes"],
             json!(["Empty"])
         );
+    }
+
+    fn put_zone(id: &str, name: &str, logical: &[&str], bands: usize) -> Value {
+        json!({
+            "id": id,
+            "name": name,
+            "logical_output_ids": logical,
+            "eq": {
+                "engaged": true,
+                "bands": (0..bands)
+                    .map(|i| json!({ "freq_hz": 100 + i as u32, "gain_db": 1.5, "q": 1.25 }))
+                    .collect::<Vec<_>>(),
+            },
+        })
+    }
+
+    /// `scene.get` answers a scene whole and changes nothing: not a
+    /// zone, not the claim, not the scene list.
+    #[tokio::test]
+    async fn a_scene_is_read_whole_and_reading_changes_nothing() {
+        let rig = OutputRig::new().await.with_zones().await;
+        rig.call("zone.add", json!({ "v": 1, "name": "Down", "logical_output_ids": ["logical:1"] })).await.unwrap();
+        let saved = rig
+            .call("scene.save", json!({ "v": 1, "name": "Evening" }))
+            .await
+            .unwrap();
+        rig.call("zone.remove", json!({ "v": 1, "id": "zone:1" }))
+            .await
+            .unwrap();
+        let live = zones_now(&rig).await;
+        let claims = rig.claim_count();
+        let got = rig
+            .call("scene.get", json!({ "v": 1, "name": " evening " }))
+            .await
+            .unwrap();
+        assert_eq!(got, saved, "the scene as it was saved");
+        assert_eq!(zones_now(&rig).await, live, "no zone moved");
+        assert_eq!(rig.claim_count(), claims, "no claim published");
+        let err = rig
+            .call("scene.get", json!({ "v": 1, "name": "Nope" }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown scene"), "{err}");
+    }
+
+    /// `scene.put` stores a scene as given, touches no live zone,
+    /// publishes no claim, and the scene recalls afterwards under its
+    /// own ids.
+    #[tokio::test]
+    async fn a_scene_is_stored_as_given_and_touches_no_live_zone() {
+        let rig = OutputRig::new().await.with_zones().await;
+        rig.call("zone.add", json!({ "v": 1, "name": "Live", "logical_output_ids": ["logical:1"] })).await.unwrap();
+        let live = zones_now(&rig).await;
+        let claims = rig.claim_count();
+        let zones = json!([
+            put_zone("zone:7", "Downstairs", &["logical:1"], 12),
+            put_zone("zone:9", " Upstairs ", &["logical:2"], 1),
+        ]);
+        let put = rig
+            .call(
+                "scene.put",
+                json!({ "v": 1, "scene": { "name": " Away ", "zones": zones } }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put["scene"]["name"], "Away");
+        assert_eq!(put["scene"]["zones"][1]["name"], "Upstairs");
+        assert_eq!(
+            put["scene"]["zones"][0]["eq"]["bands"]
+                .as_array()
+                .unwrap()
+                .len(),
+            12
+        );
+        assert_eq!(zones_now(&rig).await, live, "no live zone moved");
+        assert_eq!(rig.claim_count(), claims, "no claim published");
+        assert_eq!(
+            rig.call("scene.get", json!({ "v": 1, "name": "away" }))
+                .await
+                .unwrap(),
+            put,
+            "what was put is what is read"
+        );
+        assert_eq!(
+            rig.call("scene.list", json!({ "v": 1 })).await.unwrap()["scenes"],
+            json!(["Away"])
+        );
+        let file = tokio::fs::read_to_string(
+            rig.dir.path().join(SceneStore::FILE_NAME),
+        )
+        .await
+        .unwrap();
+        assert!(file.contains("Away"), "persisted: {file}");
+
+        rig.call("scene.recall", json!({ "v": 1, "name": "Away" }))
+            .await
+            .unwrap();
+        let after = zones_now(&rig).await;
+        assert_eq!(after[0]["id"], "zone:7");
+        assert_eq!(after[1]["id"], "zone:9");
+        let added = rig
+            .call(
+                "zone.add",
+                json!({ "v": 1, "name": "Porch", "logical_output_ids": [] }),
+            )
+            .await;
+        assert!(added.is_err());
+    }
+
+    /// A band's gain and Q are kept to their steps when a scene is put,
+    /// as when the band is set on a live zone.
+    #[tokio::test]
+    async fn a_put_scene_keeps_gain_and_q_to_their_steps() {
+        let rig = OutputRig::new().await.with_zones().await;
+        let mut z = put_zone("zone:1", "Down", &["logical:1"], 1);
+        z["eq"]["bands"][0] =
+            json!({ "freq_hz": 250, "gain_db": 2.46, "q": 0.333 });
+        let put = rig
+            .call(
+                "scene.put",
+                json!({ "v": 1, "scene": { "name": "S", "zones": [z] } }),
+            )
+            .await
+            .unwrap();
+        let band = &put["scene"]["zones"][0]["eq"]["bands"][0];
+        assert_eq!(band["gain_db"], json!(2.5));
+        assert_eq!(band["q"], json!(0.33));
+    }
+
+    /// Every way a scene is not one that would recall is refused before
+    /// any write: the scene list and its file stay as they were.
+    #[tokio::test]
+    async fn a_scene_that_would_not_recall_is_refused_and_nothing_is_stored() {
+        let rig = OutputRig::new().await.with_zones().await;
+        rig.call("scene.save", json!({ "v": 1, "name": "Held" }))
+            .await
+            .unwrap();
+        let path = rig.dir.path().join(SceneStore::FILE_NAME);
+        let file_before = tokio::fs::read(&path).await.unwrap();
+        let mut over_range = put_zone("zone:1", "A", &["logical:1"], 2);
+        over_range["eq"]["bands"][1]["gain_db"] = json!(15.01);
+        let mut low_freq = put_zone("zone:1", "A", &["logical:1"], 2);
+        low_freq["eq"]["bands"][0]["freq_hz"] = json!(19);
+        let mut low_q = put_zone("zone:1", "A", &["logical:1"], 2);
+        low_q["eq"]["bands"][0]["q"] = json!(0.05);
+        let cases: Vec<(&str, Value, &str)> = vec![
+            (
+                "empty name",
+                json!({ "name": "  ", "zones": [] }),
+                "needs a name",
+            ),
+            (
+                "long name",
+                json!({ "name": "x".repeat(65), "zones": [] }),
+                "at most 64",
+            ),
+            (
+                "bad zone id",
+                json!({ "name": "S", "zones": [put_zone("zone:x", "A", &["logical:1"], 1)] }),
+                "zone:<n>",
+            ),
+            (
+                "duplicate zone id",
+                json!({ "name": "S", "zones": [
+                    put_zone("zone:1", "A", &["logical:1"], 1),
+                    put_zone("zone:1", "B", &["logical:2"], 1)] }),
+                "named twice",
+            ),
+            (
+                "duplicate zone name",
+                json!({ "name": "S", "zones": [
+                    put_zone("zone:1", "Same", &["logical:1"], 1),
+                    put_zone("zone:2", "same", &["logical:2"], 1)] }),
+                "named twice",
+            ),
+            (
+                "empty zone name",
+                json!({ "name": "S", "zones": [put_zone("zone:1", " ", &["logical:1"], 1)] }),
+                "needs a name",
+            ),
+            (
+                "no logical outputs",
+                json!({ "name": "S", "zones": [put_zone("zone:1", "A", &[], 1)] }),
+                "at least one logical output",
+            ),
+            (
+                "unknown logical output",
+                json!({ "name": "S", "zones": [put_zone("zone:1", "A", &["logical:99"], 1)] }),
+                "unknown logical output",
+            ),
+            (
+                "logical output twice in a zone",
+                json!({ "name": "S", "zones": [put_zone("zone:1", "A", &["logical:1", "logical:1"], 1)] }),
+                "named twice",
+            ),
+            (
+                "logical output in two zones",
+                json!({ "name": "S", "zones": [
+                    put_zone("zone:1", "A", &["logical:1"], 1),
+                    put_zone("zone:2", "B", &["logical:1"], 1)] }),
+                "one zone at most",
+            ),
+            (
+                "no bands",
+                json!({ "name": "S", "zones": [put_zone("zone:1", "A", &["logical:1"], 0)] }),
+                "has 0",
+            ),
+            (
+                "too many bands",
+                json!({ "name": "S", "zones": [put_zone("zone:1", "A", &["logical:1"], 32)] }),
+                "has 32",
+            ),
+            (
+                "gain over",
+                json!({ "name": "S", "zones": [over_range] }),
+                "gain_db",
+            ),
+            (
+                "freq under",
+                json!({ "name": "S", "zones": [low_freq] }),
+                "freq_hz",
+            ),
+            ("q under", json!({ "name": "S", "zones": [low_q] }), "q "),
+            (
+                "the name is held",
+                json!({ "name": "held", "zones": [] }),
+                "already exists",
+            ),
+        ];
+        for (label, scene, want) in cases {
+            let err = rig
+                .call("scene.put", json!({ "v": 1, "scene": scene }))
+                .await
+                .unwrap_err();
+            assert!(err.contains(want), "{label}: {err}");
+            assert_eq!(
+                tokio::fs::read(&path).await.unwrap(),
+                file_before,
+                "{label}: nothing written"
+            );
+        }
+        assert_eq!(
+            rig.call("scene.list", json!({ "v": 1 })).await.unwrap()["scenes"],
+            json!(["Held"])
+        );
+    }
+
+    /// A name a scene holds is refused unless `overwrite` is true, then
+    /// replaced in place with the spelling just given; the 33rd scene is
+    /// refused.
+    #[tokio::test]
+    async fn a_put_replaces_a_scene_only_when_asked_and_stops_at_the_cap() {
+        let rig = OutputRig::new().await.with_zones().await;
+        let put = |name: &str, overwrite: Option<bool>| {
+            let mut body =
+                json!({ "v": 1, "scene": { "name": name, "zones": [] } });
+            if let Some(o) = overwrite {
+                body["overwrite"] = json!(o);
+            }
+            body
+        };
+        rig.call("scene.put", put("Alpha", None)).await.unwrap();
+        rig.call("scene.put", put("Beta", None)).await.unwrap();
+        assert!(rig.call("scene.put", put("ALPHA", None)).await.is_err());
+        assert!(rig
+            .call("scene.put", put("ALPHA", Some(false)))
+            .await
+            .is_err());
+        let r = rig
+            .call("scene.put", put("ALPHA", Some(true)))
+            .await
+            .unwrap();
+        assert_eq!(r["scene"]["name"], "ALPHA");
+        assert_eq!(
+            rig.call("scene.list", json!({ "v": 1 })).await.unwrap()["scenes"],
+            json!(["ALPHA", "Beta"]),
+            "replaced in place"
+        );
+        for i in 0..30 {
+            rig.call("scene.put", put(&format!("S{i}"), None))
+                .await
+                .unwrap();
+        }
+        let err = rig.call("scene.put", put("Over", None)).await.unwrap_err();
+        assert!(err.contains("already 32 scenes"), "{err}");
+        assert!(rig
+            .call("scene.put", put("ALPHA", Some(true)))
+            .await
+            .is_ok());
     }
 
     /// A refused recall changes no zone: an unknown name, a

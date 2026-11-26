@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Tests for the system.backup plugin, against a stub that stands
 //! in for the six owners: audio.delivery, audio.zones,
-//! audio.playlist, audio.options, audio.favourites and audio.alarm.
+//! audio.playlist, audio.options, audio.favourites and audio.alarm
+//! (audio.zones also answers the scene verbs).
 
 use std::sync::Mutex;
 
@@ -26,6 +27,8 @@ struct Owners {
     presets: Vec<Value>,
     /// The alarm, as `alarm.get` answers it.
     alarm: Option<Value>,
+    /// The scenes, as `scene.get` answers them, in first-saved order.
+    scenes: Vec<Value>,
 }
 
 fn flat() -> Value {
@@ -63,6 +66,7 @@ impl Owners {
             }),
             presets: Vec::new(),
             alarm: None,
+            scenes: Vec::new(),
         }
     }
 
@@ -101,6 +105,10 @@ impl Owners {
                 "#EXTM3U\n#PLAYLIST:__favourites__\nINTERNAL/a.flac\nNAS/x/b.flac\n"
                     .into(),
             ),
+        ];
+        o.scenes = vec![
+            json!({ "name": "Evening", "zones": o.zones.clone() }),
+            json!({ "name": "Quiet", "zones": [] }),
         ];
         o.alarm = Some(json!({
             "weekdays": ["mon", "fri"],
@@ -308,6 +316,41 @@ impl Stub {
                 }
                 Ok(ok)
             }
+            "scene.list" => Ok(json!({
+                "v": 1,
+                "scenes": o.scenes.iter().map(|s| s["name"].clone()).collect::<Vec<_>>(),
+            })),
+            "scene.get" => {
+                let name = s("name");
+                let scene = o
+                    .scenes
+                    .iter()
+                    .find(|sc| sc["name"] == json!(name))
+                    .ok_or("unknown scene")?;
+                Ok(json!({ "v": 1, "scene": scene }))
+            }
+            "scene.put" => {
+                let scene = p["scene"].clone();
+                let name =
+                    scene["name"].as_str().unwrap_or_default().to_string();
+                if p.get("overwrite") == Some(&json!(true)) {
+                    return Err("the backup never overwrites a scene".into());
+                }
+                if o.scenes.iter().any(|sc| {
+                    sc["name"].as_str().unwrap().eq_ignore_ascii_case(&name)
+                }) {
+                    return Err(format!("a scene named {name} already exists"));
+                }
+                for z in scene["zones"].as_array().unwrap() {
+                    for id in z["logical_output_ids"].as_array().unwrap() {
+                        if !o.logical_outputs.iter().any(|l| l["id"] == *id) {
+                            return Err(format!("unknown logical output {id}"));
+                        }
+                    }
+                }
+                o.scenes.push(scene.clone());
+                Ok(json!({ "v": 1, "scene": scene }))
+            }
             "alarm.get" => Ok(json!({ "v": 1, "alarm": o.alarm })),
             "alarm.set" => {
                 o.alarm = Some(json!({
@@ -471,6 +514,8 @@ const READS: &[&str] = &[
     "options.get_settings",
     "options.list_eq_presets",
     "alarm.get",
+    "scene.list",
+    "scene.get",
 ];
 
 // ----- manifest / surface -----
@@ -644,6 +689,24 @@ async fn a_backup_goes_back_onto_an_empty_device() {
     assert_eq!(after.presets, set_up.presets);
     assert_eq!(after.playlists, set_up.playlists);
     assert_eq!(after.alarm, set_up.alarm, "the alarm went back");
+    assert_eq!(after.scenes.len(), 2, "both scenes went back");
+    assert_eq!(
+        after.scenes[1], set_up.scenes[1],
+        "the empty scene as it was"
+    );
+    assert_eq!(
+        after.scenes[0]["zones"][0]["logical_output_ids"],
+        json!([lo("Porch"), lo("Kitchen")]),
+        "the scene's outputs are the ids the device minted, not the old ones"
+    );
+    assert_eq!(
+        after.scenes[0]["zones"][0]["id"], "zone:2",
+        "its zone id as it was"
+    );
+    assert_eq!(
+        after.scenes[0]["zones"][0]["eq"], set_up.scenes[0]["zones"][0]["eq"],
+        "its EQ as it was"
+    );
 
     let verbs = stub.verbs();
     let first = |v: &str| verbs.iter().position(|x| x == v).unwrap();
@@ -656,6 +719,14 @@ async fn a_backup_goes_back_onto_an_empty_device() {
     assert!(
         last("options.") < first("playlist.import_file"),
         "settings before playlists"
+    );
+    assert!(
+        last("zone.") < first("scene.put"),
+        "the scenes go back after the zones they snapshot"
+    );
+    assert!(
+        last("scene.") < first("options.set_resampling"),
+        "scenes are config, before settings"
     );
     assert!(
         last("playlist.") < first("alarm.set"),
@@ -686,15 +757,33 @@ async fn a_missing_device_is_a_refusal_not_a_guess() {
         .collect();
     assert_eq!(
         items,
-        ["logical output Porch", "zone Downstairs", "output_device"],
+        [
+            "logical output Porch",
+            "zone Downstairs",
+            "scene Evening",
+            "output_device"
+        ],
         "{refused:?}"
     );
     assert_eq!(
         refused[1]["reason"],
         "its logical output logical:5 did not go back"
     );
+    assert_eq!(
+        refused[2]["reason"], "its logical output logical:5 did not go back",
+        "a scene that names it is not put"
+    );
     let after = stub.owners();
     assert_eq!(after.logical_outputs.len(), 1, "Kitchen went back");
+    assert_eq!(
+        after
+            .scenes
+            .iter()
+            .map(|s| s["name"].clone())
+            .collect::<Vec<_>>(),
+        [json!("Quiet")],
+        "the scene with no zones went back; the one that names Porch did not"
+    );
     assert!(after.zones.is_empty(), "no zone with a shrunken membership");
     assert_eq!(after.record["output_device"], "", "not replaced by a guess");
     assert_eq!(after.record["mixer_type"], "hardware", "the rest went back");
@@ -724,12 +813,15 @@ async fn import_removes_nothing_the_device_has() {
         "zone Downstairs",
         "playlist Morning",
         "playlist Late",
+        "scene Evening",
+        "scene Quiet",
     ] {
         assert!(items.contains(&held), "{held} not reported: {items:?}");
     }
     let after = stub.owners();
     assert_eq!(after.logical_outputs, before.logical_outputs);
     assert_eq!(after.zones, before.zones);
+    assert_eq!(after.scenes, before.scenes, "the device's own scenes stay");
     assert_eq!(
         after.playlists, before.playlists,
         "the device's own Morning stays"
@@ -1054,6 +1146,104 @@ async fn an_unreadable_output_list_leaves_output_device_alone() {
     assert_eq!(stub.owners().record["output_device"], "");
 }
 
+// ----- scenes -----
+
+/// A scene is read whole, with `scene.get`, one call per name
+/// `scene.list` gave.
+#[tokio::test]
+async fn scenes_are_exported_whole() {
+    let owners = Owners::set_up();
+    let (backup, stub) = export_from(owners.clone()).await;
+    assert_eq!(backup["config"]["scenes"], json!(owners.scenes));
+    let gets: Vec<Value> = stub
+        .calls()
+        .into_iter()
+        .filter(|(_, v, _)| v == "scene.get")
+        .map(|(_, _, p)| p["name"].clone())
+        .collect();
+    assert_eq!(gets, [json!("Evening"), json!("Quiet")]);
+    let (none, _) = export_from(Owners::empty()).await;
+    assert_eq!(none["config"]["scenes"], json!([]));
+}
+
+/// A restore stores scenes as given and recalls nothing: the live zones
+/// are the ones the zones import made, and no verb that saves, recalls
+/// or removes a scene is sent.
+#[tokio::test]
+async fn a_restore_stores_scenes_and_never_recalls_one() {
+    let (backup, _) = export_from(Owners::set_up()).await;
+    let stub = Stub::new(Owners::empty());
+    let refused = import_into(&stub, backup).await.unwrap();
+    assert!(refused.is_empty(), "{refused:?}");
+    for (_, verb, payload) in stub.calls() {
+        assert!(
+            !["scene.save", "scene.recall", "scene.remove"]
+                .contains(&verb.as_str()),
+            "a restore sent {verb}"
+        );
+        if verb == "scene.put" {
+            assert!(payload.get("overwrite").is_none(), "{payload}");
+        }
+    }
+    let after = stub.owners();
+    assert_eq!(after.zones.len(), 1, "the zones import made the live zones");
+    assert_eq!(after.zones[0]["name"], "Downstairs");
+}
+
+/// A scene that names a logical output the backup does not carry is
+/// reported and not put; one the owner refuses, as one the device holds,
+/// is reported too, and the rest still go back.
+#[tokio::test]
+async fn a_scene_that_cannot_go_back_is_reported() {
+    let (mut backup, _) = export_from(Owners::set_up()).await;
+    backup["config"]["scenes"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "name": "Stale",
+            "zones": [{
+                "id": "zone:8", "name": "Gone", "logical_output_ids": ["logical:99"],
+                "eq": { "engaged": false, "bands": [flat()] },
+            }],
+        }));
+    let stub = Stub::new(Owners::empty());
+    let refused = import_into(&stub, backup.clone()).await.unwrap();
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["domain"], "config");
+    assert_eq!(refused[0]["item"], "scene Stale");
+    assert_eq!(
+        refused[0]["reason"],
+        "its logical output logical:99 did not go back"
+    );
+    assert_eq!(stub.owners().scenes.len(), 2, "the others went back");
+
+    // The owner's own refusal is reported with its reason.
+    let stub = Arc::new(Stub {
+        owners: Mutex::new(Owners::empty()),
+        calls: Mutex::new(Vec::new()),
+        broken: Some("scene.put"),
+    });
+    let refused = import_into(&stub, backup).await.unwrap();
+    let items: Vec<&str> = refused
+        .iter()
+        .map(|r| r["item"].as_str().unwrap())
+        .collect();
+    assert!(items.contains(&"scene Evening"), "{items:?}");
+    assert!(items.contains(&"scene Quiet"), "{items:?}");
+}
+
+/// A backup taken before scenes were part of one has no `scenes` key.
+/// It goes back as it did and puts no scene.
+#[tokio::test]
+async fn a_backup_without_scenes_still_goes_back() {
+    let (mut backup, _) = export_from(Owners::set_up()).await;
+    backup["config"].as_object_mut().unwrap().remove("scenes");
+    let stub = Stub::new(Owners::empty());
+    let refused = import_into(&stub, backup).await.unwrap();
+    assert!(refused.is_empty(), "{refused:?}");
+    assert!(!stub.verbs().iter().any(|v| v.starts_with("scene.")));
+}
+
 // ----- the 16 MiB bound -----
 
 /// The backup's size as the bound measures it: the object written
@@ -1220,7 +1410,9 @@ async fn no_music_file_no_share_secret_and_no_share_add() {
             "read_dir",
             "/var/lib/evo",
             "remove_logical_output",
-            "scene.",
+            "scene.save",
+            "scene.recall",
+            "scene.remove",
             "delete_",
             "reset_to_defaults",
             "restore_last_known_good",

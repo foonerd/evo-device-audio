@@ -177,6 +177,22 @@ terminus, not the options EQ, not the logical outputs.
   refused and nothing is written. Answers the scene.
 - `scene.list {}`: the names, in the order first saved; an empty
   set is an empty list.
+- `scene.get { name }`: one scene, whole, as `{ name, zones }`.
+  Reads only: no zone, claim or scene changes. An unknown name
+  is refused.
+- `scene.put { scene: { name, zones }, overwrite }`: a scene
+  stored as given, which a backup needs to put one back.
+  `overwrite` is false unless set. The scene is checked before
+  any write and the live zones, the logical outputs, the options
+  EQ and the claim are not touched: the name as a scene name is,
+  and a name a scene already holds, without regard to case, is
+  refused unless `overwrite` is true, when that scene is replaced
+  in place; the 33rd scene is refused; each zone has an id
+  `zone:<n>` and a name as a zone name is, unique within the
+  scene; each holds at least one logical output the plugin has
+  now, named once in the zone and in no other zone of the
+  scene; each zone EQ has 1 through 31 bands, every field in
+  its range, gain and Q kept to their steps. Answers the scene.
 - `scene.recall { name }`: the live zones are replaced by the
   snapshot, ids kept; `next_id` becomes one past the highest
   present and never moves backward; an empty snapshot clears the

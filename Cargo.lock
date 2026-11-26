@@ -3762,7 +3762,7 @@ dependencies = [
 
 [[package]]
 name = "org-evoframework-delivery-alsa"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "evo-plugin-sdk",
@@ -4032,7 +4032,7 @@ dependencies = [
 
 [[package]]
 name = "org-evoframework-system-backup"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "evo-plugin-sdk",

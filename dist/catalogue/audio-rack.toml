@@ -101,8 +101,10 @@ description = """
 A zone is a name over one or more logical outputs. It stores \
 its own EQ. evo.audio.zones / eq_claim tells the one eq_only \
 cascade which zone's bands to use. A scene is a name and a \
-snapshot of every zone: scene.save, scene.list, scene.recall, \
-scene.remove. A zone is not an ALSA device. It moves no mixer \
+snapshot of every zone: scene.save, scene.list, scene.get, \
+scene.put, scene.recall, scene.remove. scene.get reads one \
+scene whole and scene.put stores one as given; neither moves \
+a live zone. A zone is not an ALSA device. It moves no mixer \
 and no drop-in. A logical output sits in one zone at most, and \
 cannot be removed while a zone holds it.
 """
@@ -510,7 +512,7 @@ shape = 1
 description = """
 One backup of the operator's configuration. Stocked by \
 org.evoframework.system.backup: export_backup reads config \
-(logical outputs and zones), playlists (favourites among them) \
+(logical outputs, zones and scenes), playlists (favourites among them) \
 and settings (the alarm among them) from the plugins that own \
 them, and import_backup puts them back through the same owners, \
 removing nothing and reporting what an owner refuses, such as \

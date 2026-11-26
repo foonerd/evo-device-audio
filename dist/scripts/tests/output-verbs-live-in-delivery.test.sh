@@ -11,8 +11,8 @@
 # `zone.add`, `zone.update`, `zone.remove` and `zone.list` keep a
 # name over one or more logical outputs, and `zone.set_eq_engaged`
 # and `zone.set_eq_band` keep a zone's own EQ; `scene.save`,
-# `scene.list`, `scene.recall` and `scene.remove` keep a snapshot
-# of every zone under a name. The delivery
+# `scene.list`, `scene.get`, `scene.put`, `scene.recall` and
+# `scene.remove` keep a snapshot of every zone under a name. The delivery
 # plugin owns the chain definition those verbs steer and the
 # names the operator gives its outputs; no steward crate and no
 # other plugin carries an output policy, a second copy of a
@@ -58,6 +58,8 @@ VERBS=(
     "zone.set_eq_band"
     "scene.save"
     "scene.list"
+    "scene.get"
+    "scene.put"
     "scene.recall"
     "scene.remove"
 )

@@ -34,8 +34,8 @@
 //! existed loads with the default EQ.
 //!
 //! Zones survive a restart in `zones.toml` under the plugin's
-//! state directory. No subject is published. No scene is
-//! stored.
+//! state directory. No subject is published. Scenes are stored
+//! apart, in `scenes.rs`; this module checks a scene's zones.
 
 use std::path::{Path, PathBuf};
 
@@ -129,6 +129,15 @@ pub(crate) enum Refusal {
     TooManyBands,
     /// The zone has only [`EQ_BAND_MIN_COUNT`] band; it keeps it.
     LastBand,
+    /// A scene's zone id is not `zone:<n>`.
+    BadZoneId(String),
+    /// Two zones of one scene carry the same id.
+    DuplicateZoneId(String),
+    /// Two zones of one scene carry the same name, case-insensitively.
+    DuplicateZoneName(String),
+    /// A scene's zone EQ has no bands, or more than
+    /// [`EQ_BAND_MAX_COUNT`].
+    BandCount(usize),
     /// A band field outside its range; names the field.
     BandFieldOutOfRange {
         /// `freq_hz`, `gain_db` or `q`.
@@ -197,6 +206,20 @@ impl std::fmt::Display for Refusal {
             Refusal::LastBand => {
                 write!(f, "the zone EQ keeps at least {EQ_BAND_MIN_COUNT} band")
             }
+            Refusal::BadZoneId(id) => {
+                write!(f, "zone id {id:?} is not of the form zone:<n>")
+            }
+            Refusal::DuplicateZoneId(id) => {
+                write!(f, "zone id {id:?} is named twice in one scene")
+            }
+            Refusal::DuplicateZoneName(name) => {
+                write!(f, "zone name {name:?} is named twice in one scene")
+            }
+            Refusal::BandCount(n) => write!(
+                f,
+                "a zone EQ has {EQ_BAND_MIN_COUNT} through \
+                 {EQ_BAND_MAX_COUNT} bands; this one has {n}"
+            ),
             Refusal::BandFieldOutOfRange { field, got, range } => {
                 write!(f, "{field} {got} is out of range; {range}")
             }
@@ -349,6 +372,121 @@ fn clean_name(name: &str) -> Result<String, Refusal> {
         return Err(Refusal::NameTooLong(n));
     }
     Ok(name.to_string())
+}
+
+/// A band within its ranges, its gain and Q kept to their steps. The
+/// range is checked on what was asked for, so a value that rounds
+/// into the range from just outside it is still refused.
+fn check_band(band: &EqBand) -> Result<EqBand, Refusal> {
+    if !(EQ_BAND_FREQ_MIN..=EQ_BAND_FREQ_MAX).contains(&band.freq_hz) {
+        return Err(Refusal::BandFieldOutOfRange {
+            field: "freq_hz",
+            got: band.freq_hz.to_string(),
+            range: format!("{EQ_BAND_FREQ_MIN} through {EQ_BAND_FREQ_MAX} Hz"),
+        });
+    }
+    if !(EQ_BAND_GAIN_MIN_DB..=EQ_BAND_GAIN_MAX_DB).contains(&band.gain_db) {
+        return Err(Refusal::BandFieldOutOfRange {
+            field: "gain_db",
+            got: band.gain_db.to_string(),
+            range: format!(
+                "{EQ_BAND_GAIN_MIN_DB} through {EQ_BAND_GAIN_MAX_DB} dB"
+            ),
+        });
+    }
+    if !(EQ_BAND_Q_MIN..=EQ_BAND_Q_MAX).contains(&band.q) {
+        return Err(Refusal::BandFieldOutOfRange {
+            field: "q",
+            got: band.q.to_string(),
+            range: format!("{EQ_BAND_Q_MIN} through {EQ_BAND_Q_MAX}"),
+        });
+    }
+    Ok(EqBand {
+        freq_hz: band.freq_hz,
+        gain_db: to_step(band.gain_db, EQ_GAIN_STEP_DB),
+        q: to_step(band.q, EQ_Q_STEP),
+    })
+}
+
+/// Every zone of a snapshot holds at least one logical output, each
+/// one the plugin has, named once in its zone, and no logical output
+/// sits in two zones.
+fn check_membership(
+    known_logical: &[String],
+    snapshot: &[Zone],
+) -> Result<(), Refusal> {
+    let mut seen: Vec<(&str, &str)> = Vec::new();
+    for z in snapshot {
+        if z.logical_output_ids.is_empty() {
+            return Err(Refusal::NoLogicalOutputs);
+        }
+        for (i, id) in z.logical_output_ids.iter().enumerate() {
+            if !known_logical.iter().any(|k| k == id) {
+                return Err(Refusal::UnknownLogicalOutput(id.clone()));
+            }
+            if z.logical_output_ids[..i].contains(id) {
+                return Err(Refusal::DuplicateLogicalOutput(id.clone()));
+            }
+            if let Some((_, holder)) = seen.iter().find(|(l, _)| *l == id) {
+                return Err(Refusal::SnapshotSharesLogicalOutput {
+                    logical_output_id: id.clone(),
+                    zones: (holder.to_string(), z.id.clone()),
+                });
+            }
+            seen.push((id.as_str(), z.id.as_str()));
+        }
+    }
+    Ok(())
+}
+
+/// The zones of a scene that is being put, checked before it is
+/// stored, and returned as they will be kept: ids `zone:<n>` and
+/// unique, names as a zone name is, and unique without regard to
+/// case, membership as a recall needs it, and each EQ with 1 through
+/// 31 bands, every field in its range, gain and Q kept to their
+/// steps. Nothing is written.
+pub(crate) fn check_scene_zones(
+    known_logical: &[String],
+    zones: Vec<Zone>,
+) -> Result<Vec<Zone>, Refusal> {
+    let mut ids: Vec<&str> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    for z in &zones {
+        if z.id
+            .strip_prefix(ID_PREFIX)
+            .and_then(|n| n.parse::<u64>().ok())
+            .is_none()
+        {
+            return Err(Refusal::BadZoneId(z.id.clone()));
+        }
+        if ids.contains(&z.id.as_str()) {
+            return Err(Refusal::DuplicateZoneId(z.id.clone()));
+        }
+        ids.push(z.id.as_str());
+        let name = clean_name(&z.name)?;
+        let lower = name.to_lowercase();
+        if names.contains(&lower) {
+            return Err(Refusal::DuplicateZoneName(name));
+        }
+        names.push(lower);
+    }
+    check_membership(known_logical, &zones)?;
+    zones
+        .into_iter()
+        .map(|mut z| {
+            z.name = clean_name(&z.name)?;
+            let n = z.eq.bands.len();
+            if !(EQ_BAND_MIN_COUNT..=EQ_BAND_MAX_COUNT).contains(&n) {
+                return Err(Refusal::BandCount(n));
+            }
+            z.eq.bands =
+                z.eq.bands
+                    .iter()
+                    .map(check_band)
+                    .collect::<Result<Vec<_>, _>>()?;
+            Ok(z)
+        })
+        .collect()
 }
 
 impl Zones {
@@ -539,37 +677,7 @@ impl Zones {
         if slot == count && count >= EQ_BAND_MAX_COUNT {
             return Err(Refusal::TooManyBands);
         }
-        if !(EQ_BAND_FREQ_MIN..=EQ_BAND_FREQ_MAX).contains(&band.freq_hz) {
-            return Err(Refusal::BandFieldOutOfRange {
-                field: "freq_hz",
-                got: band.freq_hz.to_string(),
-                range: format!(
-                    "{EQ_BAND_FREQ_MIN} through {EQ_BAND_FREQ_MAX} Hz"
-                ),
-            });
-        }
-        if !(EQ_BAND_GAIN_MIN_DB..=EQ_BAND_GAIN_MAX_DB).contains(&band.gain_db)
-        {
-            return Err(Refusal::BandFieldOutOfRange {
-                field: "gain_db",
-                got: band.gain_db.to_string(),
-                range: format!(
-                    "{EQ_BAND_GAIN_MIN_DB} through {EQ_BAND_GAIN_MAX_DB} dB"
-                ),
-            });
-        }
-        if !(EQ_BAND_Q_MIN..=EQ_BAND_Q_MAX).contains(&band.q) {
-            return Err(Refusal::BandFieldOutOfRange {
-                field: "q",
-                got: band.q.to_string(),
-                range: format!("{EQ_BAND_Q_MIN} through {EQ_BAND_Q_MAX}"),
-            });
-        }
-        let kept = EqBand {
-            freq_hz: band.freq_hz,
-            gain_db: to_step(band.gain_db, EQ_GAIN_STEP_DB),
-            q: to_step(band.q, EQ_Q_STEP),
-        };
+        let kept = check_band(&band)?;
         let bands = &mut self.state.zones[at].eq.bands;
         if slot == count {
             bands.push(kept);
@@ -614,27 +722,7 @@ impl Zones {
         known_logical: &[String],
         snapshot: &[Zone],
     ) -> Result<(), Refusal> {
-        let mut seen: Vec<(&str, &str)> = Vec::new();
-        for z in snapshot {
-            if z.logical_output_ids.is_empty() {
-                return Err(Refusal::NoLogicalOutputs);
-            }
-            for (i, id) in z.logical_output_ids.iter().enumerate() {
-                if !known_logical.iter().any(|k| k == id) {
-                    return Err(Refusal::UnknownLogicalOutput(id.clone()));
-                }
-                if z.logical_output_ids[..i].contains(id) {
-                    return Err(Refusal::DuplicateLogicalOutput(id.clone()));
-                }
-                if let Some((_, holder)) = seen.iter().find(|(l, _)| *l == id) {
-                    return Err(Refusal::SnapshotSharesLogicalOutput {
-                        logical_output_id: id.clone(),
-                        zones: (holder.to_string(), z.id.clone()),
-                    });
-                }
-                seen.push((id.as_str(), z.id.as_str()));
-            }
-        }
+        check_membership(known_logical, snapshot)?;
         let highest = snapshot
             .iter()
             .map(|z| id_number(&z.id).0)
