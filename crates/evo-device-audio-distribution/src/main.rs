@@ -305,6 +305,7 @@ fn audio_distribution_runtime_setup(
             let chain_controller =
                 Arc::new(evo_audio_topology::eq_chain::ChainController::new(
                     Arc::clone(&audio_topology_store),
+                    evo_audio_topology::eq_chain::AsoundPaths::system(),
                 ));
             tokio::spawn(Arc::clone(&chain_controller).follow(bus.subscribe()));
 

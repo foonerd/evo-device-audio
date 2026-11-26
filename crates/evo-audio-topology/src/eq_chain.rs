@@ -32,6 +32,14 @@
 //! The composition plugin holds no device in any mode but
 //! `eq_only`, so the chain going back to Direct needs no message
 //! to it: it has already let go.
+//!
+//! The EqInPath chain needs `pcm.evo_comp_in` in the ALSA
+//! configuration, which this distribution installs with the binary. A
+//! box where only the binary was updated has no such pcm, and MPD
+//! pointed at a name that does not exist plays nothing. The controller
+//! therefore checks the configuration before it publishes that chain
+//! and, when the pcm is missing, keeps the direct chain and says why:
+//! the EQ is not heard, but the music is.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -75,6 +83,68 @@ pub const COMP_CAPTURE_PCM: &str = "hw:Loopback,1,3";
 
 /// The pcm both chains end on: the one that reaches the DAC.
 pub const OUTPUT_PCM: &str = "evo";
+
+/// Where the ALSA configuration lives, for the check that the EQ
+/// chain's pcm exists.
+#[derive(Debug, Clone)]
+pub struct AsoundPaths {
+    /// The top-level configuration file.
+    pub conf: PathBuf,
+    /// The directory of drop-ins it includes.
+    pub dropin_dir: PathBuf,
+}
+
+impl AsoundPaths {
+    /// The paths on a device this distribution installs.
+    pub fn system() -> Self {
+        Self {
+            conf: PathBuf::from("/etc/asound.conf"),
+            dropin_dir: PathBuf::from("/etc/asound.d"),
+        }
+    }
+
+    /// Whether the configuration defines the pcm `name`, in the
+    /// top-level file or any drop-in. A file that cannot be read
+    /// counts as not defining it.
+    pub fn defines_pcm(&self, name: &str) -> bool {
+        let mut files = vec![self.conf.clone()];
+        if let Ok(entries) = std::fs::read_dir(&self.dropin_dir) {
+            let mut found: Vec<PathBuf> = entries
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "conf"))
+                .collect();
+            found.sort();
+            files.extend(found);
+        }
+        files
+            .iter()
+            .filter_map(|f| std::fs::read_to_string(f).ok())
+            .any(|text| text_defines_pcm(&text, name))
+    }
+}
+
+/// Whether ALSA configuration `text` defines the pcm `name`: a line
+/// that opens `pcm.<name>` (or its override form `pcm.!<name>`) and is
+/// not a comment. `pcm.<name>_other` is another name and does not
+/// count.
+pub fn text_defines_pcm(text: &str, name: &str) -> bool {
+    text.lines().any(|line| {
+        // A comment line cannot start with `pcm.`, so it never matches.
+        let line = line.trim_start();
+        let Some(rest) = line.strip_prefix("pcm.") else {
+            return false;
+        };
+        let rest = rest.strip_prefix('!').unwrap_or(rest);
+        let Some(after) = rest.strip_prefix(name) else {
+            return false;
+        };
+        after
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_whitespace() || c == '{' || c == '=')
+    })
+}
 
 /// Which chain is in force.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,21 +268,33 @@ struct State {
     /// `None` until something has been published, and again after a
     /// publish that failed, so the next change tries again.
     published: Option<ChainShape>,
+    /// The EQ chain is wanted but its pcm is missing, so the direct
+    /// chain stands in.
+    degraded: bool,
 }
 
 /// Keeps the published chain matching the composition mode.
 pub struct ChainController {
     store: Arc<AudioTopologyStore>,
+    asound: AsoundPaths,
     state: Mutex<State>,
 }
 
 impl ChainController {
-    /// A controller over `store`. It publishes nothing yet.
-    pub fn new(store: Arc<AudioTopologyStore>) -> Self {
+    /// A controller over `store`, checking `asound` for the EQ chain's
+    /// pcm. It publishes nothing yet.
+    pub fn new(store: Arc<AudioTopologyStore>, asound: AsoundPaths) -> Self {
         Self {
             store,
+            asound,
             state: Mutex::new(State::default()),
         }
+    }
+
+    /// Whether the EQ chain was wanted but is not being published
+    /// because its pcm is missing from the ALSA configuration.
+    pub async fn degraded(&self) -> bool {
+        self.state.lock().await.degraded
     }
 
     /// The composition plugin announced `mode`.
@@ -242,7 +324,29 @@ impl ChainController {
         if !st.armed {
             return;
         }
-        let want = ChainShape::for_mode(st.mode.as_deref().unwrap_or(""));
+        let mut want = ChainShape::for_mode(st.mode.as_deref().unwrap_or(""));
+        // The EQ chain points MPD at `evo_comp_in`; with no such pcm MPD
+        // opens nothing and the listener hears silence. Check each time
+        // it would be published, so a box fixed afterwards gets the
+        // chain at the next announcement.
+        let was_degraded = st.degraded;
+        st.degraded = false;
+        if want == ChainShape::EqInPath && !self.asound.defines_pcm(COMP_IN_PCM)
+        {
+            st.degraded = true;
+            if !was_degraded {
+                tracing::warn!(
+                    pcm = COMP_IN_PCM,
+                    conf = %self.asound.conf.display(),
+                    "audio chain: eq_only is chosen but the ALSA configuration \
+                     does not define the EQ chain's pcm; staying on the direct \
+                     chain so the music plays. LOGGING.md §2: the EQ is not \
+                     heard until the distribution's asound.conf is installed \
+                     with this binary and eq_only is chosen again."
+                );
+            }
+            want = ChainShape::Direct;
+        }
         if st.published == Some(want) {
             return;
         }
@@ -324,9 +428,30 @@ mod tests {
         controller: Arc<ChainController>,
         store: Arc<AudioTopologyStore>,
         routing: Arc<AudioRoutingRuntime>,
+        asound: AsoundPaths,
+        _dir: tempfile::TempDir,
     }
 
+    const STANZA: &str = "pcm.evo_comp_in {\n    type plug\n    slave.pcm \"hw:Loopback,0,3\"\n}\n";
+
+    /// A rig whose ALSA configuration defines the EQ chain's pcm, as an
+    /// installed device does.
     fn rig() -> Rig {
+        rig_with(Some(STANZA))
+    }
+
+    /// A rig whose top-level ALSA configuration holds `conf`, or does not
+    /// exist when `None`.
+    fn rig_with(conf: Option<&str>) -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let asound = AsoundPaths {
+            conf: dir.path().join("asound.conf"),
+            dropin_dir: dir.path().join("asound.d"),
+        };
+        std::fs::create_dir_all(&asound.dropin_dir).unwrap();
+        if let Some(c) = conf {
+            std::fs::write(&asound.conf, c).unwrap();
+        }
         let persistence: Arc<dyn PersistenceStore> =
             Arc::new(MemoryPersistenceStore::new());
         let routing = Arc::new(AudioRoutingRuntime::new());
@@ -337,9 +462,14 @@ mod tests {
             bus,
         ));
         Rig {
-            controller: Arc::new(ChainController::new(Arc::clone(&store))),
+            controller: Arc::new(ChainController::new(
+                Arc::clone(&store),
+                asound.clone(),
+            )),
             store,
             routing,
+            asound,
+            _dir: dir,
         }
     }
 
@@ -626,5 +756,117 @@ mod tests {
         }
         assert_eq!(r.controller.published().await, Some(ChainShape::EqInPath));
         task.abort();
+    }
+
+    // ----- the asound pairing check ------------------------------
+
+    #[test]
+    fn a_pcm_definition_is_recognised_in_its_real_forms_only() {
+        let name = "evo_comp_in";
+        for yes in [
+            "pcm.evo_comp_in {\n",
+            "pcm.evo_comp_in{\n",
+            "  pcm.evo_comp_in {\n",
+            "pcm.!evo_comp_in {\n",
+            "pcm.evo_comp_in = \"x\"\n",
+            "pcm.evo_comp_in\n",
+            "# header\npcm.evo {\n}\npcm.evo_comp_in {\n}\n",
+        ] {
+            assert!(text_defines_pcm(yes, name), "{yes:?}");
+        }
+        for no in [
+            "",
+            "# pcm.evo_comp_in {\n",
+            "   # pcm.evo_comp_in {\n",
+            "pcm.evo_comp_in_other {\n",
+            "pcm.evo_comp_inx {\n",
+            "pcm.evo {\n    slave.pcm \"evo_comp_in\"\n}\n",
+            "ctl.evo_comp_in {\n",
+            "xpcm.evo_comp_in {\n",
+        ] {
+            assert!(!text_defines_pcm(no, name), "{no:?}");
+        }
+    }
+
+    #[test]
+    fn the_pcm_is_found_in_the_conf_or_in_a_drop_in_and_not_otherwise() {
+        let r = rig_with(Some("pcm.evo {\n}\n"));
+        assert!(!r.asound.defines_pcm(COMP_IN_PCM));
+        std::fs::write(r.asound.dropin_dir.join("zz-extra.conf"), STANZA)
+            .unwrap();
+        assert!(r.asound.defines_pcm(COMP_IN_PCM), "a drop-in counts");
+        std::fs::write(r.asound.dropin_dir.join("notes.txt"), "pcm.other {\n")
+            .unwrap();
+        assert!(
+            !r.asound.defines_pcm("other"),
+            "only .conf drop-ins are read"
+        );
+        let none = rig_with(None);
+        assert!(!none.asound.defines_pcm(COMP_IN_PCM), "no file, no pcm");
+    }
+
+    /// A box whose binary is newer than its asound.conf keeps playing:
+    /// the EQ chain is not published, the direct one stays, and the
+    /// controller says it is degraded.
+    #[tokio::test]
+    async fn without_the_pcm_the_eq_chain_is_not_published_and_the_music_plays()
+    {
+        let r = rig_with(Some("pcm.evo {\n}\n"));
+        let source = r
+            .routing
+            .handle_for_plugin(SOURCE_PLUGIN, PluginAudioRole::Source);
+        r.controller.arm().await;
+        r.controller.observe_mode("eq_only").await;
+        assert_eq!(stored_stage_count(&r).await, Some(2), "still direct");
+        assert_eq!(r.controller.published().await, Some(ChainShape::Direct));
+        assert!(r.controller.degraded().await);
+        assert_eq!(
+            source.write_endpoint().unwrap().path,
+            PathBuf::from("evo"),
+            "MPD still writes the DAC's pcm"
+        );
+    }
+
+    /// A box that comes up in eq_only without the pcm is armed direct,
+    /// not silent.
+    #[tokio::test]
+    async fn arming_in_eq_only_without_the_pcm_is_direct() {
+        let r = rig_with(Some("pcm.evo {\n}\n"));
+        r.controller.observe_mode("eq_only").await;
+        r.controller.arm().await;
+        assert_eq!(stored_stage_count(&r).await, Some(2));
+        assert!(r.controller.degraded().await);
+    }
+
+    /// Once the pcm is installed the next announcement gets the EQ
+    /// chain; if it is taken away again the chain goes back to direct.
+    #[tokio::test]
+    async fn the_chain_follows_the_pcm_as_it_comes_and_goes() {
+        let r = rig_with(Some("pcm.evo {\n}\n"));
+        r.controller.arm().await;
+        r.controller.observe_mode("eq_only").await;
+        assert_eq!(stored_stage_count(&r).await, Some(2));
+        assert!(r.controller.degraded().await);
+
+        std::fs::write(&r.asound.conf, format!("pcm.evo {{\n}}\n{STANZA}"))
+            .unwrap();
+        r.controller.observe_mode("eq_only").await;
+        assert_eq!(stored_stage_count(&r).await, Some(3), "now the EQ chain");
+        assert!(!r.controller.degraded().await);
+
+        std::fs::write(&r.asound.conf, "pcm.evo {\n}\n").unwrap();
+        r.controller.observe_mode("eq_only").await;
+        assert_eq!(stored_stage_count(&r).await, Some(2), "back to direct");
+        assert!(r.controller.degraded().await);
+    }
+
+    /// The check applies to the EQ chain only: direct needs nothing.
+    #[tokio::test]
+    async fn the_direct_chain_needs_no_pcm_and_is_never_degraded() {
+        let r = rig_with(None);
+        r.controller.arm().await;
+        r.controller.observe_mode("passthrough").await;
+        assert_eq!(stored_stage_count(&r).await, Some(2));
+        assert!(!r.controller.degraded().await);
     }
 }
