@@ -146,6 +146,21 @@ pub fn text_defines_pcm(text: &str, name: &str) -> bool {
     })
 }
 
+/// Whether boot rehydration should re-publish the stored chain for
+/// `target_key`.
+///
+/// The default chain is the controller's: it publishes the chain the
+/// composition mode wants when it arms after admission. A stored EQ
+/// chain re-published ahead of that hands the composition plugin
+/// endpoints for a chain that may no longer be wanted (the mode was
+/// changed, or the pcm it needs is gone), and a plugin is never told
+/// that a chain was withdrawn: with `eq_only` recorded it would open
+/// the output and hold it against the source that has it back. Every
+/// other target is rehydrated as before.
+pub fn rehydrates(target_key: &str) -> bool {
+    target_key != DEFAULT_TARGET_KEY
+}
+
 /// Which chain is in force.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainShape {
@@ -868,5 +883,15 @@ mod tests {
         r.controller.observe_mode("passthrough").await;
         assert_eq!(stored_stage_count(&r).await, Some(2));
         assert!(!r.controller.degraded().await);
+    }
+
+    #[test]
+    fn the_default_chain_is_the_controllers_and_every_other_target_is_rehydrated(
+    ) {
+        assert!(!rehydrates(DEFAULT_TARGET_KEY));
+        assert!(!rehydrates("evo-device-audio:default"));
+        assert!(rehydrates("usb:vid=0x21b4,pid=0x0096"));
+        assert!(rehydrates("evo-device-audio:default-2"));
+        assert!(rehydrates(""));
     }
 }

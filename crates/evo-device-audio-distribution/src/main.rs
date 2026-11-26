@@ -255,6 +255,16 @@ fn audio_distribution_runtime_setup(
                 Ok(rows) => {
                     let count = rows.len();
                     for topology in rows {
+                        // The default chain is the controller's, published
+                        // when it arms after admission. Re-publishing the
+                        // stored one first would give the composition
+                        // plugin endpoints for a chain that may no longer
+                        // be wanted.
+                        if !evo_audio_topology::eq_chain::rehydrates(
+                            &topology.target_key,
+                        ) {
+                            continue;
+                        }
                         let target = topology.target_key.clone();
                         if let Err(e) = audio_topology_store
                             .publish(topology, "system:rehydrate")
