@@ -1433,6 +1433,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "evo-apply-update"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "flate2",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "evo-audio-topology"
 version = "0.1.13"
 dependencies = [
@@ -4102,6 +4118,21 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+ "tracing",
+]
+
+[[package]]
+name = "org-evoframework-system-updater"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "evo-apply-update",
+ "evo-plugin-sdk",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
 ]
 

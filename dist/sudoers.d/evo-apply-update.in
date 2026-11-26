@@ -1,0 +1,7 @@
+# Narrow NOPASSWD grant for the updater's request wrapper.
+# The wrapper is root-owned, installed mode 0755. It parses a closed
+# grammar (check | apply <component> <version> | channel <value>) and
+# refuses anything else before it starts one unit instance. It fetches,
+# verifies and installs nothing itself.
+
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: /usr/local/bin/evo-apply-update

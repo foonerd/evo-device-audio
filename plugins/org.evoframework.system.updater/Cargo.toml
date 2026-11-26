@@ -1,0 +1,39 @@
+[package]
+name = "org-evoframework-system-updater"
+# Keep in sync with manifest.toml [plugin].version and PluginIdentity in describe().
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Stocks the system.updater shelf: check, status, apply, history and channel verbs over the distribution's root updater helper. The plugin fetches, verifies and installs nothing itself."
+
+[lib]
+path = "src/lib.rs"
+
+# Out-of-process wire binary cross-built by `dist/scripts/deploy-distribution.sh`
+# and staged under `/opt/evo/plugins/org.evoframework.system.updater/`; the
+# framework's Phase-2 discovery walks the search root at boot and admits the
+# bundle.
+[[bin]]
+name = "system-updater-wire"
+path = "src/bin/system-updater-wire.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+# The helper's own closed grammar and clock, so the surface refuses what
+# the helper would refuse and the two cannot drift.
+evo-apply-update = { path = "../../crates/evo-apply-update" }
+evo-plugin-sdk = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+[lints]
+workspace = true

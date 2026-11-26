@@ -31,6 +31,7 @@
 #       alsa/asound.conf
 #       mpd/evo-fragment.conf
 #       etc-evo/*                 (operator config seeds)
+#       etc-updater/*             (updater.toml, allow.toml)
 #       keys/                     (trust roots:
 #                                  commons-plugin-signing-public.{pem,meta.toml})
 #       README.md                 (bring-up procedure
@@ -176,6 +177,17 @@ trap 'rm -rf "${STAGE_DIR}"' EXIT
 echo "[1/5] stage steward binary ..."
 install -d -m 0755 "${STAGE_DIR}/bin"
 install -m 0755 "${DIST_BIN_PATH}" "${STAGE_DIR}/bin/${DIST_BIN}"
+# The updater helper: the sudo target and the unit's worker.
+# bootstrap.sh places them as root; the updater never delivers itself.
+for UPDATER_BIN in evo-apply-update evo-apply-update-worker; do
+    UPDATER_BIN_PATH="${REPO_ROOT}/target/${TARGET_TRIPLE}/release/${UPDATER_BIN}"
+    if [[ ! -x "${UPDATER_BIN_PATH}" ]]; then
+        echo "FAIL: ${UPDATER_BIN} missing at ${UPDATER_BIN_PATH}" >&2
+        echo "      run: scripts/cross-build.sh ${TARGET_TRIPLE} --release -p evo-apply-update" >&2
+        exit 2
+    fi
+    install -m 0755 "${UPDATER_BIN_PATH}" "${STAGE_DIR}/bin/${UPDATER_BIN}"
+done
 echo "  ok"
 
 echo "[2/5] stage + sign plugin bundles ..."
@@ -241,6 +253,9 @@ cp -a "${REPO_ROOT}/dist/sudoers.d/." "${STAGE_DIR}/dist/sudoers.d/"
 install -d -m 0755 "${STAGE_DIR}/dist/systemd/evo.service.d"
 cp -a "${REPO_ROOT}/dist/systemd/evo.service.d/." \
     "${STAGE_DIR}/dist/systemd/evo.service.d/"
+# The updater's worker unit; bootstrap's updater step places it.
+install -m 0644 "${REPO_ROOT}/dist/systemd/evo-apply-update@.service" \
+    "${STAGE_DIR}/dist/systemd/evo-apply-update@.service"
 # Framework systemd unit (the installer ships it — collapses
 # the framework's prototype-install.sh role).
 if [[ -f "${ENG_ROOT}/dist/systemd/evo.service.example" ]]; then
@@ -306,6 +321,9 @@ if [[ -d "${REPO_ROOT}/dist/etc-evo" ]]; then
     cp -a "${REPO_ROOT}/dist/etc-evo/." "${STAGE_DIR}/dist/etc-evo/"
 fi
 # Trust roots.
+# updater config seeds (updater.toml, allow.toml).
+install -d -m 0755 "${STAGE_DIR}/dist/etc-updater"
+cp -a "${REPO_ROOT}/dist/etc-updater/." "${STAGE_DIR}/dist/etc-updater/"
 install -d -m 0755 "${STAGE_DIR}/dist/keys"
 cp -a "${REPO_ROOT}/dist/keys/." "${STAGE_DIR}/dist/keys/"
 # Plugin data files referenced by bootstrap (e.g. DAC

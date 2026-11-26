@@ -522,6 +522,23 @@ Music files and share passwords are never in a backup.
 """
 
 [[racks.shelves]]
+name = "updater"
+shape = 1
+description = """
+The in-app updater. Stocked by org.evoframework.system.updater: \
+updater.check starts a check of the recorded channel's signed \
+registry, updater.apply starts one offered component (a plugin, \
+or the host files), updater.channel.set records alpha, test or \
+production; updater.status, updater.history and \
+updater.channel.get read what the root helper recorded. The \
+three that start work gate at `write:system_admin`; the reads \
+gate at scope `system`. The plugin fetches and installs nothing: \
+a root helper verifies the signed documents and hashes, keeps \
+the previous bundle, never touches plugin state, and restores \
+the previous bundle when the new one is not admitted.
+"""
+
+[[racks.shelves]]
 name = "locale"
 shape = 1
 description = """

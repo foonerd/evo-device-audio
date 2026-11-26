@@ -1,0 +1,57 @@
+[plugin]
+name = "org.evoframework.system.updater"
+# Keep equal to Cargo.toml `version`.
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "system.updater"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.13"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 2
+
+[lifecycle]
+mode = "reactive-only"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = [
+    "updater.check",
+    "updater.status",
+    "updater.apply",
+    "updater.history",
+    "updater.channel.get",
+    "updater.channel.set",
+]
+response_budget_ms = 5000
+
+# Reads show what the helper recorded. The three that start work are
+# writes at system_admin, as the backup's verbs are.
+[capabilities.respondent.verb_capabilities]
+"updater.check" = { kind = "write", scope = "system_admin" }
+"updater.apply" = { kind = "write", scope = "system_admin" }
+"updater.channel.set" = { kind = "write", scope = "system_admin" }
+"updater.status" = { kind = "read", scope = "system" }
+"updater.history" = { kind = "read", scope = "system" }
+"updater.channel.get" = { kind = "read", scope = "system" }

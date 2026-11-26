@@ -2,6 +2,14 @@
 
 All notable changes to evo-device-audio are recorded here.
 
+## Unreleased
+
+- In-app updater: the `org.evoframework.system.updater` plugin and a root
+  helper (`evo-apply-update`) that checks a signed registry, applies one
+  plugin at a time with the previous bundle kept and a restore if the new
+  one is not admitted, delivers the host wrappers and sudoers grants, and
+  writes the installed release record. See `dist/UPDATER.md`.
+
 ## [0.1.13] - 2026-09-01
 
 First public release of the evo-device-audio plugin commons for

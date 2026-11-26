@@ -1,0 +1,37 @@
+schema_version: "1.0"
+plugin: org.evoframework.system.updater
+owner: evo-device-audio
+isolation: oop
+has_os_dependencies: true
+
+# The surface of the distribution's updater. The plugin
+# fetches, verifies and installs nothing: every start of work is one call
+# to the root request wrapper, which parses a closed grammar and starts a
+# transient unit. Results are read from the helper's root-owned state
+# directory. A write verb is gated by the framework dispatcher at
+# write:system_admin before the request reaches the plugin.
+
+capability_intent:
+  - id: updater_request_wrapper
+    need: invoke `sudo -n /usr/local/bin/evo-apply-update <check | apply <component> <version> | channel <alpha|test|production>>`, the narrow NOPASSWD grant `dist/sudoers.d/evo-apply-update.in` renders for the service user. The plugin validates the same closed grammar first and passes exactly those arguments; it passes no path, URL or key. The wrapper answers one JSON line and starts a transient root unit; it does the work, not the plugin.
+    access_path: sudoers/command
+    failure_mode: check, apply and channel.set answer `accepted:false` with `error.code = helper_unavailable` and the sudo or wrapper text; status, history and channel.get still answer from the recorded state.
+  - id: updater_state_read
+    need: read `status.json`, `inventory.json`, `history.jsonl` and `channel` in `/var/lib/evo-updater/` (root-owned, world-readable). The plugin writes none of them.
+    access_path: filesystem/system
+    failure_mode: a missing or unparseable file answers an empty field (state `idle`, inventory null, history empty, channel `production`); the verb still answers.
+
+required_binaries:
+  - name: sudo
+    min_version: "1.9"
+    failure_mode: refuse to admit; the narrow NOPASSWD grant relies on sudoers parsing introduced in 1.9.
+
+required_kernel_modules: []
+required_system_services: []
+
+verification:
+  commands:
+    - "test -x /usr/local/bin/evo-apply-update"
+  expected:
+    - the updater helper is installed
+host_provisioning: {}

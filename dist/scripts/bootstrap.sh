@@ -37,6 +37,7 @@
 #   EVO_INSTALL_NETWORK_CAPTIVE_SUDOERS=0 — skip /etc/sudoers.d/evo-network-captive
 #   EVO_INSTALL_NETWORK_AP_VIF_CONF=0  — skip /etc/NetworkManager/conf.d/evo-ap-vif.conf
 #                                       + /usr/local/bin/evo-captive-probe
+#   EVO_INSTALL_UPDATER=0              — skip the updater helper
 #   EVO_INSTALL_HARDWARE_AUDIO_SUDOERS=0 — skip /etc/sudoers.d/evo-hardware-audio
 #   EVO_INSTALL_SYSTEM_POWER_SUDOERS=0  — skip /etc/sudoers.d/evo-system-power
 #   EVO_INSTALL_DACS_CATALOGUE=0       — skip /usr/share/evo-device-audio/dacs.json install
@@ -912,6 +913,22 @@ install -m 0440 -o root -g root "$TMP" "$SET_TIMEZONE_SUDOERS_FILE"
 rm -f "$TMP"
 trap - EXIT
 echo "[bootstrap] installed $SET_TIMEZONE_WRAPPER_DST and $SET_TIMEZONE_SUDOERS_FILE"
+
+# ----------------------------------------------------------
+# Step 1j: the updater helper
+# ----------------------------------------------------------
+# /usr/local/bin/evo-apply-update (the sudo target), its worker, the
+# transient unit, /etc/evo-updater (config, allow list, trust) and the
+# sudoers grant. The helper cannot deliver itself; this is the one place a
+# box gets it. Skipped with EVO_INSTALL_UPDATER=0.
+if [[ "${EVO_INSTALL_UPDATER:-1}" != "0" ]]; then
+    UPDATER_BIN_DIR="${EVO_BUNDLE_BIN_DIR:-$DIST_DIR/../bin}"
+    bash "$DIST_DIR/scripts/install-updater.sh" \
+        --dist "$DIST_DIR" --bin-dir "$UPDATER_BIN_DIR" \
+        --service-user "$SERVICE_USER"
+else
+    echo "[bootstrap] EVO_INSTALL_UPDATER=0 — skipping the updater helper"
+fi
 
 # ----------------------------------------------------------
 # Step 1d: /usr/share/evo-device-audio/dacs.json

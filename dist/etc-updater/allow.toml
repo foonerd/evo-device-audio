@@ -1,0 +1,67 @@
+# The only files the updater may ever write outside plugin bundles
+#. Root-owned and placed by the installer; the
+# updater cannot change it. A carrier that names a file not listed here is
+# refused whole. Widening this list is an installer change.
+#
+# `create = true` means the file is placed where it is absent; `false`
+# means it is only replaced where the installer already put it.
+
+[[file]]
+kind = "bin"
+name = "evo-rtc-wake"
+create = true
+
+[[file]]
+kind = "bin"
+name = "evo-set-timezone"
+create = true
+
+[[file]]
+kind = "bin"
+name = "evo-captive-probe"
+create = false
+
+[[file]]
+kind = "sudoers"
+name = "evo-rtc-wake"
+create = true
+
+[[file]]
+kind = "sudoers"
+name = "evo-set-timezone"
+create = true
+
+[[file]]
+kind = "sudoers"
+name = "evo-hardware-audio"
+create = false
+
+[[file]]
+kind = "sudoers"
+name = "evo-mpd-restart"
+create = false
+
+[[file]]
+kind = "sudoers"
+name = "evo-network-captive"
+create = false
+
+[[file]]
+kind = "sudoers"
+name = "evo-network-nm"
+create = false
+
+[[file]]
+kind = "sudoers"
+name = "evo-set-kiosk-password"
+create = false
+
+[[file]]
+kind = "sudoers"
+name = "evo-system-kiosk"
+create = false
+
+[[file]]
+kind = "sudoers"
+name = "evo-system-power"
+create = false

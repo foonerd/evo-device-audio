@@ -1,0 +1,13 @@
+# The updater's configuration. Root-owned. The worker reads it
+# and nothing else decides where it fetches from.
+#
+# base_url is the artefacts plane. Every document and bundle URL the
+# worker follows must sit under it. HTTPS only.
+base_url = "https://raw.githubusercontent.com/foonerd/evo-device-audio-artefacts/main"
+
+# A lab origin with its own certificate names a CA bundle here (a
+# root-owned file). Production leaves it unset.
+# ca_file = "/etc/evo-updater/lab-ca.pem"
+
+# Largest bundle or carrier the worker will fetch.
+max_bundle_bytes = 67108864
