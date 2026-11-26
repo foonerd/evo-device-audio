@@ -15,6 +15,7 @@
 //! fresh load starts with none. It is not crossfade, it is not an
 //! alarm, and it does not program the RTC.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +24,7 @@ use serde_json::{json, Value};
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::PLUGIN_NAME;
 
@@ -43,6 +45,24 @@ pub(crate) struct SleepTimer {
 struct Armed {
     cancel: oneshot::Sender<()>,
     task: JoinHandle<()>,
+    /// When it was armed, how long it waits, how long it fades.
+    started: Instant,
+    wait: Duration,
+    fade: Duration,
+    /// Set by the task when the wait is over and the fade begins.
+    fading: Arc<AtomicBool>,
+}
+
+/// What a timer is doing now, for a surface that shows it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Snapshot {
+    /// `waiting` before the fade, `fading` from its first step.
+    pub(crate) phase: &'static str,
+    /// Whole seconds until the fade begins, rounded up; 0 while
+    /// fading.
+    pub(crate) seconds_remaining: u64,
+    /// How long the fade takes, milliseconds.
+    pub(crate) fade_ms: u64,
 }
 
 impl Armed {
@@ -74,8 +94,22 @@ impl SleepTimer {
             old.disarm().await;
         }
         let (cancel, cancelled) = oneshot::channel();
-        let task = tokio::spawn(run(dispatcher, wait, fade, cancelled));
-        *slot = Some(Armed { cancel, task });
+        let fading = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(run(
+            dispatcher,
+            wait,
+            fade,
+            cancelled,
+            Arc::clone(&fading),
+        ));
+        *slot = Some(Armed {
+            cancel,
+            task,
+            started: Instant::now(),
+            wait,
+            fade,
+            fading,
+        });
         tracing::info!(
             plugin = PLUGIN_NAME,
             wait_s = wait.as_secs(),
@@ -90,6 +124,30 @@ impl SleepTimer {
             old.disarm().await;
             tracing::info!(plugin = PLUGIN_NAME, "sleep timer cancelled");
         }
+    }
+
+    /// The timer as it stands now, or `None` when none is waiting or
+    /// fading. A timer whose task has ended is not armed, even
+    /// before it is taken out of the slot.
+    pub(crate) async fn snapshot(&self) -> Option<Snapshot> {
+        let slot = self.armed.lock().await;
+        let a = slot.as_ref().filter(|a| !a.task.is_finished())?;
+        let fade_ms = u64::try_from(a.fade.as_millis()).unwrap_or(u64::MAX);
+        if a.fading.load(Ordering::SeqCst) {
+            return Some(Snapshot {
+                phase: "fading",
+                seconds_remaining: 0,
+                fade_ms,
+            });
+        }
+        let left =
+            (a.started + a.wait).saturating_duration_since(Instant::now());
+        Some(Snapshot {
+            phase: "waiting",
+            seconds_remaining: left.as_secs()
+                + u64::from(left.subsec_nanos() > 0),
+            fade_ms,
+        })
     }
 
     /// Whether a timer is waiting or fading.
@@ -109,11 +167,13 @@ async fn run(
     wait: Duration,
     fade: Duration,
     mut cancelled: oneshot::Receiver<()>,
+    fading: Arc<AtomicBool>,
 ) {
     tokio::select! {
         _ = tokio::time::sleep(wait) => {}
         _ = &mut cancelled => return,
     }
+    fading.store(true, Ordering::SeqCst);
     let d = &*dispatcher;
     // The level the fade starts from is the level it returns to.
     // Without it there is nothing to restore, so there is no fade:

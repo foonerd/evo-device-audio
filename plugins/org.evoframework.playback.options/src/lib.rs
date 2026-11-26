@@ -313,6 +313,7 @@ const REQUEST_TYPES: &[&str] = &[
     "options.restore_last_known_good",
     "options.reset_to_defaults",
     "options.set_sleep_timer",
+    "options.get_sleep_timer",
 ];
 
 /// Upper bound for the crossfade-seconds operator setting.
@@ -1773,6 +1774,9 @@ impl Respondent for PlaybackOptionsPlugin {
                 "options.reset_to_defaults" => {
                     self.handle_reset_to_defaults(req).await
                 }
+                "options.get_sleep_timer" => {
+                    self.handle_get_sleep_timer(req).await
+                }
                 "options.set_sleep_timer" => {
                     self.handle_set_sleep_timer(req).await
                 }
@@ -2481,6 +2485,33 @@ impl PlaybackOptionsPlugin {
                 status: "ok",
             },
         )
+    }
+
+    /// Read the sleep timer: whether one is waiting or fading, and
+    /// how long until the fade. Reads only; nothing is armed,
+    /// cancelled or written.
+    async fn handle_get_sleep_timer(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        parse_versioned::<EmptyPayload>(req)?;
+        let answer = match self.sleep_timer.snapshot().await {
+            Some(t) => serde_json::json!({
+                "v": PAYLOAD_VERSION,
+                "armed": true,
+                "phase": t.phase,
+                "seconds_remaining": t.seconds_remaining,
+                "fade_ms": t.fade_ms,
+            }),
+            None => serde_json::json!({
+                "v": PAYLOAD_VERSION,
+                "armed": false,
+                "phase": null,
+                "seconds_remaining": null,
+                "fade_ms": null,
+            }),
+        };
+        encode(req, &answer)
     }
 
     /// Arm, replace, or cancel the sleep timer. `seconds` is the
@@ -4886,6 +4917,124 @@ mod tests {
         advance(Duration::from_secs(60)).await;
         assert!(stub.calls().is_empty());
         p.handle_request(&sleep_timer(0, 0)).await.unwrap();
+    }
+
+    async fn read_sleep_timer(p: &PlaybackOptionsPlugin) -> Value {
+        let resp = p
+            .handle_request(&req("options.get_sleep_timer", json!({ "v": 1 })))
+            .await
+            .unwrap();
+        serde_json::from_slice(&resp.payload).unwrap()
+    }
+
+    /// The read answers none armed before any set, and after a cancel.
+    #[tokio::test(start_paused = true)]
+    async fn the_sleep_timer_read_answers_none_armed() {
+        let stub = StubPlayback::at(50);
+        let (p, _dir) = plugin_with_playback(&stub).await;
+        let none = json!({
+            "v": 1, "armed": false, "phase": null,
+            "seconds_remaining": null, "fade_ms": null
+        });
+        assert_eq!(read_sleep_timer(&p).await, none);
+        p.handle_request(&sleep_timer(30, 2000)).await.unwrap();
+        p.handle_request(&sleep_timer(0, 0)).await.unwrap();
+        assert_eq!(read_sleep_timer(&p).await, none);
+    }
+
+    /// While the timer waits the read gives the time to the fade,
+    /// rounded up to a whole second, and the fade length.
+    #[tokio::test(start_paused = true)]
+    async fn the_sleep_timer_read_counts_down_while_it_waits() {
+        let stub = StubPlayback::at(50);
+        let (p, _dir) = plugin_with_playback(&stub).await;
+        p.handle_request(&sleep_timer(30, 2000)).await.unwrap();
+        let t = read_sleep_timer(&p).await;
+        assert_eq!(
+            (
+                t["armed"].clone(),
+                t["phase"].clone(),
+                t["seconds_remaining"].clone(),
+                t["fade_ms"].clone()
+            ),
+            (json!(true), json!("waiting"), json!(30), json!(2000))
+        );
+        advance(Duration::from_secs(10)).await;
+        assert_eq!(read_sleep_timer(&p).await["seconds_remaining"], 20);
+        advance(Duration::from_millis(500)).await;
+        assert_eq!(
+            read_sleep_timer(&p).await["seconds_remaining"],
+            20,
+            "19.5 s left reads as 20"
+        );
+        advance(Duration::from_millis(19_400)).await;
+        assert_eq!(read_sleep_timer(&p).await["seconds_remaining"], 1);
+    }
+
+    /// From the first step of the fade the read says so, with no
+    /// time left to wait; when the timer has paused it is not armed.
+    #[tokio::test(start_paused = true)]
+    async fn the_sleep_timer_read_shows_the_fade_then_none() {
+        let stub = StubPlayback::at(50);
+        let (p, _dir) = plugin_with_playback(&stub).await;
+        p.handle_request(&sleep_timer(5, 4000)).await.unwrap();
+        advance(Duration::from_secs(7)).await;
+        let t = read_sleep_timer(&p).await;
+        assert_eq!(
+            (
+                t["armed"].clone(),
+                t["phase"].clone(),
+                t["seconds_remaining"].clone(),
+                t["fade_ms"].clone()
+            ),
+            (json!(true), json!("fading"), json!(0), json!(4000))
+        );
+        advance(Duration::from_secs(10)).await;
+        assert_eq!(read_sleep_timer(&p).await["armed"], false);
+        assert!(stub.verbs().iter().any(|v| v == "pause"));
+    }
+
+    /// A second set replaces the timer, and the read follows it.
+    #[tokio::test(start_paused = true)]
+    async fn the_sleep_timer_read_follows_a_replacement() {
+        let stub = StubPlayback::at(50);
+        let (p, _dir) = plugin_with_playback(&stub).await;
+        p.handle_request(&sleep_timer(30, 2000)).await.unwrap();
+        advance(Duration::from_secs(10)).await;
+        p.handle_request(&sleep_timer(90, 6000)).await.unwrap();
+        let t = read_sleep_timer(&p).await;
+        assert_eq!(
+            (t["seconds_remaining"].clone(), t["fade_ms"].clone()),
+            (json!(90), json!(6000))
+        );
+    }
+
+    /// Reading is not touching: the read sends `audio.playback`
+    /// nothing, and the timer runs on exactly as it would have.
+    #[tokio::test(start_paused = true)]
+    async fn the_sleep_timer_read_changes_nothing() {
+        let stub = StubPlayback::at(60);
+        let (p, _dir) = plugin_with_playback(&stub).await;
+        p.handle_request(&sleep_timer(10, 1000)).await.unwrap();
+        for _ in 0..5 {
+            read_sleep_timer(&p).await;
+            advance(Duration::from_secs(1)).await;
+        }
+        assert!(stub.calls().is_empty(), "nothing is sent while it waits");
+        advance(Duration::from_secs(10)).await;
+        assert!(stub.verbs().iter().any(|v| v == "pause"), "it still pauses");
+        assert_eq!(stub.volume(), 60, "and the volume is back");
+    }
+
+    /// An unknown payload version is refused.
+    #[tokio::test(start_paused = true)]
+    async fn the_sleep_timer_read_refuses_another_payload_version() {
+        let stub = StubPlayback::at(50);
+        let (p, _dir) = plugin_with_playback(&stub).await;
+        assert!(p
+            .handle_request(&req("options.get_sleep_timer", json!({ "v": 2 })))
+            .await
+            .is_err());
     }
 
     /// A cancel during the fade stops it and puts the volume back
