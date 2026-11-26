@@ -1,15 +1,105 @@
 #!/usr/bin/env bash
+# evo-rtc-wake <utc-epoch-seconds>
+#
+# Program the RTC wake alarm, in the RTC's own time.
+#
+# The argument is a UTC instant. The kernel's wakealarm node takes
+# epoch seconds and writes them into the RTC as calendar fields, and
+# it reads the RTC's fields back as UTC. That is right when the RTC
+# holds UTC, which Linux-only machines and the Raspberry Pi do. It is
+# wrong when the RTC holds local wall time, which a machine shared
+# with an OS that keeps the hardware clock in local time does: the
+# alarm would fire a whole zone offset away from the instant asked.
+#
+# So the wrapper measures instead of assuming. `since_epoch` is the
+# RTC's fields read as UTC; its distance from the system clock is the
+# RTC's offset.
+#
+#   within 2 minutes of the system clock     RTC holds UTC (drift is
+#                                            not a zone and is left alone)
+#   within 2 minutes of a multiple of 15 min the RTC holds local time, and
+#   from 30 min to 14 h away                 that multiple is its offset
+#                                            (no zone is 15 min from UTC)
+#   anything else                            refused: it cannot be told
+#                                            from an unsynchronised clock
+#
+# The wake is then programmed as the instant plus the RTC's offset
+# as it is now. That is the RTC's own value, not the zone's value at
+# the wake: a powered-off RTC across a daylight-saving change still
+# holds the old wall time and keeps ticking from it.
+#
+# After the write the node is read back and must hold what was
+# written. One line says what was done.
+#
+# Exit codes: 1 bad argument, 2 the wake would precede the RTC's
+# epoch, 3 the RTC's offset cannot be told, 4 the node did not keep
+# the value.
 set -euo pipefail
 
 readonly RTC_WAKEALARM_PATH="/sys/class/rtc/rtc0/wakealarm"
-readonly RTC_SECONDS_RE='^[0-9]+$'
+readonly RTC_SINCE_EPOCH_PATH="/sys/class/rtc/rtc0/since_epoch"
+readonly RTC_SECONDS_RE='^[0-9]{1,12}$'
+readonly DRIFT_TOLERANCE=120
+readonly ZONE_STEP=900
+readonly ZONE_MIN=1800
+readonly ZONE_MAX=50400
+
+now_utc() { date -u +%s; }
 
 if [[ $# -ne 1 || ! "$1" =~ $RTC_SECONDS_RE ]]; then
     echo "evo-rtc-wake: expected one non-negative UTC epoch-seconds argument" >&2
     exit 1
 fi
+target=$((10#$1))
 
-# Linux wakealarm consumes UTC Unix epoch seconds. Clear first so
-# replacing an alarm never leaves the previous wake programmed.
+abs() { local v=$1; echo $((v < 0 ? -v : v)); }
+
+# The RTC's offset from UTC, in seconds, or a refusal.
+rtc_offset() {
+    local rtc now delta n snapped
+    if ! rtc="$(cat "$RTC_SINCE_EPOCH_PATH" 2>/dev/null)" || [[ ! "$rtc" =~ ^[0-9]+$ ]]; then
+        echo "evo-rtc-wake: cannot read the RTC time from $RTC_SINCE_EPOCH_PATH" >&2
+        return 3
+    fi
+    now="$(now_utc)"
+    delta=$((rtc - now))
+    if (( $(abs "$delta") <= DRIFT_TOLERANCE )); then
+        echo 0
+        return 0
+    fi
+    if (( delta >= 0 )); then n=$(((delta + ZONE_STEP / 2) / ZONE_STEP)); else n=$(((delta - ZONE_STEP / 2) / ZONE_STEP)); fi
+    snapped=$((n * ZONE_STEP))
+    if (( $(abs $((delta - snapped))) <= DRIFT_TOLERANCE && $(abs "$snapped") >= ZONE_MIN && $(abs "$snapped") <= ZONE_MAX )); then
+        echo "$snapped"
+        return 0
+    fi
+    echo "evo-rtc-wake: the RTC reads ${delta}s from the system clock, which is neither drift nor a zone offset; not programming" >&2
+    return 3
+}
+
+# Clearing never needs the RTC's offset.
+if (( target == 0 )); then
+    printf '%s' '0' > "$RTC_WAKEALARM_PATH"
+    echo "evo-rtc-wake: cleared"
+    exit 0
+fi
+
+offset="$(rtc_offset)" || exit $?
+programmed=$((target + offset))
+if (( programmed <= 0 )); then
+    echo "evo-rtc-wake: the wake at $target is before the RTC's epoch ($offset s offset)" >&2
+    exit 2
+fi
+
+# Clear first so replacing an alarm never leaves the previous wake programmed.
 printf '%s' '0' > "$RTC_WAKEALARM_PATH"
-printf '%s' "$1" > "$RTC_WAKEALARM_PATH"
+printf '%s' "$programmed" > "$RTC_WAKEALARM_PATH"
+
+readback="$(cat "$RTC_WAKEALARM_PATH")"
+if [[ "$readback" != "$programmed" ]]; then
+    echo "evo-rtc-wake: wrote $programmed but the node holds '${readback}'" >&2
+    exit 4
+fi
+
+if (( offset == 0 )); then mode=utc; else mode=local; fi
+echo "evo-rtc-wake: rtc=$mode offset=${offset}s wake=$target programmed=$programmed"

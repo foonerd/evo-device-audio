@@ -30,6 +30,16 @@ with no installed record, a newer release, a changed carrier, or a missing
 or different wrapper. Downgrades are never offered. A plugin that is not
 installed is not offered.
 
+## Who may start it
+
+The three verbs that start work are writes at `system_admin`, so they
+follow the household protection level, as the backup, timezone and power
+verbs do. Under "This is a home player" and "Everyday use" an unpaired
+client on the LAN may start a check, record a channel or start an apply.
+From "Visitors can play" up they are refused with
+`household_policy_locked`, and the three reads stay open. What an apply can
+install is bounded by the signed documents and hashes, not by who asked.
+
 ## What an apply does
 
 1. Fetches the bundle named by the signed registry, from under the
