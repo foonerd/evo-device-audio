@@ -216,7 +216,17 @@ pcm.evo_loopback_capture {
 /// Atomic write: temp file in the same directory, fsync, rename
 /// over the target. Concurrent readers see prior or next, never
 /// partial.
+///
+/// A file that already holds exactly `body` is left alone. The
+/// playback plugin's asound watcher restarts MPD whenever a file under
+/// `/etc/asound.d/` changes, and a rewrite with the same bytes is a
+/// change to it: the placeholder is written at every load and every
+/// teardown, and each write restarted MPD for nothing. An unreadable
+/// or different file is written as before.
 fn write_atomic(target: &Path, body: &str) -> Result<(), DropInError> {
+    if std::fs::read(target).is_ok_and(|have| have == body.as_bytes()) {
+        return Ok(());
+    }
     let dir = target.parent().unwrap_or(Path::new("."));
     let temp = dir.join(format!(
         ".{}.tmp.{}",
@@ -353,6 +363,37 @@ mod tests {
         write_atomic(&target, "first").unwrap();
         write_atomic(&target, "second").unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "second");
+    }
+
+    #[test]
+    fn an_identical_write_leaves_the_file_untouched() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempdir();
+        let target = dir.join("zz-evo-multiroom-source.conf");
+        write_atomic(&target, DISENGAGED_PLACEHOLDER).unwrap();
+        let before = std::fs::metadata(&target).unwrap();
+        // A rename onto the target makes a new inode, so an unchanged
+        // inode and mtime mean nothing was written.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        write_atomic(&target, DISENGAGED_PLACEHOLDER).unwrap();
+        let after = std::fs::metadata(&target).unwrap();
+        assert_eq!(before.ino(), after.ino(), "same file");
+        assert_eq!(before.mtime_nsec(), after.mtime_nsec(), "same mtime");
+        assert_eq!(before.mtime(), after.mtime());
+    }
+
+    #[test]
+    fn a_different_write_replaces_the_file_and_a_missing_one_is_created() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempdir();
+        let target = dir.join("zz-evo-multiroom-source.conf");
+        assert!(!target.exists());
+        write_atomic(&target, "first").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "first");
+        let ino = std::fs::metadata(&target).unwrap().ino();
+        write_atomic(&target, "second").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "second");
+        assert_ne!(std::fs::metadata(&target).unwrap().ino(), ino, "replaced");
     }
 
     fn tempdir() -> std::path::PathBuf {
