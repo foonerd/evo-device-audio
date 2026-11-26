@@ -3,7 +3,7 @@
 //! Tests for the system.backup plugin, against a stub that stands
 //! in for the six owners: audio.delivery, audio.zones,
 //! audio.playlist, audio.options, audio.favourites and audio.alarm
-//! (audio.zones also answers the scene verbs).
+//! (audio.zones also answers the scene verbs) and system.locale.
 
 use std::sync::Mutex;
 
@@ -29,6 +29,15 @@ struct Owners {
     alarm: Option<Value>,
     /// The scenes, as `scene.get` answers them, in first-saved order.
     scenes: Vec<Value>,
+    /// The operator's language, and the tags `language.set` applies.
+    language: String,
+    catalogues: Vec<String>,
+    /// The zone in force, and the zones the host holds.
+    timezone: String,
+    host_zones: Vec<String>,
+    /// Whether `timezone.set`, dispatched by the backup, is refused for
+    /// want of `system_admin`, as the framework's dispatcher does.
+    zone_gated: bool,
 }
 
 fn flat() -> Value {
@@ -67,6 +76,15 @@ impl Owners {
             presets: Vec::new(),
             alarm: None,
             scenes: Vec::new(),
+            language: "en".into(),
+            catalogues: vec!["en".into()],
+            timezone: "Europe/London".into(),
+            host_zones: vec![
+                "Europe/London".into(),
+                "Asia/Kolkata".into(),
+                "Etc/UTC".into(),
+            ],
+            zone_gated: true,
         }
     }
 
@@ -351,6 +369,33 @@ impl Stub {
                 o.scenes.push(scene.clone());
                 Ok(json!({ "v": 1, "scene": scene }))
             }
+            "language.get" => Ok(json!({ "v": 1, "language": o.language })),
+            "language.set" => {
+                let asked = s("language");
+                if let Some(tag) = o
+                    .catalogues
+                    .iter()
+                    .find(|c| c.eq_ignore_ascii_case(asked.trim()))
+                    .cloned()
+                {
+                    o.language = tag;
+                }
+                Ok(json!({ "v": 1, "language": o.language }))
+            }
+            "timezone.get" => Ok(json!({ "v": 1, "timezone": o.timezone })),
+            "timezone.set" => {
+                if o.zone_gated {
+                    return Err(
+                        "verb_capability_scope_not_granted: timezone.set needs write:system_admin"
+                            .into(),
+                    );
+                }
+                let asked = s("timezone");
+                if o.host_zones.contains(&asked) {
+                    o.timezone = asked;
+                }
+                Ok(json!({ "v": 1, "timezone": o.timezone }))
+            }
             "alarm.get" => Ok(json!({ "v": 1, "alarm": o.alarm })),
             "alarm.set" => {
                 o.alarm = Some(json!({
@@ -516,6 +561,8 @@ const READS: &[&str] = &[
     "alarm.get",
     "scene.list",
     "scene.get",
+    "language.get",
+    "timezone.get",
 ];
 
 // ----- manifest / surface -----
@@ -582,7 +629,8 @@ async fn export_answers_the_three_domains_from_their_owners() {
             "audio.zones",
             "audio.playlist",
             "audio.options",
-            "audio.alarm"
+            "audio.alarm",
+            "system.locale"
         ]
         .contains(&shelf.as_str()));
         if verb == "playlist.export_file" {
@@ -727,6 +775,14 @@ async fn a_backup_goes_back_onto_an_empty_device() {
     assert!(
         last("scene.") < first("options.set_resampling"),
         "scenes are config, before settings"
+    );
+    assert!(
+        last("options.") < first("language.get"),
+        "the locale goes back after the settings"
+    );
+    assert!(
+        last("language.") < first("playlist.create_playlist"),
+        "and before the playlists"
     );
     assert!(
         last("playlist.") < first("alarm.set"),
@@ -1144,6 +1200,150 @@ async fn an_unreadable_output_list_leaves_output_device_alone() {
         .expect("reported");
     assert!(row["reason"].as_str().unwrap().contains("could not check"));
     assert_eq!(stub.owners().record["output_device"], "");
+}
+
+// ----- the language and the timezone -----
+
+/// The locale is read on export, as the owners answer it.
+#[tokio::test]
+async fn the_locale_is_exported() {
+    let mut owners = Owners::set_up();
+    owners.timezone = "Asia/Kolkata".into();
+    let (backup, stub) = export_from(owners).await;
+    assert_eq!(
+        backup["settings"]["locale"],
+        json!({ "language": "en", "timezone": "Asia/Kolkata" })
+    );
+    let gets: Vec<String> = stub
+        .verbs()
+        .into_iter()
+        .filter(|v| v == "language.get" || v == "timezone.get")
+        .collect();
+    assert_eq!(gets, ["language.get", "timezone.get"]);
+}
+
+/// A language or zone the device already holds is not sent, and a
+/// restore onto it reports nothing.
+#[tokio::test]
+async fn a_locale_the_device_holds_is_not_sent() {
+    let (backup, _) = export_from(Owners::set_up()).await;
+    let stub = Stub::new(Owners::empty());
+    let refused = import_into(&stub, backup).await.unwrap();
+    assert!(refused.is_empty(), "{refused:?}");
+    let verbs = stub.verbs();
+    assert!(!verbs.iter().any(|v| v == "language.set"), "{verbs:?}");
+    assert!(
+        !verbs.iter().any(|v| v == "timezone.set"),
+        "no apply, no wait, no alarm reschedule for nothing: {verbs:?}"
+    );
+}
+
+/// A language the device has a catalogue for goes back, whatever the
+/// case; one it has none for is reported with the language in force and
+/// the device's own language stays.
+#[tokio::test]
+async fn a_language_goes_back_or_is_reported() {
+    let mut source = Owners::set_up();
+    source.language = "fr-CA".into();
+    let (backup, _) = export_from(source).await;
+
+    let mut has = Owners::empty();
+    has.catalogues = vec!["en".into(), "fr-CA".into()];
+    let stub = Stub::new(has);
+    let refused = import_into(&stub, backup.clone()).await.unwrap();
+    assert!(refused.is_empty(), "{refused:?}");
+    assert_eq!(stub.owners().language, "fr-CA");
+
+    let stub = Stub::new(Owners::empty());
+    let refused = import_into(&stub, backup).await.unwrap();
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["domain"], "settings");
+    assert_eq!(refused[0]["item"], "language");
+    let reason = refused[0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("fr-CA") && reason.contains("\"en\""),
+        "{reason}"
+    );
+    assert_eq!(stub.owners().language, "en", "the device's own stays");
+}
+
+/// The zone is attempted through the owner. Dispatched by the backup it
+/// carries no `system_admin`, so the owner refuses; the restore reports
+/// the zone from the backup with the owner's reason, and the device's
+/// zone stays. Nothing else is lost.
+#[tokio::test]
+async fn a_zone_the_owner_refuses_is_reported_with_its_value() {
+    let mut source = Owners::set_up();
+    source.timezone = "Asia/Kolkata".into();
+    let (backup, _) = export_from(source).await;
+    let stub = Stub::new(Owners::empty());
+    let refused = import_into(&stub, backup).await.unwrap();
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["item"], "timezone");
+    let reason = refused[0]["reason"].as_str().unwrap();
+    assert!(reason.contains("Asia/Kolkata"), "{reason}");
+    assert!(reason.contains("system_admin"), "{reason}");
+    assert_eq!(
+        stub.owners().timezone,
+        "Europe/London",
+        "the device's own stays"
+    );
+    assert_eq!(
+        stub.verbs().iter().filter(|v| *v == "timezone.set").count(),
+        1,
+        "attempted once"
+    );
+    assert_eq!(stub.owners().playlists.len(), 4, "the rest went back");
+}
+
+/// If the owner accepts, as a framework that carried the operator's
+/// sitting would, the zone goes back with no change here, before the
+/// alarm; a zone the host does not hold is reported.
+#[tokio::test]
+async fn a_zone_the_owner_accepts_goes_back_before_the_alarm() {
+    let mut source = Owners::set_up();
+    source.timezone = "Asia/Kolkata".into();
+    let (backup, _) = export_from(source).await;
+    let mut open = Owners::empty();
+    open.zone_gated = false;
+    let stub = Stub::new(open);
+    let refused = import_into(&stub, backup.clone()).await.unwrap();
+    assert!(refused.is_empty(), "{refused:?}");
+    assert_eq!(stub.owners().timezone, "Asia/Kolkata");
+    let verbs = stub.verbs();
+    let at = |v: &str| verbs.iter().position(|x| x == v).unwrap();
+    assert!(at("timezone.set") < at("alarm.set"), "{verbs:?}");
+
+    let mut lacking = Owners::empty();
+    lacking.zone_gated = false;
+    lacking.host_zones = vec!["Europe/London".into()];
+    let stub = Stub::new(lacking);
+    let refused = import_into(&stub, backup).await.unwrap();
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["item"], "timezone");
+    assert!(refused[0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("does not hold"));
+    assert_eq!(stub.owners().timezone, "Europe/London");
+}
+
+/// A backup taken before the locale was part of one has no `locale`
+/// key. It goes back as it did and touches neither.
+#[tokio::test]
+async fn a_backup_without_a_locale_still_goes_back() {
+    let (mut backup, _) = export_from(Owners::set_up()).await;
+    backup["settings"].as_object_mut().unwrap().remove("locale");
+    let mut other = Owners::empty();
+    other.timezone = "Asia/Kolkata".into();
+    let stub = Stub::new(other);
+    let refused = import_into(&stub, backup).await.unwrap();
+    assert!(refused.is_empty(), "{refused:?}");
+    assert!(!stub
+        .verbs()
+        .iter()
+        .any(|v| v.starts_with("language.") || v.starts_with("timezone.")));
+    assert_eq!(stub.owners().timezone, "Asia/Kolkata");
 }
 
 // ----- scenes -----

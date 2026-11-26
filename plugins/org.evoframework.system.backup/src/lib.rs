@@ -14,10 +14,11 @@
 //!   - `playlists` is `[{ name, m3u }]`, every stored playlist as
 //!     `playlist.export_file` answers its text, format `m3u`,
 //!     library-relative rows;
-//!   - `settings` is `{ record, eq_presets, alarm }`, as
+//!   - `settings` is `{ record, eq_presets, locale, alarm }`, as
 //!     `options.get_settings` and `options.list_eq_presets` answer
-//!     the first two, and `alarm` the alarm `alarm.get` answers, or
-//!     `null` when none is set.
+//!     the first two, `locale` is `{ language, timezone }` as
+//!     `language.get` and `timezone.get` answer them, and `alarm` the
+//!     alarm `alarm.get` answers, or `null` when none is set.
 //!
 //!   An owner that cannot answer refuses the export; a backup is
 //!   never answered with a domain left out.
@@ -50,6 +51,17 @@
 //!     the default, always goes back. An output the device lacks,
 //!     or a list it cannot read, is reported and the device's own
 //!     `output_device` stays.
+//!   - The language and the timezone go back after the settings and
+//!     before the playlists and the alarm, so an alarm set after them
+//!     is scheduled on the zone in force. A value the device already
+//!     holds is not sent. The language goes through `language.set`;
+//!     one the glass has no catalogue for does not apply and is
+//!     reported as `language`. The zone is attempted through
+//!     `timezone.set`, which is a write at `system_admin`; a call
+//!     the plugin dispatches does not carry that grant, so the owner
+//!     refuses it, and the zone is reported as `timezone` with the
+//!     owner's reason and the zone from the backup. A backup without
+//!     `locale` sets neither.
 //!   - The alarm goes back through `alarm.set` once the playlists
 //!     are in, and replaces the one the device holds, as a setting
 //!     does. A backup with no `alarm` key, taken before the alarm
@@ -107,6 +119,7 @@ const ZONES: &str = "audio.zones";
 const PLAYLIST: &str = "audio.playlist";
 const OPTIONS: &str = "audio.options";
 const ALARM: &str = "audio.alarm";
+const LOCALE: &str = "system.locale";
 const FAVOURITES: &str = "audio.favourites";
 
 /// The stored playlist the favourites list is kept in. The playlist
@@ -232,6 +245,16 @@ struct Settings {
     /// alarm was part of one.
     #[serde(default)]
     alarm: Option<AlarmRecord>,
+    /// The language and the zone. Absent in a backup taken before they
+    /// were part of one.
+    #[serde(default)]
+    locale: Option<LocaleRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocaleRecord {
+    language: String,
+    timezone: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -449,10 +472,16 @@ async fn export(d: &dyn ShelfRequestDispatcher) -> Result<Value, String> {
     let record = call(d, OPTIONS, "options.get_settings", v.clone()).await?;
     let presets =
         call(d, OPTIONS, "options.list_eq_presets", v.clone()).await?;
+    let language = call(d, LOCALE, "language.get", v.clone()).await?;
+    let timezone = call(d, LOCALE, "timezone.get", v.clone()).await?;
     let alarm = call(d, ALARM, "alarm.get", v).await?;
     let settings = json!({
         "record": record,
         "eq_presets": field(&presets, "options.list_eq_presets", "presets")?,
+        "locale": {
+            "language": field(&language, "language.get", "language")?,
+            "timezone": field(&timezone, "timezone.get", "timezone")?,
+        },
         "alarm": field(&alarm, "alarm.get", "alarm")?,
     });
 
@@ -660,6 +689,14 @@ async fn import(
         put("settings", format!("EQ preset {}", preset.name), r);
     }
 
+    // The language and the zone, once the settings are in and before the
+    // alarm, which is scheduled on the zone in force.
+    if let Some(locale) = &backup.settings.locale {
+        for (item, reason) in put_locale(d, locale).await {
+            put("settings", item, Err(reason));
+        }
+    }
+
     // Playlists, never over one the device already holds.
     for playlist in &backup.playlists {
         let rows = m3u_rows(&playlist.m3u);
@@ -746,6 +783,93 @@ async fn import(
     }
 
     refused
+}
+
+/// Put the language and the zone back. A value the device already
+/// holds is not sent. Returns what did not go back, as `(item,
+/// reason)`: a language the glass has no catalogue for, or a zone the
+/// owner refused or did not apply.
+async fn put_locale(
+    d: &dyn ShelfRequestDispatcher,
+    locale: &LocaleRecord,
+) -> Vec<(String, String)> {
+    let v = json!({ "v": PAYLOAD_VERSION });
+    let mut not_back = Vec::new();
+    let held = |answer: Result<Value, String>, key: &str| {
+        answer.ok().and_then(|a| {
+            a.get(key).and_then(Value::as_str).map(str::to_string)
+        })
+    };
+    let language_held =
+        held(call(d, LOCALE, "language.get", v.clone()).await, "language");
+    if language_held.as_deref().map(str::to_lowercase)
+        != Some(locale.language.to_lowercase())
+    {
+        match call(
+            d,
+            LOCALE,
+            "language.set",
+            json!({ "v": PAYLOAD_VERSION, "language": locale.language }),
+        )
+        .await
+        {
+            // The owner answers the language in force, not an error, for
+            // a tag the glass has no catalogue for.
+            Ok(a) => {
+                let now = a.get("language").and_then(Value::as_str);
+                if now.map(str::to_lowercase)
+                    != Some(locale.language.to_lowercase())
+                {
+                    not_back.push((
+                        "language".to_string(),
+                        format!(
+                            "this device has no catalogue for {:?}; its own \
+                             language, {:?}, stays",
+                            locale.language,
+                            now.unwrap_or("unknown")
+                        ),
+                    ));
+                }
+            }
+            Err(reason) => not_back.push(("language".to_string(), reason)),
+        }
+    }
+    let zone_held = held(call(d, LOCALE, "timezone.get", v).await, "timezone");
+    if zone_held.as_deref() != Some(locale.timezone.as_str()) {
+        match call(
+            d,
+            LOCALE,
+            "timezone.set",
+            json!({ "v": PAYLOAD_VERSION, "timezone": locale.timezone }),
+        )
+        .await
+        {
+            // As the language: the zone in force is answered, not an
+            // error, for a zone the host does not hold.
+            Ok(a) => {
+                let now = a.get("timezone").and_then(Value::as_str);
+                if now != Some(locale.timezone.as_str()) {
+                    not_back.push((
+                        "timezone".to_string(),
+                        format!(
+                            "this device does not hold the zone {:?}; its own \
+                             zone, {:?}, stays",
+                            locale.timezone,
+                            now.unwrap_or("unknown")
+                        ),
+                    ));
+                }
+            }
+            Err(reason) => not_back.push((
+                "timezone".to_string(),
+                format!(
+                    "the zone {:?} in the backup was not applied: {reason}",
+                    locale.timezone
+                ),
+            )),
+        }
+    }
+    not_back
 }
 
 /// A scene's zones with each logical output id replaced by the id the

@@ -513,8 +513,8 @@ description = """
 One backup of the operator's configuration. Stocked by \
 org.evoframework.system.backup: export_backup reads config \
 (logical outputs, zones and scenes), playlists (favourites among them) \
-and settings (the alarm among them) from the plugins that own \
-them, and import_backup puts them back through the same owners, \
+and settings (the language, the timezone and the alarm among \
+them) from the plugins that own them, and import_backup puts them back through the same owners, \
 removing nothing and reporting what an owner refuses, such as \
 an output the device does not have. Both gate at \
 `write:system_admin`. \
