@@ -129,6 +129,25 @@ const ALSA_OPEN_ATTEMPTS: u32 = 20;
 const ALSA_OPEN_RETRY_DELAY: std::time::Duration =
     std::time::Duration::from_millis(500);
 
+/// How much audio the ALSA pump keeps queued in the output ahead of
+/// what is playing, in milliseconds.
+///
+/// The pump moves each buffer as it arrives, so without a cushion the
+/// output holds only the few milliseconds written a moment ago. Any
+/// stall of the pump thread longer than that (a busy box after a
+/// restart, a scheduling hiccup) underruns the output, and the gap
+/// shifts the rest of the stream: a click on a tone, a slip on music.
+/// A cushion this long turns a stall shorter than it into nothing at
+/// all, at the cost of this much delay through the EQ path.
+#[cfg_attr(not(feature = "alsa-substrate"), allow(dead_code))]
+pub(crate) const OUTPUT_CUSHION_MS: u32 = 200;
+
+/// The cushion in frames at `rate_hz`.
+#[cfg_attr(not(feature = "alsa-substrate"), allow(dead_code))]
+pub(crate) fn cushion_frames(rate_hz: u32) -> usize {
+    (u64::from(rate_hz) * u64::from(OUTPUT_CUSHION_MS) / 1000) as usize
+}
+
 /// Run `attempt` until it stops failing to open, at most
 /// `attempts` times, pausing `delay` between tries.
 ///
@@ -609,6 +628,24 @@ mod tests {
         );
         let err = stage.apply(&mut out).unwrap_err();
         assert!(matches!(err, ByteFlowError::ReadFailed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn the_cushion_is_two_tenths_of_a_second_of_frames() {
+        assert_eq!(cushion_frames(44_100), 8_820);
+        assert_eq!(cushion_frames(48_000), 9_600);
+        assert_eq!(cushion_frames(96_000), 19_200);
+        assert_eq!(cushion_frames(192_000), 38_400);
+    }
+
+    #[test]
+    fn the_cushion_fits_the_output_buffer_the_dac_gives() {
+        // The DAC's playback buffer on the reference target is 131072
+        // frames; a cushion must sit well inside it at every rate the
+        // chain can carry.
+        for rate in [44_100u32, 48_000, 96_000, 192_000] {
+            assert!(cushion_frames(rate) * 2 < 131_072, "{rate} Hz");
+        }
     }
 
     fn quick() -> std::time::Duration {

@@ -62,7 +62,7 @@ use evo_plugin_sdk::audio::{AudioFormat, PcmCodec};
 use evo_plugin_sdk::contract::audio_routing::CompositionEndpoints;
 use tokio::sync::{watch, Notify};
 
-use crate::byte_flow::{ByteFlowError, EqStage};
+use crate::byte_flow::{cushion_frames, ByteFlowError, EqStage};
 use crate::EqRuntimeState;
 
 /// Async wrapper around the blocking ALSA pump loop. Spawns
@@ -190,6 +190,18 @@ fn run_alsa_pcm_blocking(
     let input_io = input_pcm.io_bytes();
     let output_io = output_pcm.io_bytes();
 
+    // Queue the cushion before any audio: the output then always holds
+    // this much ahead of what is playing, and a stall of the pump
+    // shorter than it is not heard. The first write starts the stream.
+    let cushion = cushion_frames(rate_hz);
+    queue_silence(
+        &output_pcm,
+        &output_io,
+        cushion,
+        frame_size_bytes,
+        &cancel_flag,
+    )?;
+
     // Recoveries since the last buffer that made it through. A pcm
     // that goes quiet while the source pauses, or restarts, comes
     // back through `recover`; one that never settles is a failure.
@@ -265,6 +277,13 @@ fn run_alsa_pcm_blocking(
                             &mut recoveries,
                             false,
                         )?;
+                        queue_silence(
+                            &output_pcm,
+                            &output_io,
+                            cushion,
+                            frame_size_bytes,
+                            &cancel_flag,
+                        )?;
                     }
                 }
                 Err(e) => {
@@ -280,11 +299,57 @@ fn run_alsa_pcm_blocking(
                         &mut recoveries,
                         false,
                     )?;
+                    // The recovered output is empty: put the cushion
+                    // back before the frames that were waiting.
+                    queue_silence(
+                        &output_pcm,
+                        &output_io,
+                        cushion,
+                        frame_size_bytes,
+                        &cancel_flag,
+                    )?;
                 }
             }
         }
         recoveries = 0;
     }
+}
+
+/// Write `frames` of silence to the output, waiting for room as the
+/// output asks. A cancel ends it quietly. Anything but a full buffer
+/// is a write failure.
+fn queue_silence(
+    pcm: &PCM,
+    io: &alsa::pcm::IO<'_, u8>,
+    frames: usize,
+    frame_size_bytes: usize,
+    cancel_flag: &AtomicBool,
+) -> Result<(), ByteFlowError> {
+    const CHUNK_FRAMES: usize = 1024;
+    let silence = vec![0u8; CHUNK_FRAMES * frame_size_bytes];
+    let mut left = frames;
+    while left > 0 {
+        if cancel_flag.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let n = left.min(CHUNK_FRAMES);
+        match io.writei(&silence[..n * frame_size_bytes]) {
+            Ok(written) => left -= written.min(left),
+            Err(e) if e.errno() == nix::errno::Errno::EAGAIN as i32 => {
+                pcm.wait(Some(PCM_WAIT_TIMEOUT_MS)).map_err(|w| {
+                    ByteFlowError::WriteFailed(format!(
+                        "alsa output wait (cushion): {w}"
+                    ))
+                })?;
+            }
+            Err(e) => {
+                return Err(ByteFlowError::WriteFailed(format!(
+                    "alsa output writei (cushion): {e}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// How many recoveries in a row, with no buffer getting through
