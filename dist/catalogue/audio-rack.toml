@@ -532,6 +532,8 @@ answers the language in force. Only a language the glass has \
 a catalogue for applies, `en` today; any other tag is not \
 applied and the answer is the language still in force. Before \
 any set the language is `en`. No password is asked. \
+language.get answers the language in force and language.list \
+the tags a set would apply; neither writes anything. \
 timezone.set sets the device's zone and answers the zone in \
 force, an IANA name; a zone the host does not hold, and \
 `Factory`, are not applied. After an apply it waits more than \

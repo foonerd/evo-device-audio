@@ -3798,7 +3798,7 @@ dependencies = [
 
 [[package]]
 name = "org-evoframework-identity-locale"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "evo-plugin-sdk",

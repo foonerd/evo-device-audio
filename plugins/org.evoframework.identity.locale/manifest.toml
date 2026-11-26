@@ -1,7 +1,7 @@
 [plugin]
 name = "org.evoframework.identity.locale"
 # Keep in sync with this crate's Cargo.toml [package].version (PluginIdentity + packaging).
-version = "0.1.1"
+version = "0.1.2"
 contract = 1
 
 [target]
@@ -40,6 +40,8 @@ restart_budget = 5
 [capabilities.respondent]
 request_types = [
     "language.set",
+    "language.get",
+    "language.list",
     "timezone.set",
     "timezone.get",
     "timezone.list",
@@ -50,7 +52,7 @@ response_budget_ms = 6000
 
 [capabilities.respondent.verb_capabilities]
 # language.set is absent: changing the language asks for no
-# password. timezone.get and timezone.list are absent: they only
-# read. A zone change is a per-device system setting, a write at
+# password. language.get, language.list, timezone.get and
+# timezone.list are absent: they only read. A zone change is a per-device system setting, a write at
 # system_admin, not step-up.
 "timezone.set" = { kind = "write", scope = "system_admin" }

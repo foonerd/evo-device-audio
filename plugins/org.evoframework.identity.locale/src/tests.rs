@@ -62,11 +62,11 @@ fn both_manifests() -> [Manifest; 2] {
 }
 
 /// Both manifests stock `system.locale` with the two setters and
-/// the two zone reads, a 6000 ms budget for the zone change's wait
+/// the four reads, a 6000 ms budget for the zone change's wait
 /// and reschedule, and one gate: `timezone.set` is a write at
 /// `system_admin`.
 #[test]
-fn both_manifests_stock_system_locale_with_four_verbs() {
+fn both_manifests_stock_system_locale_with_six_verbs() {
     for m in both_manifests() {
         assert_eq!(m.plugin.name, PLUGIN_NAME);
         assert_eq!(m.target.shelf, "system.locale");
@@ -76,6 +76,8 @@ fn both_manifests_stock_system_locale_with_four_verbs() {
             resp.request_types,
             vec![
                 VERB_LANGUAGE_SET,
+                VERB_LANGUAGE_GET,
+                VERB_LANGUAGE_LIST,
                 VERB_TIMEZONE_SET,
                 VERB_TIMEZONE_GET,
                 VERB_TIMEZONE_LIST
@@ -126,12 +128,18 @@ fn timezone_set_stays_write_system_admin() {
     }
 }
 
-/// Pin: neither zone read carries a write grant, in either manifest.
+/// Pin: none of the four reads carries a write grant, in either
+/// manifest.
 #[test]
-fn the_zone_reads_have_no_write_grant() {
+fn the_reads_have_no_write_grant() {
     for m in both_manifests() {
         let resp = m.capabilities.respondent.expect("respondent");
-        for verb in [VERB_TIMEZONE_GET, VERB_TIMEZONE_LIST] {
+        for verb in [
+            VERB_LANGUAGE_GET,
+            VERB_LANGUAGE_LIST,
+            VERB_TIMEZONE_GET,
+            VERB_TIMEZONE_LIST,
+        ] {
             assert!(resp.request_types.iter().any(|v| v == verb), "{verb}");
             assert!(
                 !matches!(
@@ -747,6 +755,157 @@ async fn a_malformed_zone_payload_is_refused() {
         );
     }
     assert_eq!(r.timeline.seen(), []);
+}
+
+// ----- language.get and language.list -----
+
+/// `language.get` answers the language in force: `en` on a fresh
+/// plugin, the language a set applied, and the language still in
+/// force after a refused tag. It is read, never written: a fresh
+/// plugin's state directory stays empty.
+#[tokio::test]
+async fn language_get_answers_the_language_in_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = boot(dir.path(), Some(&["en", "fr-CA"])).await;
+    assert_eq!(
+        read(&p, VERB_LANGUAGE_GET).await.unwrap(),
+        json!({ "v": 1, "language": "en" })
+    );
+    assert_eq!(stored(dir.path()), None, "a read writes nothing");
+    set(&p, "FR-ca").await;
+    assert_eq!(
+        read(&p, VERB_LANGUAGE_GET).await.unwrap(),
+        json!({ "v": 1, "language": "fr-CA" }),
+        "the catalogue's spelling"
+    );
+    set(&p, "de").await;
+    assert_eq!(
+        read(&p, VERB_LANGUAGE_GET).await.unwrap()["language"],
+        "fr-CA",
+        "a refused tag leaves the language in force"
+    );
+}
+
+/// The language a restart brings back is the one `language.get`
+/// answers; a stored tag with no catalogue answers the default.
+#[tokio::test]
+async fn language_get_follows_the_stored_language_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = boot(dir.path(), Some(&["en", "de"])).await;
+    set(&first, "de").await;
+    drop(first);
+    let again = boot(dir.path(), Some(&["en", "de"])).await;
+    assert_eq!(
+        read(&again, VERB_LANGUAGE_GET).await.unwrap()["language"],
+        "de"
+    );
+    let narrower = boot(dir.path(), Some(&["en"])).await;
+    assert_eq!(
+        read(&narrower, VERB_LANGUAGE_GET).await.unwrap()["language"],
+        "en",
+        "a stored tag the glass no longer has is no stored language"
+    );
+}
+
+/// `language.list` answers the tags a set would apply, in the
+/// catalogue's spelling and order, and the language `language.get`
+/// answers is always one of them.
+#[tokio::test]
+async fn language_list_answers_what_a_set_would_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = boot(dir.path(), None).await;
+    assert_eq!(
+        read(&p, VERB_LANGUAGE_LIST).await.unwrap(),
+        json!({ "v": 1, "languages": ["en"] })
+    );
+    let many = boot(dir.path(), Some(&["en", "fr-CA", "de"])).await;
+    let listed = read(&many, VERB_LANGUAGE_LIST).await.unwrap();
+    assert_eq!(listed["languages"], json!(["en", "fr-CA", "de"]));
+    for tag in listed["languages"].as_array().unwrap() {
+        let tag = tag.as_str().unwrap();
+        assert_eq!(set(&many, tag).await["language"], tag, "{tag}");
+        assert_eq!(
+            read(&many, VERB_LANGUAGE_GET).await.unwrap()["language"],
+            tag
+        );
+    }
+    assert!(
+        listed["languages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == DEFAULT_LANGUAGE),
+        "the default is always offered"
+    );
+}
+
+/// Pin: the language reads write nothing and reach no host. The
+/// stored file is byte for byte and time for time as it was, and the
+/// code of both handlers names no write, host call or dispatcher.
+#[tokio::test]
+async fn the_language_reads_write_nothing_and_reach_no_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = boot(dir.path(), None).await;
+    set(&p, "en").await;
+    let path = dir.path().join(STATE_FILENAME);
+    let before = (
+        std::fs::read(&path).unwrap(),
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+    );
+    for verb in [VERB_LANGUAGE_GET, VERB_LANGUAGE_LIST] {
+        read(&p, verb).await.unwrap();
+    }
+    let after = (
+        std::fs::read(&path).unwrap(),
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+    );
+    assert_eq!(after, before, "a read moved the stored file");
+
+    let src = include_str!("lib.rs");
+    for name in ["handle_language_get", "handle_language_list"] {
+        let at = src.find(&format!("async fn {name}(")).expect(name);
+        let end = src[at + 1..]
+            .find("\n    async fn ")
+            .map_or(src.len(), |i| at + 1 + i);
+        let body = &src[at..end];
+        for token in [
+            "write_language",
+            "tokio::fs",
+            "zone_host",
+            "dispatcher",
+            "Command",
+        ] {
+            assert!(!body.contains(token), "{name} names {token:?}");
+        }
+    }
+}
+
+/// A language read's payload of the wrong version or shape is a
+/// malformed request, and neither verb answers before load.
+#[tokio::test]
+async fn a_malformed_language_read_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = boot(dir.path(), None).await;
+    for verb in [VERB_LANGUAGE_GET, VERB_LANGUAGE_LIST] {
+        for payload in [json!({ "v": 2 }), json!(null), json!("v")] {
+            let request = Request {
+                request_type: verb.to_string(),
+                ..req(payload.clone())
+            };
+            assert!(
+                matches!(
+                    p.handle_request(&request).await,
+                    Err(PluginError::Permanent(_))
+                ),
+                "{verb} {payload}"
+            );
+        }
+    }
+    let mut unloaded = boot(dir.path(), None).await;
+    unloaded.loaded = false;
+    for verb in [VERB_LANGUAGE_GET, VERB_LANGUAGE_LIST] {
+        assert!(read(&unloaded, verb).await.is_err(), "{verb} before load");
+    }
 }
 
 // ----- timezone.get and timezone.list -----

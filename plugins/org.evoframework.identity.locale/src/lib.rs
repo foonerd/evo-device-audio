@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! # org-evoframework-identity-locale
 //!
-//! Stocks the `system.locale` shelf with two setters:
-//! `language.set { v: 1, language }` for the operator's language,
-//! and `timezone.set { v: 1, timezone }` for the device's zone.
+//! Stocks the `system.locale` shelf with two setters and the
+//! reads that go with them: `language.set { v: 1, language }` for
+//! the operator's language, `timezone.set { v: 1, timezone }` for
+//! the device's zone, `language.get` and `language.list`, and
+//! `timezone.get` and `timezone.list`.
 //!
 //! ## `language.set`
 //!
@@ -22,6 +24,18 @@
 //!   glass has no catalogue for counts as no stored language.
 //! - It carries no capability gate: changing the language asks for
 //!   no password.
+//!
+//! ## `language.get` and `language.list`
+//!
+//! - `language.get { v: 1 }` answers `{ v: 1, language }`, the
+//!   language in force, as `language.set` answers it: the stored
+//!   tag in the catalogue's spelling, or `en` when none is stored.
+//! - `language.list { v: 1 }` answers `{ v: 1, languages }`, the
+//!   tags a `language.set` would apply, in the catalogue's spelling
+//!   and order. The language `language.get` answers is always one
+//!   of them.
+//! - Neither writes anything or reaches the host, and neither
+//!   carries a capability gate.
 //!
 //! ## `timezone.set`
 //!
@@ -79,6 +93,12 @@ pub const PLUGIN_NAME: &str = "org.evoframework.identity.locale";
 
 /// Set the operator's language.
 pub const VERB_LANGUAGE_SET: &str = "language.set";
+
+/// Read the language in force.
+pub const VERB_LANGUAGE_GET: &str = "language.get";
+
+/// List the languages a set would apply.
+pub const VERB_LANGUAGE_LIST: &str = "language.list";
 
 /// The languages the glass has a catalogue for.
 pub const CATALOGUES: &[&str] = &["en"];
@@ -227,6 +247,34 @@ impl LocalePlugin {
         Ok(Response::for_request(req, bytes))
     }
 
+    async fn handle_language_get(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        read_payload(req, VERB_LANGUAGE_GET)?;
+        let in_force = self.language.lock().await.clone();
+        reply(
+            req,
+            VERB_LANGUAGE_GET,
+            serde_json::json!({ "v": PAYLOAD_VERSION, "language": in_force }),
+        )
+    }
+
+    async fn handle_language_list(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        read_payload(req, VERB_LANGUAGE_LIST)?;
+        reply(
+            req,
+            VERB_LANGUAGE_LIST,
+            serde_json::json!({
+                "v": PAYLOAD_VERSION,
+                "languages": self.catalogues,
+            }),
+        )
+    }
+
     async fn handle_timezone_set(
         &self,
         req: &Request,
@@ -372,6 +420,8 @@ impl Plugin for LocalePlugin {
                 runtime_capabilities: RuntimeCapabilities {
                     request_types: vec![
                         VERB_LANGUAGE_SET.to_string(),
+                        VERB_LANGUAGE_GET.to_string(),
+                        VERB_LANGUAGE_LIST.to_string(),
                         VERB_TIMEZONE_SET.to_string(),
                         VERB_TIMEZONE_GET.to_string(),
                         VERB_TIMEZONE_LIST.to_string(),
@@ -455,6 +505,8 @@ impl Respondent for LocalePlugin {
             }
             match req.request_type.as_str() {
                 VERB_LANGUAGE_SET => self.handle_set(req).await,
+                VERB_LANGUAGE_GET => self.handle_language_get(req).await,
+                VERB_LANGUAGE_LIST => self.handle_language_list(req).await,
                 VERB_TIMEZONE_SET => self.handle_timezone_set(req).await,
                 VERB_TIMEZONE_GET => self.handle_timezone_get(req).await,
                 VERB_TIMEZONE_LIST => self.handle_timezone_list(req).await,
