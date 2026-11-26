@@ -777,14 +777,19 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                     let name =
                         cmd.split('"').nth(1).unwrap_or_default().to_string();
                     let mut out = String::new();
+                    // MPD refuses a playlist it does not hold.
                     if let Some(entries) = stored.get(&name) {
                         for (pos, path) in entries.iter().enumerate() {
                             out.push_str(&format!(
                                 "file: {path}\nPos: {pos}\n"
                             ));
                         }
+                        out.push_str("OK\n");
+                    } else {
+                        out.push_str(
+                            "ACK [50@0] {listplaylistinfo} No such playlist\n",
+                        );
                     }
-                    out.push_str("OK\n");
                     let _ = w.write_all(out.as_bytes()).await;
                 } else if cmd.starts_with("playlistadd") {
                     let mut args = cmd.split('"').filter(|s| {

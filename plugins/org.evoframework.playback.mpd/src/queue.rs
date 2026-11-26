@@ -2415,17 +2415,22 @@ pub(crate) async fn handle_load_playlist_to_queue(
     payload: LoadPlaylistPayload,
 ) -> Result<(), VerbError> {
     check_version(payload.v, "queue.load_playlist_to_queue")?;
-    conn.clear().await.map_err(|e| VerbError::Mpd {
-        verb: "load_playlist_to_queue".to_string(),
-        reason: e.to_string(),
-    })?;
-    load_playlist_with_dlna_resolve(
+    // Read and resolve the playlist first. A playlist MPD does not
+    // hold, or an entry that cannot be resolved, refuses here and
+    // the queue stays as it was; only a load that can go ahead
+    // clears the queue.
+    let resolved = resolve_stored_playlist(
         ctx,
         conn,
         "load_playlist_to_queue",
         &payload.playlist_name,
     )
     .await?;
+    conn.clear().await.map_err(|e| VerbError::Mpd {
+        verb: "load_playlist_to_queue".to_string(),
+        reason: e.to_string(),
+    })?;
+    add_resolved_to_queue(conn, "load_playlist_to_queue", &resolved).await?;
     if let Some(start) = payload.start_position {
         if let Err(e) = conn.play_position(start).await {
             // Non-fatal: queue loaded but auto-start failed. The
@@ -2452,13 +2457,14 @@ pub(crate) async fn handle_append_playlist_to_queue(
     payload: AppendPlaylistPayload,
 ) -> Result<(), VerbError> {
     check_version(payload.v, "queue.append_playlist_to_queue")?;
-    load_playlist_with_dlna_resolve(
+    let resolved = resolve_stored_playlist(
         ctx,
         conn,
         "append_playlist_to_queue",
         &payload.playlist_name,
     )
     .await?;
+    add_resolved_to_queue(conn, "append_playlist_to_queue", &resolved).await?;
     publish_queue(ctx, conn).await;
     Ok(())
 }
@@ -2473,17 +2479,21 @@ pub(crate) async fn handle_append_playlist_to_queue(
 /// through the queue without MPD refusing the scheme it does
 /// not know.
 ///
-/// Resolve is per-entry so a single unresolvable entry (a
-/// MediaServer offline, an objectId no longer valid) refuses
-/// the whole load atomically before any MPD write — the queue
-/// starts intact and stays intact. This matches the
+/// The work is two steps so a caller can put a write between
+/// them. [`resolve_stored_playlist`] only reads: it asks MPD for
+/// the playlist and resolves every entry, and writes nothing.
+/// A playlist MPD does not hold, or a single unresolvable entry
+/// (a MediaServer offline, an objectId no longer valid), refuses
+/// the whole load there, so a caller that clears the queue first
+/// does so only once the load can go ahead. This matches the
 /// `queue.enqueue` all-or-nothing invariant.
-async fn load_playlist_with_dlna_resolve(
+/// [`add_resolved_to_queue`] then adds what was resolved.
+async fn resolve_stored_playlist(
     ctx: &QueueContext,
     conn: &mut MpdConnection,
     verb: &str,
     playlist_name: &str,
-) -> Result<(), VerbError> {
+) -> Result<Vec<ResolvedTrack>, VerbError> {
     let entries = conn.listplaylistinfo(playlist_name).await.map_err(|e| {
         VerbError::Mpd {
             verb: verb.to_string(),
@@ -2494,7 +2504,17 @@ async fn load_playlist_with_dlna_resolve(
     for e in &entries {
         resolved.push(resolve_uri_for_mpd(ctx, verb, &e.file_path).await?);
     }
-    for r in &resolved {
+    Ok(resolved)
+}
+
+/// Add resolved playlist entries to the end of the queue, in
+/// order.
+async fn add_resolved_to_queue(
+    conn: &mut MpdConnection,
+    verb: &str,
+    resolved: &[ResolvedTrack],
+) -> Result<(), VerbError> {
+    for r in resolved {
         let id =
             conn.addid(&r.uri, None).await.map_err(|e| VerbError::Mpd {
                 verb: verb.to_string(),
@@ -3019,6 +3039,106 @@ mod tests {
             commands.lock().unwrap().iter().any(|c| c == "play \"2\""),
             "cued where it was"
         );
+    }
+
+    fn live_queue() -> Vec<(u32, String)> {
+        vec![
+            (11, "INTERNAL/a.flac".to_string()),
+            (12, "INTERNAL/b.flac".to_string()),
+        ]
+    }
+
+    fn live_queue_paths() -> Vec<String> {
+        vec!["INTERNAL/a.flac".to_string(), "INTERNAL/b.flac".to_string()]
+    }
+
+    #[tokio::test]
+    async fn loading_a_missing_playlist_leaves_the_queue_as_it_was() {
+        // An alarm names a playlist that was renamed or deleted
+        // since it was set. The load refuses, and the queue the
+        // operator was listening to is not cleared on the way.
+        let (ctx, mut conn, log) = next_harness(live_queue(), Some(0)).await;
+
+        let refused = handle_load_playlist_to_queue(
+            &ctx,
+            &mut conn,
+            LoadPlaylistPayload {
+                v: QUEUE_PAYLOAD_VERSION,
+                playlist_name: "No Such List".to_string(),
+                start_position: Some(0),
+            },
+        )
+        .await;
+
+        assert!(refused.is_err(), "a playlist MPD does not hold refuses");
+        assert_eq!(queue_paths(&mut conn).await, live_queue_paths());
+        let sent = log.lock().unwrap().clone();
+        assert!(
+            !sent.iter().any(|c| c == "clear"),
+            "the queue is never cleared for a load that cannot go ahead: \
+             {sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn loading_a_playlist_reads_it_before_it_clears_the_queue() {
+        let (ctx, mut conn, log) = next_harness(live_queue(), Some(0)).await;
+        conn.playlistadd("Wake", "INTERNAL/x.flac").await.unwrap();
+        conn.playlistadd("Wake", "INTERNAL/y.flac").await.unwrap();
+
+        handle_load_playlist_to_queue(
+            &ctx,
+            &mut conn,
+            LoadPlaylistPayload {
+                v: QUEUE_PAYLOAD_VERSION,
+                playlist_name: "Wake".to_string(),
+                start_position: Some(0),
+            },
+        )
+        .await
+        .expect("a stored playlist loads");
+
+        assert_eq!(
+            queue_paths(&mut conn).await,
+            vec!["INTERNAL/x.flac".to_string(), "INTERNAL/y.flac".to_string()],
+            "the playlist replaces the queue"
+        );
+        let sent = log.lock().unwrap().clone();
+        let at = |prefix: &str| {
+            sent.iter()
+                .position(|c| c.starts_with(prefix))
+                .unwrap_or_else(|| panic!("no {prefix} sent: {sent:?}"))
+        };
+        assert!(
+            at("listplaylistinfo") < at("clear"),
+            "the playlist is read before the queue is cleared: {sent:?}"
+        );
+        assert!(at("clear") < at("addid"), "and added only after: {sent:?}");
+        assert!(
+            sent.iter().any(|c| c.starts_with("play 0")
+                || c.starts_with("play \"0\"")),
+            "it plays from the first entry: {sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn appending_a_missing_playlist_adds_nothing() {
+        let (ctx, mut conn, log) = next_harness(live_queue(), Some(0)).await;
+
+        let refused = handle_append_playlist_to_queue(
+            &ctx,
+            &mut conn,
+            AppendPlaylistPayload {
+                v: QUEUE_PAYLOAD_VERSION,
+                playlist_name: "No Such List".to_string(),
+            },
+        )
+        .await;
+
+        assert!(refused.is_err());
+        assert_eq!(queue_paths(&mut conn).await, live_queue_paths());
+        let sent = log.lock().unwrap().clone();
+        assert!(!sent.iter().any(|c| c.starts_with("addid")), "{sent:?}");
     }
 
     #[tokio::test]
