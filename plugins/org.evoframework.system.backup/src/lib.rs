@@ -12,21 +12,38 @@
 //!   - `playlists` is `[{ name, m3u }]`, every stored playlist as
 //!     `playlist.export_file` answers its text, format `m3u`,
 //!     library-relative rows;
-//!   - `settings` is `{ record, eq_presets }`, as
+//!   - `settings` is `{ record, eq_presets, alarm }`, as
 //!     `options.get_settings` and `options.list_eq_presets` answer
-//!     them.
+//!     the first two, and `alarm` the alarm `alarm.get` answers, or
+//!     `null` when none is set.
 //!
 //!   An owner that cannot answer refuses the export; a backup is
 //!   never answered with a domain left out.
 //! - `import_backup { v: 1, backup }` refuses a backup whose own `v`
 //!   is not 1, or that does not parse, before any write. It then
-//!   puts config back, then settings, then playlists, through the
-//!   owners' add and set verbs, and answers `{ v: 1, refused: [{
-//!   domain, item, reason }] }`. Import adds and sets; it takes
-//!   nothing away. An item its owner refuses — a name the device
-//!   already holds, hardware the device lacks — is reported and
-//!   skipped; nothing is put in its place, and the other items
-//!   still go back.
+//!   puts config back, then settings, then playlists, then the
+//!   alarm, through the owners' add and set verbs, and answers `{
+//!   v: 1, refused: [{ domain, item, reason }] }`. Import adds and
+//!   sets; it takes nothing away. An item its owner refuses — a
+//!   name the device already holds, hardware the device lacks — is
+//!   reported and skipped; nothing is put in its place, and the
+//!   other items still go back.
+//!   - The favourites list is exported as the playlist
+//!     `__favourites__` and goes back one row at a time through
+//!     `favourites.add_favourite`, since the playlist owner refuses
+//!     that name; a favourite already held is a no-op.
+//!   - A playlist with no rows goes back as an empty playlist
+//!     through `playlist.create_playlist`.
+//!   - `output_device` is put back only if the device has that
+//!     output, checked against `delivery.list_outputs` the way the
+//!     delivery plugin resolves the descriptor; the empty string,
+//!     the default, always goes back. An output the device lacks,
+//!     or a list it cannot read, is reported and the device's own
+//!     `output_device` stays.
+//!   - The alarm goes back through `alarm.set` once the playlists
+//!     are in, and replaces the one the device holds, as a setting
+//!     does. A backup with no `alarm` key, taken before the alarm
+//!     was part of a backup, sets none.
 //! - A backup is at most [`MAX_BACKUP_BYTES`], 16 MiB, measured as
 //!   the backup object written as compact UTF-8 JSON. Export refuses
 //!   a backup over the bound as Permanent and answers none; it never
@@ -79,6 +96,13 @@ const DELIVERY: &str = "audio.delivery";
 const ZONES: &str = "audio.zones";
 const PLAYLIST: &str = "audio.playlist";
 const OPTIONS: &str = "audio.options";
+const ALARM: &str = "audio.alarm";
+const FAVOURITES: &str = "audio.favourites";
+
+/// The stored playlist the favourites list is kept in. The playlist
+/// owner refuses it on import; its rows go back through the
+/// favourites shelf.
+const FAVOURITES_PLAYLIST: &str = "__favourites__";
 
 /// The settings record's fields that go back, in the order they go,
 /// each with its setter and the key that setter takes the value
@@ -183,6 +207,17 @@ struct PlaylistText {
 struct Settings {
     record: Map<String, Value>,
     eq_presets: Vec<Preset>,
+    /// The alarm, or none. Absent in a backup taken before the
+    /// alarm was part of one.
+    #[serde(default)]
+    alarm: Option<AlarmRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AlarmRecord {
+    weekdays: Vec<String>,
+    time: String,
+    playlist_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -372,10 +407,13 @@ async fn export(d: &dyn ShelfRequestDispatcher) -> Result<Value, String> {
     }
 
     let record = call(d, OPTIONS, "options.get_settings", v.clone()).await?;
-    let presets = call(d, OPTIONS, "options.list_eq_presets", v).await?;
+    let presets =
+        call(d, OPTIONS, "options.list_eq_presets", v.clone()).await?;
+    let alarm = call(d, ALARM, "alarm.get", v).await?;
     let settings = json!({
         "record": record,
         "eq_presets": field(&presets, "options.list_eq_presets", "presets")?,
+        "alarm": field(&alarm, "alarm.get", "alarm")?,
     });
 
     Ok(json!({
@@ -516,6 +554,14 @@ async fn import(
         let Some(value) = record.get(*name) else {
             continue;
         };
+        if *name == "output_device" {
+            // The setter takes any name. A device this one lacks would
+            // be stored, so it is checked here first.
+            if let Err(reason) = check_output_device(d, value).await {
+                put("settings", (*name).to_string(), Err(reason));
+                continue;
+            }
+        }
         let mut payload = json!({ "v": PAYLOAD_VERSION });
         payload[*key] = value.clone();
         let r = call(d, OPTIONS, verb, payload).await;
@@ -552,6 +598,36 @@ async fn import(
 
     // Playlists, never over one the device already holds.
     for playlist in &backup.playlists {
+        let rows = m3u_rows(&playlist.m3u);
+        if playlist.name == FAVOURITES_PLAYLIST {
+            // The playlist owner refuses this name; the favourites
+            // shelf is where its rows go. Adding one already held is a
+            // no-op there.
+            for uri in rows {
+                let r = call(
+                    d,
+                    FAVOURITES,
+                    "favourites.add_favourite",
+                    json!({ "v": PAYLOAD_VERSION, "uri": uri }),
+                )
+                .await;
+                put("playlists", format!("favourite {uri}"), r);
+            }
+            continue;
+        }
+        if rows.is_empty() {
+            // The import verb refuses a file with no rows; an empty
+            // playlist is made, not imported.
+            let r = call(
+                d,
+                PLAYLIST,
+                "playlist.create_playlist",
+                json!({ "v": PAYLOAD_VERSION, "name": playlist.name }),
+            )
+            .await;
+            put("playlists", format!("playlist {}", playlist.name), r);
+            continue;
+        }
         let r = call(
             d,
             PLAYLIST,
@@ -588,7 +664,125 @@ async fn import(
         }
     }
 
+    // The alarm last: it names a playlist, which is in by now.
+    if let Some(alarm) = &backup.settings.alarm {
+        let r = call(
+            d,
+            ALARM,
+            "alarm.set",
+            json!({
+                "v": PAYLOAD_VERSION,
+                "weekdays": alarm.weekdays,
+                "time": alarm.time,
+                "playlist_name": alarm.playlist_name,
+            }),
+        )
+        .await;
+        put("settings", "alarm".to_string(), r);
+    }
+
     refused
+}
+
+/// The rows of an m3u: every line that is not blank and not a
+/// comment, trimmed.
+fn m3u_rows(text: &str) -> Vec<&str> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect()
+}
+
+/// The card token of an `hw:CARD=NAME,DEV=N` or `hw:N,M` descriptor,
+/// as the delivery plugin reads it.
+fn card_token(descriptor: &str) -> &str {
+    let rest = descriptor
+        .strip_prefix("hw:CARD=")
+        .or_else(|| descriptor.strip_prefix("hw:"))
+        .unwrap_or(descriptor);
+    if rest.len() == descriptor.len() {
+        return descriptor;
+    }
+    rest.split(',').next().unwrap_or(rest)
+}
+
+/// The device index of a descriptor; 0 when it names none.
+fn card_device(descriptor: &str) -> u64 {
+    let Some(rest) = descriptor
+        .strip_prefix("hw:CARD=")
+        .or_else(|| descriptor.strip_prefix("hw:"))
+    else {
+        return 0;
+    };
+    rest.split(',')
+        .nth(1)
+        .and_then(|s| s.strip_prefix("DEV=").unwrap_or(s).trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Whether one of the device's outputs is the one `descriptor` names:
+/// its `hw:N,M` id, or the same device index on a card matched by
+/// name, short id or index. The delivery plugin resolves
+/// `output_device` the same way.
+fn output_known(outputs: &[Value], descriptor: &str) -> bool {
+    if outputs
+        .iter()
+        .any(|o| o["alsa_id"].as_str() == Some(descriptor))
+    {
+        return true;
+    }
+    let card = card_token(descriptor);
+    let device = card_device(descriptor);
+    outputs.iter().any(|o| {
+        o["device_idx"].as_u64() == Some(device)
+            && (o["card_name"].as_str() == Some(card)
+                || o["card_id"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty() && id == card)
+                || o["card_idx"].as_u64().map(|i| i.to_string()).as_deref()
+                    == Some(card))
+    })
+}
+
+/// Whether `output_device` may go back: the empty string, which is
+/// the default, or an output this device has. The reason if not.
+async fn check_output_device(
+    d: &dyn ShelfRequestDispatcher,
+    value: &Value,
+) -> Result<(), String> {
+    let Some(name) = value.as_str() else {
+        return Err("output_device is not a name".to_string());
+    };
+    if name.is_empty() {
+        return Ok(());
+    }
+    let listed = call(
+        d,
+        DELIVERY,
+        "delivery.list_outputs",
+        json!({ "v": PAYLOAD_VERSION }),
+    )
+    .await
+    .map_err(|e| {
+        format!("could not check {name:?} against the device's outputs: {e}")
+    })?;
+    let outputs =
+        listed
+            .get("outputs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                format!(
+                "could not check {name:?}: delivery.list_outputs answered no \
+                 outputs"
+            )
+            })?;
+    if output_known(outputs, name) {
+        Ok(())
+    } else {
+        Err(format!(
+            "this device has no output {name:?}; its own output_device stays"
+        ))
+    }
 }
 
 /// Copy a band's `freq_hz`, `gain_db` and `q` into a payload.

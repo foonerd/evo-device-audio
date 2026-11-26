@@ -510,10 +510,12 @@ shape = 1
 description = """
 One backup of the operator's configuration. Stocked by \
 org.evoframework.system.backup: export_backup reads config \
-(logical outputs and zones), playlists and settings from the \
-plugins that own them, and import_backup puts them back \
-through the same owners, removing nothing and reporting what \
-an owner refuses. Both gate at `write:system_admin`. \
+(logical outputs and zones), playlists (favourites among them) \
+and settings (the alarm among them) from the plugins that own \
+them, and import_backup puts them back through the same owners, \
+removing nothing and reporting what an owner refuses, such as \
+an output the device does not have. Both gate at \
+`write:system_admin`. \
 Music files and share passwords are never in a backup.
 """
 

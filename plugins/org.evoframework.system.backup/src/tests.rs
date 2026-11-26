@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Just a Nerd
 // SPDX-License-Identifier: Apache-2.0
 //! Tests for the system.backup plugin, against a stub that stands
-//! in for the four owners: audio.delivery, audio.zones,
-//! audio.playlist and audio.options.
+//! in for the six owners: audio.delivery, audio.zones,
+//! audio.playlist, audio.options, audio.favourites and audio.alarm.
 
 use std::sync::Mutex;
 
@@ -16,8 +16,6 @@ use super::*;
 struct Owners {
     /// The `hw:N,M` outputs this device has.
     hardware: Vec<String>,
-    /// The output devices `options.set_output_device` accepts.
-    devices: Vec<String>,
     logical_outputs: Vec<Value>,
     zones: Vec<Value>,
     next_logical: u32,
@@ -26,6 +24,8 @@ struct Owners {
     playlists: Vec<(String, String)>,
     record: Value,
     presets: Vec<Value>,
+    /// The alarm, as `alarm.get` answers it.
+    alarm: Option<Value>,
 }
 
 fn flat() -> Value {
@@ -36,7 +36,6 @@ impl Owners {
     fn empty() -> Self {
         Self {
             hardware: vec!["hw:0,0".into(), "hw:1,0".into()],
-            devices: vec![String::new(), "hw:0,0".into(), "hw:1,0".into()],
             logical_outputs: Vec::new(),
             zones: Vec::new(),
             next_logical: 1,
@@ -63,6 +62,7 @@ impl Owners {
                 "eq_presets": [],
             }),
             presets: Vec::new(),
+            alarm: None,
         }
     }
 
@@ -92,7 +92,21 @@ impl Owners {
                 "Late".into(),
                 "#EXTM3U\n#PLAYLIST:Late\nNAS/x/b.flac\n".into(),
             ),
+            (
+                "Quiet".into(),
+                "#EXTM3U\n#PLAYLIST:Quiet\n".into(),
+            ),
+            (
+                "__favourites__".into(),
+                "#EXTM3U\n#PLAYLIST:__favourites__\nINTERNAL/a.flac\nNAS/x/b.flac\n"
+                    .into(),
+            ),
         ];
+        o.alarm = Some(json!({
+            "weekdays": ["mon", "fri"],
+            "time": "06:30",
+            "playlist_name": "Morning",
+        }));
         o.record["mixer_type"] = json!("hardware");
         o.record["mixer_device"] = json!("hw:1");
         o.record["mixer_control"] = json!("PCM");
@@ -244,8 +258,77 @@ impl Stub {
                     "filename": format!("{name}.m3u"), "entries": 1, "content": text,
                 }))
             }
+            "delivery.list_outputs" => {
+                let rows: Vec<Value> = o
+                    .hardware
+                    .iter()
+                    .map(|id| {
+                        let (card, dev) = id
+                            .trim_start_matches("hw:")
+                            .split_once(',')
+                            .unwrap();
+                        json!({
+                            "card_idx": card.parse::<u32>().unwrap(),
+                            "device_idx": dev.parse::<u32>().unwrap(),
+                            "card_name": format!("Card{card}"),
+                            "card_id": format!("card{card}"),
+                            "alsa_id": id,
+                        })
+                    })
+                    .collect();
+                Ok(json!({ "v": 1, "outputs": rows }))
+            }
+            "playlist.create_playlist" => {
+                let name = s("name");
+                if o.playlists.iter().any(|(n, _)| *n == name) {
+                    return Err(format!("playlist {name} exists"));
+                }
+                o.playlists.push((
+                    name.clone(),
+                    format!("#EXTM3U\n#PLAYLIST:{name}\n"),
+                ));
+                Ok(ok)
+            }
+            "favourites.add_favourite" => {
+                let uri = s("uri");
+                if uri.starts_with("GONE/") {
+                    return Err(format!("{uri} is not in the library"));
+                }
+                let at =
+                    o.playlists.iter().position(|(n, _)| n == "__favourites__");
+                let at = at.unwrap_or_else(|| {
+                    o.playlists.push((
+                        "__favourites__".into(),
+                        "#EXTM3U\n#PLAYLIST:__favourites__\n".into(),
+                    ));
+                    o.playlists.len() - 1
+                });
+                if !o.playlists[at].1.lines().any(|l| l == uri) {
+                    o.playlists[at].1.push_str(&format!("{uri}\n"));
+                }
+                Ok(ok)
+            }
+            "alarm.get" => Ok(json!({ "v": 1, "alarm": o.alarm })),
+            "alarm.set" => {
+                o.alarm = Some(json!({
+                    "weekdays": p["weekdays"], "time": p["time"],
+                    "playlist_name": p["playlist_name"],
+                }));
+                Ok(json!({ "v": 1, "alarm": o.alarm }))
+            }
             "playlist.import_file" => {
                 let (name, text) = (s("name"), s("content"));
+                if name == "__favourites__" {
+                    return Err(
+                        "the system-managed favourites playlist; use the favourites shelf"
+                            .into(),
+                    );
+                }
+                if !text.lines().any(|l| !l.is_empty() && !l.starts_with('#')) {
+                    return Err(
+                        "nothing to import: the file holds no rows".into()
+                    );
+                }
                 if o.playlists.iter().any(|(n, _)| *n == name)
                     && p["overwrite"] != json!(true)
                 {
@@ -293,14 +376,9 @@ impl Stub {
                     .ok_or_else(|| {
                         format!("{v} is not a setter this stub knows")
                     })?;
+                // As the real owner: `output_device` is taken whatever it
+                // names.
                 let value = p[key].clone();
-                if field == "output_device"
-                    && !o.devices.contains(
-                        &value.as_str().unwrap_or_default().to_string(),
-                    )
-                {
-                    return Err(format!("no output device {value}"));
-                }
                 if field == "startup_volume_percent"
                     && value.as_u64() > o.record["max_volume_percent"].as_u64()
                 {
@@ -392,6 +470,7 @@ const READS: &[&str] = &[
     "playlist.export_file",
     "options.get_settings",
     "options.list_eq_presets",
+    "alarm.get",
 ];
 
 // ----- manifest / surface -----
@@ -457,7 +536,8 @@ async fn export_answers_the_three_domains_from_their_owners() {
             "audio.delivery",
             "audio.zones",
             "audio.playlist",
-            "audio.options"
+            "audio.options",
+            "audio.alarm"
         ]
         .contains(&shelf.as_str()));
         if verb == "playlist.export_file" {
@@ -563,6 +643,7 @@ async fn a_backup_goes_back_onto_an_empty_device() {
     );
     assert_eq!(after.presets, set_up.presets);
     assert_eq!(after.playlists, set_up.playlists);
+    assert_eq!(after.alarm, set_up.alarm, "the alarm went back");
 
     let verbs = stub.verbs();
     let first = |v: &str| verbs.iter().position(|x| x == v).unwrap();
@@ -575,6 +656,10 @@ async fn a_backup_goes_back_onto_an_empty_device() {
     assert!(
         last("options.") < first("playlist.import_file"),
         "settings before playlists"
+    );
+    assert!(
+        last("playlist.") < first("alarm.set"),
+        "the alarm goes back after the playlists it names"
     );
     assert!(
         first("options.set_mixer_device") < first("options.set_mixer_type")
@@ -593,7 +678,6 @@ async fn a_missing_device_is_a_refusal_not_a_guess() {
     let (backup, _) = export_from(Owners::set_up()).await;
     let mut lacking = Owners::empty();
     lacking.hardware = vec!["hw:0,0".into()];
-    lacking.devices = vec![String::new(), "hw:0,0".into()];
     let stub = Stub::new(lacking);
     let refused = import_into(&stub, backup).await.unwrap();
     let items: Vec<&str> = refused
@@ -614,7 +698,7 @@ async fn a_missing_device_is_a_refusal_not_a_guess() {
     assert!(after.zones.is_empty(), "no zone with a shrunken membership");
     assert_eq!(after.record["output_device"], "", "not replaced by a guess");
     assert_eq!(after.record["mixer_type"], "hardware", "the rest went back");
-    assert_eq!(after.playlists.len(), 2);
+    assert_eq!(after.playlists.len(), 4, "every playlist went back");
 }
 
 /// Pin: import removes nothing the device already has. A name it
@@ -721,6 +805,253 @@ async fn without_the_dispatcher_both_verbs_refuse() {
             other => panic!("expected Permanent, got {other:?}"),
         }
     }
+}
+
+// ----- favourites, empty playlists, the alarm, output_device -----
+
+/// The favourites list is exported as the playlist `__favourites__`
+/// and goes back one row at a time through the favourites shelf, in
+/// order. The playlist owner is never asked to import it.
+#[tokio::test]
+async fn favourites_go_back_through_the_favourites_shelf() {
+    let (backup, _) = export_from(Owners::set_up()).await;
+    let stub = Stub::new(Owners::empty());
+    let refused = import_into(&stub, backup).await.unwrap();
+    assert!(refused.is_empty(), "{refused:?}");
+    let held = stub
+        .owners()
+        .playlists
+        .into_iter()
+        .find(|(n, _)| n == "__favourites__")
+        .expect("favourites went back")
+        .1;
+    assert_eq!(
+        held,
+        "#EXTM3U\n#PLAYLIST:__favourites__\nINTERNAL/a.flac\nNAS/x/b.flac\n"
+    );
+    let adds: Vec<Value> = stub
+        .calls()
+        .into_iter()
+        .filter(|(s, v, _)| {
+            s == "audio.favourites" && v == "favourites.add_favourite"
+        })
+        .map(|(_, _, p)| p["uri"].clone())
+        .collect();
+    assert_eq!(adds, [json!("INTERNAL/a.flac"), json!("NAS/x/b.flac")]);
+    for (_, verb, payload) in stub.calls() {
+        if verb == "playlist.import_file" {
+            assert_ne!(payload["name"], "__favourites__");
+        }
+    }
+}
+
+/// A favourite the favourites owner refuses is reported by row, and the
+/// rest still go back. One the device already holds is not a refusal.
+#[tokio::test]
+async fn a_favourite_the_owner_refuses_is_reported_by_row() {
+    let mut owners = Owners::set_up();
+    owners.playlists.retain(|(n, _)| n != "__favourites__");
+    owners.playlists.push((
+        "__favourites__".into(),
+        "#EXTM3U\n#PLAYLIST:__favourites__\nGONE/x.flac\nINTERNAL/a.flac\n"
+            .into(),
+    ));
+    let (backup, _) = export_from(owners).await;
+    let mut holding = Owners::empty();
+    holding.playlists.push((
+        "__favourites__".into(),
+        "#EXTM3U\n#PLAYLIST:__favourites__\nINTERNAL/a.flac\n".into(),
+    ));
+    let stub = Stub::new(holding);
+    let refused = import_into(&stub, backup).await.unwrap();
+    let rows: Vec<&Value> = refused
+        .iter()
+        .filter(|r| r["item"].as_str().unwrap().starts_with("favourite"))
+        .collect();
+    assert_eq!(rows.len(), 1, "{refused:?}");
+    assert_eq!(rows[0]["item"], "favourite GONE/x.flac");
+    assert_eq!(rows[0]["domain"], "playlists");
+}
+
+/// A playlist with no rows goes back as an empty playlist, made, not
+/// imported. An empty list of favourites asks nothing of anyone.
+#[tokio::test]
+async fn an_empty_playlist_goes_back_empty() {
+    let mut owners = Owners::set_up();
+    owners.playlists.retain(|(n, _)| n != "__favourites__");
+    owners.playlists.push((
+        "__favourites__".into(),
+        "#EXTM3U\n#PLAYLIST:__favourites__\n".into(),
+    ));
+    let (backup, _) = export_from(owners).await;
+    let stub = Stub::new(Owners::empty());
+    let refused = import_into(&stub, backup).await.unwrap();
+    assert!(refused.is_empty(), "{refused:?}");
+    let after = stub.owners();
+    let quiet = after.playlists.iter().find(|(n, _)| n == "Quiet").unwrap();
+    assert_eq!(quiet.1, "#EXTM3U\n#PLAYLIST:Quiet\n");
+    assert!(
+        !after.playlists.iter().any(|(n, _)| n == "__favourites__"),
+        "no favourites to add, none made"
+    );
+    let created: Vec<Value> = stub
+        .calls()
+        .into_iter()
+        .filter(|(_, v, _)| v == "playlist.create_playlist")
+        .map(|(_, _, p)| p["name"].clone())
+        .collect();
+    assert_eq!(created, [json!("Quiet")]);
+    for (_, verb, payload) in stub.calls() {
+        if verb == "playlist.import_file" {
+            assert_ne!(payload["name"], "Quiet");
+        }
+        assert_ne!(verb, "favourites.add_favourite");
+    }
+}
+
+/// A name the device already holds is refused for an empty playlist as
+/// for any other.
+#[tokio::test]
+async fn an_empty_playlist_the_device_holds_is_reported() {
+    let (backup, _) = export_from(Owners::set_up()).await;
+    let mut holding = Owners::empty();
+    holding
+        .playlists
+        .push(("Quiet".into(), "#EXTM3U\n#PLAYLIST:Quiet\n".into()));
+    let stub = Stub::new(holding);
+    let refused = import_into(&stub, backup).await.unwrap();
+    let items: Vec<&str> = refused
+        .iter()
+        .map(|r| r["item"].as_str().unwrap())
+        .collect();
+    assert_eq!(items, ["playlist Quiet"], "{refused:?}");
+}
+
+/// The alarm is read on export, `null` when none is set, and set on
+/// import with the fields it was read with.
+#[tokio::test]
+async fn the_alarm_is_exported_and_set_on_import() {
+    let (backup, _) = export_from(Owners::set_up()).await;
+    assert_eq!(
+        backup["settings"]["alarm"],
+        json!({ "weekdays": ["mon", "fri"], "time": "06:30", "playlist_name": "Morning" })
+    );
+    let (none, _) = export_from(Owners::empty()).await;
+    assert_eq!(none["settings"]["alarm"], Value::Null);
+
+    let stub = Stub::new(Owners::empty());
+    import_into(&stub, backup).await.unwrap();
+    let sets: Vec<Value> = stub
+        .calls()
+        .into_iter()
+        .filter(|(s, v, _)| s == "audio.alarm" && v == "alarm.set")
+        .map(|(_, _, p)| p)
+        .collect();
+    assert_eq!(
+        sets,
+        [json!({
+            "v": 1, "weekdays": ["mon", "fri"], "time": "06:30",
+            "playlist_name": "Morning",
+        })]
+    );
+    let stub = Stub::new(Owners::empty());
+    import_into(&stub, none).await.unwrap();
+    assert!(
+        !stub.verbs().iter().any(|v| v == "alarm.set"),
+        "no alarm, none set"
+    );
+}
+
+/// A backup taken before the alarm was part of one has no `alarm`
+/// key. It goes back as it always did and sets no alarm.
+#[tokio::test]
+async fn a_backup_without_an_alarm_key_still_goes_back() {
+    let (mut backup, _) = export_from(Owners::set_up()).await;
+    backup["settings"].as_object_mut().unwrap().remove("alarm");
+    let mut holding = Owners::empty();
+    holding.alarm = Some(
+        json!({ "weekdays": ["sun"], "time": "09:00", "playlist_name": "Mine" }),
+    );
+    let stub = Stub::new(holding);
+    let refused = import_into(&stub, backup).await.unwrap();
+    assert!(refused.is_empty(), "{refused:?}");
+    assert!(!stub.verbs().iter().any(|v| v == "alarm.set"));
+    assert_eq!(stub.owners().alarm.unwrap()["playlist_name"], "Mine");
+}
+
+/// An alarm its owner refuses is reported and nothing else is lost.
+#[tokio::test]
+async fn an_alarm_the_owner_refuses_is_reported() {
+    let stub = Arc::new(Stub {
+        owners: Mutex::new(Owners::empty()),
+        calls: Mutex::new(Vec::new()),
+        broken: Some("alarm.set"),
+    });
+    let (backup, _) = export_from(Owners::set_up()).await;
+    let refused = import_into(&stub, backup).await.unwrap();
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["domain"], "settings");
+    assert_eq!(refused[0]["item"], "alarm");
+}
+
+/// `output_device` goes back only if the device has that output, named
+/// as the delivery plugin reads a descriptor: `hw:N,M`, `hw:CARD=id,DEV=M`
+/// or a bare card. The empty default always goes back.
+#[tokio::test]
+async fn output_device_goes_back_only_if_the_device_has_it() {
+    let (base, _) = export_from(Owners::set_up()).await;
+    let with = |device: &str| {
+        let mut b = base.clone();
+        b["settings"]["record"]["output_device"] = json!(device);
+        b
+    };
+    for (device, goes_back) in [
+        ("hw:1,0", true),
+        ("hw:CARD=card1,DEV=0", true),
+        ("hw:CARD=Card0", true),
+        ("hw:1", true),
+        ("card1", true),
+        ("", true),
+        ("hw:9,9", false),
+        ("hw:1,3", false),
+        ("hw:CARD=Gone,DEV=0", false),
+        ("nonsense", false),
+    ] {
+        let stub = Stub::new(Owners::empty());
+        let refused = import_into(&stub, with(device)).await.unwrap();
+        let named = refused.iter().any(|r| r["item"] == "output_device");
+        assert_eq!(named, !goes_back, "{device:?}: {refused:?}");
+        let sent = stub
+            .verbs()
+            .iter()
+            .any(|v| v == "options.set_output_device");
+        assert_eq!(sent, goes_back, "{device:?}: sent={sent}");
+        let stored = stub.owners().record["output_device"].clone();
+        if goes_back {
+            assert_eq!(stored, json!(device), "{device:?}");
+        } else {
+            assert_eq!(stored, json!(""), "the device's own value stays");
+        }
+    }
+}
+
+/// Outputs the device cannot list: the value is not applied, and the
+/// reason says why.
+#[tokio::test]
+async fn an_unreadable_output_list_leaves_output_device_alone() {
+    let stub = Arc::new(Stub {
+        owners: Mutex::new(Owners::empty()),
+        calls: Mutex::new(Vec::new()),
+        broken: Some("delivery.list_outputs"),
+    });
+    let (backup, _) = export_from(Owners::set_up()).await;
+    let refused = import_into(&stub, backup).await.unwrap();
+    let row = refused
+        .iter()
+        .find(|r| r["item"] == "output_device")
+        .expect("reported");
+    assert!(row["reason"].as_str().unwrap().contains("could not check"));
+    assert_eq!(stub.owners().record["output_device"], "");
 }
 
 // ----- the 16 MiB bound -----
