@@ -18,7 +18,7 @@ capability_intent:
     access_path: framework/appointments
     failure_mode: plugin admits; alarm.set, alarm.clear, and alarm.reschedule with an alarm stored refuse with PluginError::Permanent naming the missing ledger handle; no alarm is scheduled.
   - id: state_directory_read_write
-    need: read and write `alarm.toml` in the plugin's own state directory (/var/lib/evo/plugins/org.evoframework.alarm/state/), holding `{ weekdays, time, playlist_name }` of the alarm last set. Written after a successful alarm.set, through a temporary file and a rename; removed by alarm.clear; read by alarm.reschedule to schedule the alarm again; not read at load.
+    need: read and write `alarm.toml` in the plugin's own state directory (/var/lib/evo/plugins/org.evoframework.alarm/state/), holding `{ weekdays, time, playlist_name }` of the alarm last set. Written after a successful alarm.set, through a temporary file and a rename; removed by alarm.clear; read by alarm.reschedule to schedule the alarm again and by alarm.get to answer it; not read at load.
     access_path: filesystem/state
     failure_mode: a set whose file cannot be written answers a transient error though the alarm is scheduled; a missing file is no stored alarm; a file that cannot be read or does not hold a valid alarm refuses alarm.reschedule and is left as it is.
 

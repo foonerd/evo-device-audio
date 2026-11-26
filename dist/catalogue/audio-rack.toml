@@ -114,7 +114,8 @@ description = """
 One alarm that wakes the device and plays a playlist. Stocked \
 by org.evoframework.alarm: alarm.set names the weekdays, a \
 local HH:MM and a playlist, and replaces the alarm; \
-alarm.clear takes it away. The alarm is one appointment on \
+alarm.clear takes it away; alarm.get answers the alarm that \
+is set, or null. The alarm is one appointment on \
 the framework appointment ledger whose fire loads that \
 playlist into the queue and plays it. It is not the sleep \
 timer.

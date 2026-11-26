@@ -1,7 +1,7 @@
 [plugin]
 name = "org.evoframework.alarm"
 # Keep in sync with this crate's Cargo.toml [package].version (PluginIdentity + packaging).
-version = "0.1.1"
+version = "0.1.2"
 contract = 1
 
 [target]
@@ -44,5 +44,5 @@ restart_budget = 5
 appointments = true
 
 [capabilities.respondent]
-request_types = ["alarm.set", "alarm.clear", "alarm.reschedule"]
+request_types = ["alarm.set", "alarm.clear", "alarm.reschedule", "alarm.get"]
 response_budget_ms = 2000

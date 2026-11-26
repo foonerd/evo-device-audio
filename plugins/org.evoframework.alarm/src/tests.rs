@@ -171,7 +171,7 @@ fn body(resp: &Response) -> Value {
 // ----- manifest / surface -----
 
 #[test]
-fn both_manifests_stock_audio_alarm_with_three_verbs_and_the_ledger() {
+fn both_manifests_stock_audio_alarm_with_four_verbs_and_the_ledger() {
     let oop = Manifest::from_toml(include_str!("../manifest.oop.toml"))
         .expect("manifest.oop.toml parses");
     for m in [manifest(), oop] {
@@ -182,7 +182,7 @@ fn both_manifests_stock_audio_alarm_with_three_verbs_and_the_ledger() {
         let resp = m.capabilities.respondent.expect("respondent");
         assert_eq!(
             resp.request_types,
-            vec![VERB_SET, VERB_CLEAR, VERB_RESCHEDULE]
+            vec![VERB_SET, VERB_CLEAR, VERB_RESCHEDULE, VERB_GET]
         );
     }
 }
@@ -667,6 +667,144 @@ async fn without_the_ledger_a_stored_alarm_is_not_rescheduled() {
         other => panic!("expected Permanent, got {other:?}"),
     }
     assert_eq!(std::fs::read_to_string(stored_path(&dir)).unwrap(), text);
+}
+
+// ----- alarm.get -----
+
+fn get() -> Request {
+    req(VERB_GET, json!({ "v": 1 }))
+}
+
+/// With nothing stored, a get answers `alarm: null` and asks
+/// nothing of the ledger; so does one after a clear.
+#[tokio::test]
+async fn a_get_with_nothing_stored_answers_null() {
+    let ledger = Arc::new(StubLedger::default());
+    let dir = tempfile::tempdir().unwrap();
+    let p = plugin_storing(&ledger, &dir);
+    let resp = p.handle_request(&get()).await.unwrap();
+    assert_eq!(body(&resp), json!({ "v": 1, "alarm": null }));
+
+    p.handle_request(&set(json!(["mon"]), "06:00", "Early"))
+        .await
+        .unwrap();
+    p.handle_request(&req(VERB_CLEAR, json!({ "v": 1 })))
+        .await
+        .unwrap();
+    let calls = ledger.calls().len();
+    let resp = p.handle_request(&get()).await.unwrap();
+    assert_eq!(body(&resp), json!({ "v": 1, "alarm": null }));
+    assert_eq!(ledger.calls().len(), calls, "a get makes no ledger call");
+}
+
+/// A get answers the alarm as the set stored it, and a new process
+/// reads what an earlier one stored.
+#[tokio::test]
+async fn a_get_answers_the_stored_alarm() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = Arc::new(StubLedger::default());
+    plugin_storing(&first, &dir)
+        .handle_request(&set(json!(["fri", "mon"]), "07:30", "  Morning "))
+        .await
+        .unwrap();
+
+    let ledger = Arc::new(StubLedger::default());
+    let p = plugin_storing(&ledger, &dir);
+    let resp = p.handle_request(&get()).await.unwrap();
+    assert_eq!(
+        body(&resp),
+        json!({
+            "v": 1,
+            "alarm": {
+                "weekdays": ["fri", "mon"],
+                "time": "07:30",
+                "playlist_name": "Morning",
+            },
+        })
+    );
+    assert!(ledger.calls().is_empty(), "{:?}", ledger.calls());
+}
+
+/// A set the ledger refuses is not stored, so the get still
+/// answers the alarm that was there.
+#[tokio::test]
+async fn a_get_after_a_refused_set_answers_the_previous_alarm() {
+    let ledger = Arc::new(StubLedger::default());
+    let dir = tempfile::tempdir().unwrap();
+    let p = plugin_storing(&ledger, &dir);
+    p.handle_request(&set(json!(["mon"]), "06:00", "Early"))
+        .await
+        .unwrap();
+    ledger.refuse_create.store(true, Ordering::SeqCst);
+    assert!(p
+        .handle_request(&set(json!(["tue"]), "08:00", "Late"))
+        .await
+        .is_err());
+    let resp = p.handle_request(&get()).await.unwrap();
+    assert_eq!(
+        body(&resp),
+        json!({
+            "v": 1,
+            "alarm": {
+                "weekdays": ["mon"],
+                "time": "06:00",
+                "playlist_name": "Early",
+            },
+        })
+    );
+}
+
+/// A get reads the plugin's own file, so it answers without the
+/// ledger handle.
+#[tokio::test]
+async fn a_get_answers_without_the_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let text =
+        "weekdays = [\"mon\"]\ntime = \"07:00\"\nplaylist_name = \"A\"\n";
+    std::fs::write(stored_path(&dir), text).unwrap();
+    let mut p = AlarmPlugin::new().with_state_path(stored_path(&dir));
+    p.loaded = true;
+    let resp = p.handle_request(&get()).await.unwrap();
+    assert_eq!(
+        body(&resp),
+        json!({
+            "v": 1,
+            "alarm": {
+                "weekdays": ["mon"],
+                "time": "07:00",
+                "playlist_name": "A",
+            },
+        })
+    );
+}
+
+/// A stored file that is not an alarm is refused, not answered as
+/// no alarm, and stays as it is.
+#[tokio::test]
+async fn a_get_refuses_a_stored_file_that_is_not_an_alarm() {
+    let text = "weekdays = [\"mon\"]\ntime = \"7:00\"\nplaylist_name = \"A\"\n";
+    let ledger = Arc::new(StubLedger::default());
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(stored_path(&dir), text).unwrap();
+    let p = plugin_storing(&ledger, &dir);
+    match p.handle_request(&get()).await {
+        Err(PluginError::Permanent(_)) => {}
+        other => panic!("must be refused, got {other:?}"),
+    }
+    assert_eq!(std::fs::read_to_string(stored_path(&dir)).unwrap(), text);
+}
+
+/// A get takes the payload version a set takes.
+#[tokio::test]
+async fn a_get_refuses_another_payload_version() {
+    let ledger = Arc::new(StubLedger::default());
+    let p = plugin_on(&ledger);
+    match p.handle_request(&req(VERB_GET, json!({ "v": 2 }))).await {
+        Err(PluginError::Permanent(msg)) => {
+            assert!(msg.contains("version"), "got: {msg}")
+        }
+        other => panic!("expected Permanent, got {other:?}"),
+    }
 }
 
 // ----- pin: load makes no ledger call -----

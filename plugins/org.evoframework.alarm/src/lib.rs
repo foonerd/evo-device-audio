@@ -25,6 +25,14 @@
 //!   `{ v, alarm }`, or `{ v, status: "ok" }` with nothing stored.
 //!   A create the ledger refuses is a refused verb, and the stored
 //!   alarm stays.
+//! - `alarm.get { v }` answers the stored alarm as `{ v, alarm:
+//!   { weekdays, time, playlist_name } }`, or `{ v, alarm: null }`
+//!   when none is stored. It reads the plugin's own file and
+//!   makes no ledger call, so it answers also when the ledger
+//!   handle is missing. It is what a client reads on connect to
+//!   show the alarm that is set; the file is the plugin's one
+//!   record, so it says what was last set, not what the ledger
+//!   has pending.
 //!
 //! A successful set stores `{ weekdays, time, playlist_name }` in
 //! `alarm.toml` in the plugin's own state directory; a clear
@@ -86,6 +94,9 @@ pub const VERB_CLEAR: &str = "alarm.clear";
 
 /// Schedule the stored alarm again, on the zone now in force.
 pub const VERB_RESCHEDULE: &str = "alarm.reschedule";
+
+/// Read the stored alarm.
+pub const VERB_GET: &str = "alarm.get";
 
 /// The stored alarm's file in the plugin's state directory.
 pub const STATE_FILENAME: &str = "alarm.toml";
@@ -352,6 +363,21 @@ impl AlarmPlugin {
         }
     }
 
+    async fn handle_get(&self, req: &Request) -> Result<Response, PluginError> {
+        let _: EmptyPayload = parse_versioned(req)?;
+        // Behind the same lock as the verbs that write, so a read
+        // never lands between a set's ledger call and its file.
+        let _gesture = self.gesture.lock().await;
+        let alarm = self.stored(VERB_GET).await?;
+        encode(
+            req,
+            &StoredAlarmResponse {
+                v: PAYLOAD_VERSION,
+                alarm,
+            },
+        )
+    }
+
     fn ledger(&self) -> Result<&Arc<dyn AppointmentScheduler>, PluginError> {
         self.appointments.as_ref().ok_or_else(|| {
             PluginError::Permanent(
@@ -479,6 +505,7 @@ impl Plugin for AlarmPlugin {
                         VERB_SET.to_string(),
                         VERB_CLEAR.to_string(),
                         VERB_RESCHEDULE.to_string(),
+                        VERB_GET.to_string(),
                     ],
                     accepts_custody: false,
                     flags: Default::default(),
@@ -558,6 +585,7 @@ impl Respondent for AlarmPlugin {
                 VERB_SET => self.handle_set(req).await,
                 VERB_CLEAR => self.handle_clear(req).await,
                 VERB_RESCHEDULE => self.handle_reschedule(req).await,
+                VERB_GET => self.handle_get(req).await,
                 other => Err(PluginError::Permanent(format!(
                     "alarm: unknown verb {other:?}"
                 ))),
@@ -653,6 +681,12 @@ impl HasPayloadVersion for EmptyPayload {
 struct AlarmResponse {
     v: u32,
     alarm: Alarm,
+}
+
+#[derive(Debug, Serialize)]
+struct StoredAlarmResponse {
+    v: u32,
+    alarm: Option<Alarm>,
 }
 
 #[derive(Debug, Serialize)]
