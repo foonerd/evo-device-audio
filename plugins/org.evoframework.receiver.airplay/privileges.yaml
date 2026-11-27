@@ -30,6 +30,15 @@ capability_intent:
     access_path: system message bus
     failure_mode: the daemon being absent or refusing leaves the plugin enabled but degraded with reason `avahi_unavailable`; the listener is closed, registration is retried, and nothing is left half open.
 
+  - id: loopback_substream
+    need: open the reserved ALSA Loopback playback substream `hw:Loopback,0,4` for writing, and write the decoded audio of one stream to it; the player plays the capture end of the same substream.
+    access_path: direct device (ALSA)
+    failure_mode: a missing Loopback or a substream held by something else refuses the stream with reason `loopback_unavailable`; nothing is queued in the player; the receiver stays enabled and advertising.
+  - id: player_verbs
+    need: ask the `playback.mpd` plugin, by its `audio.playback` verbs, to play, tag and end the capture, and to set the device volume and mute from the sender's volume.
+    access_path: peer dispatch
+    failure_mode: a player that cannot be reached refuses the stream with reason `playback_refused`; a player that goes away mid-stream ends the stream; nothing is left half open.
+
 required_binaries: []
 
 required_kernel_modules: []

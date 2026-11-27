@@ -28,10 +28,14 @@ use evo_plugin_sdk::contract::{
 };
 use evo_plugin_sdk::Manifest;
 
+pub mod conduct;
 pub mod lan;
 pub mod mdns;
+pub mod player;
 pub mod runtime;
+pub mod sink;
 pub mod state;
+pub mod volume;
 
 use mdns::AvahiAdvertiser;
 use runtime::{is_verb, ReceiverRuntime, RuntimeConfig, VerbError, VERBS};
@@ -113,11 +117,28 @@ impl Plugin for ReceiverAirplayPlugin {
                     ))
                 })?;
             }
+            // The player is `playback.mpd`, reached by its verbs. Without the
+            // peer dispatcher every stream is refused, so a sender is never
+            // told yes and then played silence.
+            let player: Arc<dyn player::Player> =
+                match ctx.shelf_request_dispatcher.clone() {
+                    Some(d) => Arc::new(player::PeerPlayer::new(d)),
+                    None => {
+                        tracing::warn!(
+                            plugin = PLUGIN_NAME,
+                            "no shelf request dispatcher in the load context; \
+                             streams will be refused until the steward \
+                             provides one"
+                        );
+                        Arc::new(player::NoPlayer)
+                    }
+                };
             let rt = Arc::new(ReceiverRuntime::open(
                 &ctx.state_dir,
                 &ctx.credentials_dir,
                 RuntimeConfig::production(),
                 Arc::new(AvahiAdvertiser),
+                runtime::Audio::new(player, sink::production_opener()),
             ));
             if let Err(e) = rt
                 .attach_subject_publisher(Arc::clone(&ctx.subject_announcer))

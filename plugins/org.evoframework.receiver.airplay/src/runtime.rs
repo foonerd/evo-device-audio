@@ -18,16 +18,21 @@ use std::time::{Duration, SystemTime};
 
 use evo_airplay::{
     AudioSink, Event, Receiver, SessionControl, SessionGate, SinkError,
+    SinkFactory,
 };
 use evo_plugin_sdk::contract::{
     ExternalAddressing, SubjectAnnouncement, SubjectAnnouncer,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+use crate::conduct::Conduct;
 use crate::lan::LanGate;
 use crate::mdns::{Advertiser, Registration, ServiceRecords};
+use crate::player::{Player, Tags};
+use crate::sink::{EndCapture, LoopbackSink, Note, PcmOpener};
 use crate::state::{self, Persisted};
 
 /// Subject type of the receiver's state.
@@ -129,6 +134,21 @@ pub struct Envelope {
     pub last_update_at_ms: u64,
 }
 
+/// What the receiver plays through: the player it asks, and the device its
+/// audio is written to.
+#[derive(Clone)]
+pub struct Audio {
+    player: Arc<dyn Player>,
+    pcm: Arc<dyn PcmOpener>,
+}
+
+impl Audio {
+    /// The player and the device opener.
+    pub fn new(player: Arc<dyn Player>, pcm: Arc<dyn PcmOpener>) -> Self {
+        Self { player, pcm }
+    }
+}
+
 /// How the runtime binds and retries.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -138,6 +158,9 @@ pub struct RuntimeConfig {
     pub friendly_name: Option<String>,
     /// How long to wait before retrying a registration that failed.
     pub retry_every: Duration,
+    /// How often a running stream checks that the player still has its
+    /// capture.
+    pub watch_every: Duration,
 }
 
 impl RuntimeConfig {
@@ -147,6 +170,7 @@ impl RuntimeConfig {
             preferred_port: 7000,
             friendly_name: None,
             retry_every: Duration::from_secs(15),
+            watch_every: Duration::from_secs(1),
         }
     }
 }
@@ -164,6 +188,10 @@ struct Inner {
     status: Status,
     running: Option<Running>,
     retry: Option<JoinHandle<()>>,
+    /// The running stream's work with the player.
+    session: Option<Conduct>,
+    /// Why the receiver is degraded once the running stream is over.
+    after_session: Option<&'static str>,
 }
 
 /// The runtime behind the verbs.
@@ -172,6 +200,7 @@ pub struct ReceiverRuntime {
     credentials_dir: PathBuf,
     cfg: RuntimeConfig,
     advertiser: Arc<dyn Advertiser>,
+    audio: Audio,
     inner: Mutex<Inner>,
     publisher: StdMutex<Option<Arc<dyn SubjectAnnouncer>>>,
 }
@@ -255,15 +284,6 @@ fn receiver_gate() -> Arc<dyn SessionGate> {
     Arc::new(LanGate::new())
 }
 
-/// The audio path arrives with the player bridge. Until then a stream is
-/// refused, so a sender is never told yes and then played silence.
-fn no_audio_path(
-    _rate: u32,
-    _channels: u8,
-) -> Result<Box<dyn AudioSink>, SinkError> {
-    Err(SinkError::new("the audio path is not available yet"))
-}
-
 impl ReceiverRuntime {
     /// Open the runtime. Nothing is bound; call
     /// [`ReceiverRuntime::reconcile_on_load`] to honour a persisted switch.
@@ -272,6 +292,7 @@ impl ReceiverRuntime {
         credentials_dir: &Path,
         cfg: RuntimeConfig,
         advertiser: Arc<dyn Advertiser>,
+        audio: Audio,
     ) -> Self {
         let persisted = state::load(state_dir);
         let password = persisted
@@ -283,12 +304,15 @@ impl ReceiverRuntime {
             credentials_dir: credentials_dir.to_path_buf(),
             cfg,
             advertiser,
+            audio,
             inner: Mutex::new(Inner {
                 persisted,
                 password,
                 status: Status::Disabled,
                 running: None,
                 retry: None,
+                session: None,
+                after_session: None,
             }),
             publisher: StdMutex::new(None),
         }
@@ -462,15 +486,28 @@ impl ReceiverRuntime {
             }
         }
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (notes_tx, mut notes_rx) = tokio::sync::mpsc::unbounded_channel();
+        let factory = self.sink_factory(notes_tx);
         let serve = tokio::spawn(async move {
-            if let Err(e) = bound.run(no_audio_path, events_tx).await {
+            if let Err(e) =
+                bound.run(move |r, c| factory(r, c), events_tx).await
+            {
                 tracing::warn!(error = %e, "the AirPlay listener stopped");
             }
         });
         let rt = Arc::clone(self);
         let events = tokio::spawn(async move {
-            while let Some(event) = events_rx.recv().await {
-                rt.on_event(event).await;
+            loop {
+                tokio::select! {
+                    event = events_rx.recv() => match event {
+                        Some(event) => rt.on_event(event).await,
+                        None => break,
+                    },
+                    note = notes_rx.recv() => match note {
+                        Some(note) => rt.on_note(note).await,
+                        None => break,
+                    },
+                }
             }
         });
         g.running = Some(Running {
@@ -501,7 +538,83 @@ impl ReceiverRuntime {
         }));
     }
 
+    /// The sink the library gets for each stream. It is created before the
+    /// sender is told yes, so everything that can refuse does so here: the
+    /// device must open, and the player must take the capture. A stream is
+    /// never accepted and then silenced.
+    fn sink_factory(&self, notes: UnboundedSender<Note>) -> SinkFactory {
+        let audio = self.audio.clone();
+        let handle = tokio::runtime::Handle::current();
+        Arc::new(move |rate, channels| {
+            if rate != 44_100 || channels != 2 {
+                return Err(SinkError::new(format!(
+                    "the capture is 44.1 kHz stereo, not {rate} Hz and {channels} channels"
+                )));
+            }
+            let pcm = match audio.pcm.open(rate, channels) {
+                Ok(pcm) => pcm,
+                Err(e) => {
+                    let _ = notes.send(Note::Refused("loopback_unavailable"));
+                    return Err(e);
+                }
+            };
+            let asked = handle.block_on(tokio::time::timeout(
+                crate::player::CALL_BUDGET,
+                audio.player.play_capture(&Tags::default()),
+            ));
+            match asked {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    drop(pcm);
+                    let _ = notes.send(Note::Refused("playback_refused"));
+                    return Err(SinkError::new(format!(
+                        "the player did not take the capture: {e}"
+                    )));
+                }
+                Err(_) => {
+                    drop(pcm);
+                    let _ = notes.send(Note::Refused("playback_refused"));
+                    return Err(SinkError::new(
+                        "the player did not answer in time",
+                    ));
+                }
+            }
+            let end = EndCapture::new(handle.clone(), audio.player.clone());
+            let sink: Box<dyn AudioSink> =
+                Box::new(LoopbackSink::new(pcm, notes.clone(), Some(end)));
+            Ok(sink)
+        })
+    }
+
+    async fn on_note(&self, note: Note) {
+        let env = {
+            let mut g = self.inner.lock().await;
+            if g.running.is_none() {
+                return;
+            }
+            match note {
+                Note::Refused(reason) => {
+                    // No stream is running: say why the last one was refused.
+                    if !matches!(g.status, Status::Session { .. }) {
+                        g.status = Status::Degraded(reason.to_string());
+                    }
+                }
+                Note::WriteFailed(why) => {
+                    tracing::warn!(error = %why, "ending the stream: the device failed");
+                    g.after_session = Some("loopback_unavailable");
+                    if let Some(running) = g.running.as_ref() {
+                        running.control.end_session();
+                    }
+                    return;
+                }
+            }
+            self.envelope_of(&g)
+        };
+        self.publish(&env).await;
+    }
+
     async fn on_event(&self, event: Event) {
+        let mut ended = None;
         let env = {
             let mut g = self.inner.lock().await;
             if g.running.is_none() {
@@ -509,20 +622,61 @@ impl ReceiverRuntime {
             }
             match event {
                 Event::SessionStarted { peer, .. } => {
+                    if let Some(control) =
+                        g.running.as_ref().map(|r| r.control.clone())
+                    {
+                        g.session = Some(Conduct::start(
+                            self.audio.player.clone(),
+                            control,
+                            self.cfg.watch_every,
+                        ));
+                    }
+                    g.after_session = None;
                     g.status = Status::Session {
                         peer: peer.to_canonical().to_string(),
                         since_ms: now_ms(),
                     };
                 }
+                Event::Metadata {
+                    title,
+                    artist,
+                    album,
+                } => {
+                    if let Some(conduct) = g.session.as_ref() {
+                        conduct
+                            .tags(Tags::from_metadata(
+                                title.as_deref(),
+                                artist.as_deref(),
+                                album.as_deref(),
+                            ))
+                            .await;
+                    }
+                    return;
+                }
+                Event::Volume { db } => {
+                    if let Some(conduct) = g.session.as_ref() {
+                        conduct.volume(db);
+                    }
+                    return;
+                }
                 Event::SessionEnded => {
+                    ended = g.session.take();
                     if matches!(g.status, Status::Session { .. }) {
-                        g.status = Status::Advertising;
+                        g.status = match g.after_session.take() {
+                            Some(reason) => Status::Degraded(reason.into()),
+                            None => Status::Advertising,
+                        };
                     }
                 }
                 _ => return,
             }
             self.envelope_of(&g)
         };
+        // The capture is out of the player before the session is reported
+        // over, or it would play silence.
+        if let Some(conduct) = ended {
+            conduct.finish().await;
+        }
         self.publish(&env).await;
     }
 
@@ -561,6 +715,12 @@ impl ReceiverRuntime {
             running.serve.abort();
             let _ = running.serve.await;
         }
+        // A stream that was running leaves the player's queue before the
+        // receiver reports itself off.
+        if let Some(conduct) = g.session.take() {
+            conduct.finish().await;
+        }
+        g.after_session = None;
         g.status = Status::Disabled;
     }
 
@@ -701,6 +861,8 @@ mod tests {
     struct Rig {
         rt: Arc<ReceiverRuntime>,
         adv: Arc<FakeAdvertiser>,
+        player: Arc<crate::player::fake::FakePlayer>,
+        opener: Arc<crate::sink::fake::FakeOpener>,
         state: tempfile::TempDir,
         creds: tempfile::TempDir,
     }
@@ -710,6 +872,7 @@ mod tests {
             preferred_port,
             friendly_name: Some("Test receiver".into()),
             retry_every: Duration::from_millis(150),
+            watch_every: Duration::from_millis(30),
         }
     }
 
@@ -717,15 +880,20 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let creds = tempfile::tempdir().unwrap();
         let adv = Arc::new(FakeAdvertiser::default());
+        let player = crate::player::fake::FakePlayer::new();
+        let opener = Arc::new(crate::sink::fake::FakeOpener::default());
         let rt = Arc::new(ReceiverRuntime::open(
             state.path(),
             creds.path(),
             cfg(preferred_port),
             adv.clone(),
+            Audio::new(player.clone(), opener.clone()),
         ));
         Rig {
             rt,
             adv,
+            player,
+            opener,
             state,
             creds,
         }
@@ -784,17 +952,260 @@ mod tests {
         assert!(Sender::connect(addr(e.port), "3939").await.is_ok());
     }
 
-    #[tokio::test]
-    async fn a_stream_is_refused_until_the_audio_path_exists() {
-        let r = rig();
-        let e = r.rt.enable(None).await.unwrap();
-        let mut s = Sender::connect(addr(e.port), "3939").await.unwrap();
+    const FRAMES: &[u8] =
+        include_bytes!("../../../crates/evo-airplay/tests/data/tone_lr.frames");
+    const KEY: [u8; 32] = [7u8; 32];
+
+    /// Pair and set a stream up; the sender and the answer to SETUP.
+    async fn begin(
+        port: u16,
+    ) -> (
+        Sender,
+        evo_airplay::sender::Reply,
+        Option<evo_airplay::sender::StreamPorts>,
+    ) {
+        let mut s = Sender::connect(addr(port), "3939").await.unwrap();
         s.fp_setup().await.unwrap();
         assert!(s.setup_event().await.unwrap().is_ok());
-        let (reply, ports) = s.setup_stream(103, &[7u8; 32]).await.unwrap();
+        let (reply, ports) = s.setup_stream(103, &KEY).await.unwrap();
+        (s, reply, ports)
+    }
+
+    fn taken(r: &Rig) -> usize {
+        r.opener.device.lock().unwrap().taken.len()
+    }
+
+    #[tokio::test]
+    async fn a_stream_plays_through_the_device_and_the_capture_is_taken_out_after(
+    ) {
+        use crate::player::fake::Call;
+        let r = rig();
+        let e = r.rt.enable(None).await.unwrap();
+        let (mut s, reply, ports) = begin(e.port).await;
+        assert_eq!(reply.code(), 200, "{}", reply.status);
+        let ports = ports.expect("ports");
+        // The player took the capture before the sender was told yes.
+        assert_eq!(
+            r.player.calls().first(),
+            Some(&Call::Play(Tags::default())),
+            "{:?}",
+            r.player.calls()
+        );
+        assert_eq!(r.opener.live.load(Ordering::SeqCst), 1);
+        eventually("the session is shown", || {
+            r.rt.inner
+                .try_lock()
+                .is_ok_and(|g| matches!(g.status, Status::Session { .. }))
+        })
+        .await;
+
+        let mut data = s.open_data(ports, &KEY).await.unwrap();
+        for frame in evo_airplay::sender::parse_frames(FRAMES).iter().take(40) {
+            data.send_frame(frame).await.unwrap();
+        }
+        s.set_metadata("A Song", "A Band", "A Disc").await.unwrap();
+        s.set_volume(-15.0).await.unwrap();
+        eventually("audio reaches the device", || taken(&r) > 20_000).await;
+        eventually("the title and volume reach the player", || {
+            r.player.calls().contains(&Call::Tags(Tags::from_metadata(
+                Some("A Song"),
+                Some("A Band"),
+                Some("A Disc"),
+            ))) && r.player.calls().contains(&Call::Volume(50))
+        })
+        .await;
+
+        s.teardown().await.unwrap();
+        eventually("the session is over", || {
+            r.rt.inner
+                .try_lock()
+                .is_ok_and(|g| g.status == Status::Advertising)
+        })
+        .await;
+        assert!(
+            r.player.calls().contains(&Call::End),
+            "the capture was ended"
+        );
+        eventually("the device is closed", || {
+            r.opener.live.load(Ordering::SeqCst) == 0
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_capture_is_out_of_the_player_before_the_session_is_reported_over(
+    ) {
+        use crate::player::fake::Call;
+        let r = rig();
+        let e = r.rt.enable(None).await.unwrap();
+        let (mut s, _, _) = begin(e.port).await;
+        s.teardown().await.unwrap();
+        eventually("over", || {
+            r.rt.inner
+                .try_lock()
+                .is_ok_and(|g| g.status == Status::Advertising)
+        })
+        .await;
+        // By the time the state said advertising, End had been asked.
+        assert!(r.player.calls().contains(&Call::End));
+    }
+
+    #[tokio::test]
+    async fn a_player_that_will_not_take_the_capture_refuses_the_stream() {
+        let r = rig();
+        *r.player.play_error.lock().unwrap() =
+            Some(crate::player::PlayerError::Idle);
+        let e = r.rt.enable(None).await.unwrap();
+        let (_s, reply, ports) = begin(e.port).await;
         assert_eq!(reply.code(), 503, "{}", reply.status);
         assert!(ports.is_none());
-        assert_eq!(r.rt.get_state().await.state, "advertising");
+        eventually("the device is closed again", || {
+            r.opener.live.load(Ordering::SeqCst) == 0
+        })
+        .await;
+        eventually("the reason is shown", || {
+            r.rt.inner.try_lock().is_ok_and(|g| {
+                g.status == Status::Degraded("playback_refused".into())
+            })
+        })
+        .await;
+        assert_eq!(taken(&r), 0, "nothing was played");
+    }
+
+    #[tokio::test]
+    async fn a_device_that_cannot_be_opened_refuses_the_stream_without_asking_the_player(
+    ) {
+        use crate::player::fake::Call;
+        let r = rig();
+        *r.opener.fail.lock().unwrap() = Some("busy".into());
+        let e = r.rt.enable(None).await.unwrap();
+        let (_s, reply, _) = begin(e.port).await;
+        assert_eq!(reply.code(), 503, "{}", reply.status);
+        assert_eq!(r.player.count(|c| matches!(c, Call::Play(_))), 0);
+        eventually("the reason is shown", || {
+            r.rt.inner.try_lock().is_ok_and(|g| {
+                g.status == Status::Degraded("loopback_unavailable".into())
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_good_stream_after_a_refused_one_clears_the_reason() {
+        let r = rig();
+        *r.opener.fail.lock().unwrap() = Some("busy".into());
+        let e = r.rt.enable(None).await.unwrap();
+        let (_s, reply, _) = begin(e.port).await;
+        assert_eq!(reply.code(), 503);
+        *r.opener.fail.lock().unwrap() = None;
+        let (mut s2, reply, _) = begin(e.port).await;
+        assert_eq!(reply.code(), 200, "{}", reply.status);
+        eventually("a session", || {
+            r.rt.inner
+                .try_lock()
+                .is_ok_and(|g| matches!(g.status, Status::Session { .. }))
+        })
+        .await;
+        s2.teardown().await.unwrap();
+        eventually("advertising again", || {
+            r.rt.inner
+                .try_lock()
+                .is_ok_and(|g| g.status == Status::Advertising)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_capture_the_player_took_away_ends_the_stream() {
+        use crate::player::fake::Call;
+        let r = rig();
+        let e = r.rt.enable(None).await.unwrap();
+        let (mut s, _, _) = begin(e.port).await;
+        eventually("a session", || {
+            r.rt.inner
+                .try_lock()
+                .is_ok_and(|g| matches!(g.status, Status::Session { .. }))
+        })
+        .await;
+        // The operator pressed stop: the player took the capture out.
+        *r.player.tags_error.lock().unwrap() =
+            Some(crate::player::PlayerError::Absent);
+        eventually("the receiver ended the stream", || {
+            r.rt.inner
+                .try_lock()
+                .is_ok_and(|g| g.status == Status::Advertising)
+        })
+        .await;
+        assert!(s.is_closed().await, "the sender's connection is closed");
+        assert!(r.player.calls().contains(&Call::End));
+        eventually("the device is closed", || {
+            r.opener.live.load(Ordering::SeqCst) == 0
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_device_that_fails_under_a_stream_ends_it_and_says_why() {
+        let r = rig();
+        r.opener
+            .device
+            .lock()
+            .unwrap()
+            .script
+            .push_back(crate::sink::PcmError::Failed("gone".into()));
+        let e = r.rt.enable(None).await.unwrap();
+        let (s, _, ports) = begin(e.port).await;
+        let mut data = s.open_data(ports.unwrap(), &KEY).await.unwrap();
+        for frame in evo_airplay::sender::parse_frames(FRAMES).iter().take(10) {
+            let _ = data.send_frame(frame).await;
+        }
+        eventually("the reason is shown once it is over", || {
+            r.rt.inner.try_lock().is_ok_and(|g| {
+                g.status == Status::Degraded("loopback_unavailable".into())
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn disabling_mid_stream_takes_the_capture_out_before_it_returns() {
+        use crate::player::fake::Call;
+        let r = rig();
+        let e = r.rt.enable(None).await.unwrap();
+        let (_s, reply, _) = begin(e.port).await;
+        assert_eq!(reply.code(), 200);
+        eventually("a session", || {
+            r.rt.inner
+                .try_lock()
+                .is_ok_and(|g| matches!(g.status, Status::Session { .. }))
+        })
+        .await;
+        let off = r.rt.disable().await.unwrap();
+        assert_eq!(off.state, "disabled");
+        assert!(
+            r.player.calls().contains(&Call::End),
+            "ended by the time disable returned"
+        );
+        eventually("the device is closed", || {
+            r.opener.live.load(Ordering::SeqCst) == 0
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_second_sender_is_refused_and_the_stream_is_undisturbed() {
+        let r = rig();
+        let e = r.rt.enable(None).await.unwrap();
+        let (_first, reply, _) = begin(e.port).await;
+        assert_eq!(reply.code(), 200);
+        let (_second, refused, ports) = begin(e.port).await;
+        assert_eq!(refused.code(), 453, "{}", refused.status);
+        assert!(ports.is_none());
+        assert_eq!(
+            r.opener.opened.load(Ordering::SeqCst),
+            1,
+            "one device open"
+        );
     }
 
     #[tokio::test]
@@ -960,6 +1371,7 @@ mod tests {
             r.creds.path(),
             cfg(0),
             adv.clone(),
+            Audio::new(r.player.clone(), r.opener.clone()),
         ));
         again.reconcile_on_load().await;
         let e2 = again.get_state().await;
@@ -983,6 +1395,7 @@ mod tests {
             r.creds.path(),
             cfg(0),
             adv.clone(),
+            Audio::new(r.player.clone(), r.opener.clone()),
         ));
         again.reconcile_on_load().await;
         assert_eq!(again.get_state().await.state, "disabled");

@@ -8,6 +8,11 @@ license.workspace = true
 repository.workspace = true
 description = "The device as an AirPlay 2 audio receiver, built in-process on the evo-airplay library. Registers the device with the local mDNS daemon, owns the session gate, the pairing password and the LAN filter, and publishes the reactive audio_receiver_airplay subject. Default disabled; enable and disable are write verbs under network_admin."
 
+[features]
+# The Loopback device the audio is written to. Off by default so the
+# workspace builds without the ALSA headers; the shipped build turns it on.
+alsa-substrate = ["dep:alsa"]
+
 [lib]
 path = "src/lib.rs"
 
@@ -17,6 +22,7 @@ path = "src/bin/receiver-airplay-wire.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+alsa = { version = "0.10", optional = true }
 async-trait = "0.1"
 evo-airplay = { path = "../../crates/evo-airplay" }
 evo-plugin-sdk = { workspace = true }

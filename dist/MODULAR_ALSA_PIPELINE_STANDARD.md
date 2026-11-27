@@ -61,6 +61,25 @@ Flow:
 
 `loopback capture -> multiroom fan-out scheduler -> pcm.evo_local -> DAC`
 
+## Reserved Loopback substreams
+
+The `snd-aloop` card has eight substreams per direction. A substream is
+written on device 0 and read on device 1 with the same number. These are
+reserved; nothing else opens them.
+
+| Substream | Written by | Read by |
+|-----------|------------|---------|
+| 0 | multi-room (source fan-out) | multi-room scheduler |
+| 3 | the player's output (`hw:Loopback,0,3`) | the pipeline |
+| 4 | the AirPlay receiver (`hw:Loopback,0,4`) | the player, as a queue item (`hw:Loopback,1,4`) |
+| 7 | the pipeline tap (`hw:Loopback,0,7`) | spectrum analysis (`hw:Loopback,1,7`) |
+
+The AirPlay receiver never opens `pcm.evo`: that device is held by the
+output pipeline for as long as it runs. Its audio goes to substream 4 and
+the player plays the capture end, so volume, options and the tap apply to it
+as to any other source. When substream 4 is held by something else, the
+receiver refuses the stream and reports `loopback_unavailable`.
+
 ## Ownership boundaries
 
 - **Bootstrap (`dist/scripts/bootstrap.sh`) owns:**

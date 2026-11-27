@@ -4027,6 +4027,7 @@ dependencies = [
 name = "org-evoframework-receiver-airplay"
 version = "0.1.0"
 dependencies = [
+ "alsa",
  "anyhow",
  "async-trait",
  "evo-airplay",
