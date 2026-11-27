@@ -20,6 +20,11 @@ pub struct Persisted {
     /// Operator switch. Defaults to off.
     #[serde(default)]
     pub enabled: bool,
+    /// The stack's own discoverable and pairable timeouts, while a pairing
+    /// window has them changed. If the plugin dies mid-window the next start
+    /// puts them back; without this the window's length would stay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_timeouts: Option<(u32, u32)>,
 }
 
 /// State load/save failures.
@@ -72,16 +77,25 @@ mod tests {
     #[test]
     fn nothing_stored_means_disabled() {
         let d = tempfile::tempdir().unwrap();
-        assert_eq!(load(d.path()), Persisted { enabled: false });
+        assert_eq!(load(d.path()), Persisted::default());
     }
 
     #[test]
     fn the_switch_round_trips() {
         let d = tempfile::tempdir().unwrap();
-        save(d.path(), &Persisted { enabled: true }).unwrap();
+        save(
+            d.path(),
+            &Persisted {
+                enabled: true,
+                restore_timeouts: Some((180, 0)),
+            },
+        )
+        .unwrap();
         assert!(load(d.path()).enabled);
-        save(d.path(), &Persisted { enabled: false }).unwrap();
+        assert_eq!(load(d.path()).restore_timeouts, Some((180, 0)));
+        save(d.path(), &Persisted::default()).unwrap();
         assert!(!load(d.path()).enabled);
+        assert_eq!(load(d.path()).restore_timeouts, None);
     }
 
     #[test]

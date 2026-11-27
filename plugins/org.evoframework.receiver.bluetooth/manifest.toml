@@ -1,8 +1,9 @@
 # org.evoframework.receiver.bluetooth: the device as a Bluetooth audio sink.
 #
-# The plugin owns the sink. It registers an A2DP sink endpoint and a pairing
-# agent with the platform's Bluetooth stack over the system message bus, owns
-# the pairing window and the paired-device list, and publishes honest state.
+# The plugin owns the sink. It registers an A2DP sink endpoint with the
+# platform's Bluetooth stack over the system message bus, registers a pairing
+# agent only while a pairing window is open, owns the paired-device list, and
+# publishes honest state.
 # There is no separate Bluetooth audio daemon. Disabled by default; nothing is
 # registered and the adapter is neither discoverable nor pairable while
 # disabled.

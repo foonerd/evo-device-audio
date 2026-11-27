@@ -9,17 +9,20 @@ has_os_dependencies: false
 # connection to the system message bus, over which it talks to the platform's
 # Bluetooth stack, and nothing else outside its own state directory:
 #
-#   - the system message bus, to register an A2DP sink endpoint and a pairing
-#     agent with the Bluetooth stack, read and set the adapter's power,
-#     visibility and pairing flags, list the paired devices and remove one.
+#   - the system message bus, to register an A2DP sink endpoint with the
+#     Bluetooth stack, register a pairing agent for as long as a pairing window
+#     is open, read and set the adapter's power, visibility and pairing flags,
+#     list the paired devices, mark a newly paired one trusted and remove one.
 #
 # The adapter is never left discoverable or pairable outside the pairing window
 # the operator opens, and neither is while the plugin is disabled, which is the
-# default. No pairing key is read, kept or shown: the host stack holds them.
+# default. The pairing agent exists only inside that window, because the stack
+# makes the adapter pairable whenever a default agent is registered. No pairing
+# key is read, kept or shown: the host stack holds them.
 
 capability_intent:
   - id: bluetooth_stack
-    need: connect to the system message bus and talk to the platform's Bluetooth stack (org.bluez) to register an A2DP sink endpoint and a pairing agent, read and set the adapter's power, discoverable and pairable flags, list the known devices and remove one.
+    need: connect to the system message bus and talk to the platform's Bluetooth stack (org.bluez) to register an A2DP sink endpoint, register a pairing agent for the length of a pairing window, read and set the adapter's power, discoverable and pairable flags, list the known devices, mark a newly paired one trusted and remove one.
     access_path: system message bus
     failure_mode: the stack being absent, the adapter missing or blocked, or the registration being refused leaves the plugin enabled but degraded with a reason code (bluetooth_unavailable, no_adapter, adapter_blocked, endpoint_refused); nothing is left registered, the adapter is not left visible, and the plugin tries again.
 

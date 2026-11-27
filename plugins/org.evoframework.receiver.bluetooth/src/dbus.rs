@@ -10,9 +10,14 @@
 //!
 //! This release registers the endpoint so a source can connect and configure
 //! a stream, but it never asks for the stream's transport: no audio is taken.
+//!
+//! The stack makes the adapter pairable whenever a default agent is
+//! registered. So the agent is registered for a pairing window and only for
+//! one: outside it there is no agent, hence no way to pair, whatever else is
+//! going on. A paired device is marked trusted so the stack authorises its
+//! audio later without asking one.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -312,7 +317,6 @@ pub struct SystemBluez {
     conn: Connection,
     tx: broadcast::Sender<Event>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
-    registered: AtomicBool,
 }
 
 impl SystemBluez {
@@ -326,7 +330,6 @@ impl SystemBluez {
             conn,
             tx: broadcast::channel(64).0,
             tasks: Mutex::new(Vec::new()),
-            registered: AtomicBool::new(false),
         };
         // The stack must answer (this also starts it where it is activated by
         // the bus).
@@ -577,12 +580,74 @@ impl Bluez for SystemBluez {
         .await
     }
 
-    async fn register(&self, gate: Arc<PairingGate>) -> Result<(), BtError> {
+    async fn register_endpoint(&self) -> Result<(), BtError> {
         let adapter = self.adapter_path().await?;
         let server = self.conn.object_server();
         // A previous registration of ours on this connection is replaced.
-        let _ = server.remove::<Agent, _>(AGENT_PATH).await;
         let _ = server.remove::<Endpoint, _>(ENDPOINT_PATH).await;
+        server
+            .at(
+                ENDPOINT_PATH,
+                Endpoint {
+                    events: self.tx.clone(),
+                },
+            )
+            .await
+            .map_err(err)?;
+        let mut props: HashMap<&str, Value> = HashMap::new();
+        props.insert("UUID", Value::from(SINK_UUID));
+        props.insert("Codec", Value::from(0u8));
+        props.insert("Capabilities", Value::from(SBC_CAPABILITIES.to_vec()));
+        let endpoint = ObjectPath::try_from(ENDPOINT_PATH)
+            .map_err(|e| BtError::Refused(e.to_string()))?;
+        let result = self
+            .conn
+            .call_method(
+                Some(BLUEZ),
+                adapter.as_str(),
+                Some("org.bluez.Media1"),
+                "RegisterEndpoint",
+                &(endpoint, props),
+            )
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                self.unregister_endpoint().await;
+                Err(err(e))
+            }
+        }
+    }
+
+    async fn unregister_endpoint(&self) {
+        if let Ok(adapter) = self.adapter_path().await {
+            if let Ok(ep) = ObjectPath::try_from(ENDPOINT_PATH) {
+                let _ = self
+                    .conn
+                    .call_method(
+                        Some(BLUEZ),
+                        adapter.as_str(),
+                        Some("org.bluez.Media1"),
+                        "UnregisterEndpoint",
+                        &(ep,),
+                    )
+                    .await;
+            }
+        }
+        let _ = self
+            .conn
+            .object_server()
+            .remove::<Endpoint, _>(ENDPOINT_PATH)
+            .await;
+    }
+
+    async fn register_agent(
+        &self,
+        gate: Arc<PairingGate>,
+    ) -> Result<(), BtError> {
+        let server = self.conn.object_server();
+        // A window being restarted replaces the agent it had.
+        self.unregister_agent().await;
         server
             .at(
                 AGENT_PATH,
@@ -593,37 +658,9 @@ impl Bluez for SystemBluez {
             )
             .await
             .map_err(err)?;
-        server
-            .at(
-                ENDPOINT_PATH,
-                Endpoint {
-                    events: self.tx.clone(),
-                },
-            )
-            .await
-            .map_err(err)?;
+        let agent = ObjectPath::try_from(AGENT_PATH)
+            .map_err(|e| BtError::Refused(e.to_string()))?;
         let result = async {
-            let mut props: HashMap<&str, Value> = HashMap::new();
-            props.insert("UUID", Value::from(SINK_UUID));
-            props.insert("Codec", Value::from(0u8));
-            props
-                .insert("Capabilities", Value::from(SBC_CAPABILITIES.to_vec()));
-            self.conn
-                .call_method(
-                    Some(BLUEZ),
-                    adapter.as_str(),
-                    Some("org.bluez.Media1"),
-                    "RegisterEndpoint",
-                    &(
-                        ObjectPath::try_from(ENDPOINT_PATH)
-                            .map_err(|e| BtError::Refused(e.to_string()))?,
-                        props,
-                    ),
-                )
-                .await
-                .map_err(err)?;
-            let agent = ObjectPath::try_from(AGENT_PATH)
-                .map_err(|e| BtError::Refused(e.to_string()))?;
             self.conn
                 .call_method(
                     Some(BLUEZ),
@@ -647,33 +684,13 @@ impl Bluez for SystemBluez {
             Ok::<(), BtError>(())
         }
         .await;
-        match result {
-            Ok(()) => {
-                self.registered.store(true, Ordering::SeqCst);
-                Ok(())
-            }
-            Err(e) => {
-                self.unregister().await;
-                Err(e)
-            }
+        if result.is_err() {
+            self.unregister_agent().await;
         }
+        result
     }
 
-    async fn unregister(&self) {
-        if let Ok(adapter) = self.adapter_path().await {
-            if let Ok(ep) = ObjectPath::try_from(ENDPOINT_PATH) {
-                let _ = self
-                    .conn
-                    .call_method(
-                        Some(BLUEZ),
-                        adapter.as_str(),
-                        Some("org.bluez.Media1"),
-                        "UnregisterEndpoint",
-                        &(ep,),
-                    )
-                    .await;
-            }
-        }
+    async fn unregister_agent(&self) {
         if let Ok(agent) = ObjectPath::try_from(AGENT_PATH) {
             let _ = self
                 .conn
@@ -686,10 +703,21 @@ impl Bluez for SystemBluez {
                 )
                 .await;
         }
-        let server = self.conn.object_server();
-        let _ = server.remove::<Agent, _>(AGENT_PATH).await;
-        let _ = server.remove::<Endpoint, _>(ENDPOINT_PATH).await;
-        self.registered.store(false, Ordering::SeqCst);
+        let _ = self
+            .conn
+            .object_server()
+            .remove::<Agent, _>(AGENT_PATH)
+            .await;
+    }
+
+    async fn trust(&self, address: &str) -> Result<(), BtError> {
+        let adapter = self.adapter_path().await?;
+        let device = format!(
+            "{adapter}/dev_{}",
+            address.replace(':', "_").to_ascii_uppercase()
+        );
+        self.set_prop(&device, DEVICE_IFACE, "Trusted", Value::from(true))
+            .await
     }
 
     async fn devices(&self) -> Result<Vec<DeviceInfo>, BtError> {

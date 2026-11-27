@@ -3,16 +3,19 @@
 //! # org-evoframework-receiver-bluetooth
 //!
 //! The device as a Bluetooth audio sink. The plugin owns the sink: it
-//! registers an A2DP sink endpoint and a pairing agent with the platform's
-//! Bluetooth stack over the system message bus, owns the pairing window and
-//! the paired-device list, and publishes honest state. There is no separate
+//! registers an A2DP sink endpoint with the platform's Bluetooth stack over
+//! the system message bus, registers a pairing agent for as long as a pairing
+//! window is open, owns the paired-device list, and publishes honest state. There is no separate
 //! Bluetooth audio daemon, and nothing here speaks to the player except
 //! through the `playback.mpd` plugin's verbs.
 //!
 //! Default **disabled**: nothing is registered and the adapter is neither
 //! discoverable nor pairable until an operator enables it. Enabling alone lets
 //! already-paired devices connect; it does not make the device visible. Only
-//! an explicit, bounded pairing window does that. Enabling, disabling and the
+//! an explicit, bounded pairing window does that, and the pairing agent exists
+//! only inside it: the stack makes the adapter pairable whenever a default
+//! agent is registered, so an agent that outlived the window would leave the
+//! device open to pairing. Enabling, disabling and the
 //! pairing verbs are write verbs under `network_admin`; reading the state
 //! needs no scope. The state is published on the `audio_receiver_bluetooth`
 //! subject. No link key is ever part of the state, a log line or an error.

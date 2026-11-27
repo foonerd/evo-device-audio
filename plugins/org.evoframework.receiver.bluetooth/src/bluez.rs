@@ -106,11 +106,27 @@ pub trait Bluez: Send + Sync {
         discoverable: u32,
         pairable: u32,
     ) -> Result<(), BtError>;
-    /// Register the sink endpoint and the pairing agent. The agent consults
-    /// `gate` for every request it is asked about.
-    async fn register(&self, gate: Arc<PairingGate>) -> Result<(), BtError>;
-    /// Take both registrations back. Safe to call when none is held.
-    async fn unregister(&self);
+    /// Register the A2DP sink endpoint. It stays registered while the
+    /// receiver is enabled; it lets a source configure a stream and makes
+    /// nothing visible.
+    async fn register_endpoint(&self) -> Result<(), BtError>;
+    /// Take the endpoint back. Safe to call when none is held.
+    async fn unregister_endpoint(&self);
+    /// Register the pairing agent as the default agent, for `gate` to
+    /// consult. **The host stack makes the adapter pairable whenever a
+    /// default agent is registered**, so the agent exists only while the
+    /// pairing window is open and at no other time.
+    async fn register_agent(
+        &self,
+        gate: Arc<PairingGate>,
+    ) -> Result<(), BtError>;
+    /// Take the agent back; the stack makes the adapter unpairable again.
+    /// Safe to call when none is held.
+    async fn unregister_agent(&self);
+    /// Mark a paired device trusted, so the stack authorises its audio
+    /// profiles later without asking an agent (there is none outside the
+    /// window).
+    async fn trust(&self, address: &str) -> Result<(), BtError>;
     /// Every device the stack knows.
     async fn devices(&self) -> Result<Vec<DeviceInfo>, BtError>;
     /// Forget a device: disconnect it and drop its pairing.
@@ -137,12 +153,20 @@ pub(crate) mod fake {
     pub(crate) struct FakeState {
         pub(crate) adapter: Option<AdapterInfo>,
         pub(crate) devices: Vec<DeviceInfo>,
-        pub(crate) registered: bool,
+        /// The sink endpoint is registered.
+        pub(crate) endpoint: bool,
+        /// A default agent is registered, with the gate it consults.
         pub(crate) gate: Option<Arc<PairingGate>>,
+        /// Addresses marked trusted.
+        pub(crate) trusted: Vec<String>,
         /// Powering the radio fails as blocked.
         pub(crate) blocked: bool,
-        /// Registering fails as refused.
+        /// Registering the endpoint fails as refused.
         pub(crate) refuse_register: bool,
+        /// Registering the agent fails as refused.
+        pub(crate) refuse_agent: bool,
+        /// Making the adapter discoverable fails (after the agent is in).
+        pub(crate) refuse_discoverable: bool,
         /// Every state-changing call, in order.
         pub(crate) calls: Vec<String>,
         /// Every address `remove_device` was asked about, known or not.
@@ -173,10 +197,13 @@ pub(crate) mod fake {
                 st: Mutex::new(FakeState {
                     adapter,
                     devices: Vec::new(),
-                    registered: false,
+                    endpoint: false,
                     gate: None,
+                    trusted: Vec::new(),
                     blocked: false,
                     refuse_register: false,
+                    refuse_agent: false,
+                    refuse_discoverable: false,
                     calls: Vec::new(),
                     remove_asked: Vec::new(),
                 }),
@@ -266,6 +293,9 @@ pub(crate) mod fake {
         }
         async fn set_discoverable(&self, on: bool) -> Result<(), BtError> {
             let mut s = self.st.lock().unwrap();
+            if on && s.refuse_discoverable {
+                return Err(BtError::Refused("discoverable".into()));
+            }
             s.calls.push(format!("discoverable={on}"));
             s.adapter.as_mut().ok_or(BtError::NoAdapter)?.discoverable = on;
             Ok(())
@@ -288,30 +318,61 @@ pub(crate) mod fake {
             a.pairable_timeout = pairable;
             Ok(())
         }
-        async fn register(
+        async fn register_endpoint(&self) -> Result<(), BtError> {
+            let mut s = self.st.lock().unwrap();
+            if s.refuse_register {
+                // The stack took the registration but the reply was lost: the
+                // endpoint is there and the caller was told it failed.
+                s.endpoint = true;
+                return Err(BtError::Refused("endpoint".into()));
+            }
+            s.calls.push("register_endpoint".into());
+            s.endpoint = true;
+            Ok(())
+        }
+        async fn unregister_endpoint(&self) {
+            let mut s = self.st.lock().unwrap();
+            if s.endpoint {
+                s.calls.push("unregister_endpoint".into());
+            }
+            s.endpoint = false;
+        }
+        async fn register_agent(
             &self,
             gate: Arc<PairingGate>,
         ) -> Result<(), BtError> {
             let mut s = self.st.lock().unwrap();
-            if s.refuse_register {
-                // The stack takes the first registration and refuses the
-                // next: half done, as the real one can be.
-                s.registered = true;
-                s.gate = Some(gate);
+            if s.refuse_agent {
                 return Err(BtError::Refused("agent".into()));
             }
-            s.calls.push("register".into());
-            s.registered = true;
+            s.calls.push("register_agent".into());
             s.gate = Some(gate);
+            // The rule of the real stack that matters most here: a default
+            // agent makes the adapter pairable.
+            if let Some(a) = s.adapter.as_mut() {
+                a.pairable = true;
+            }
             Ok(())
         }
-        async fn unregister(&self) {
+        async fn unregister_agent(&self) {
             let mut s = self.st.lock().unwrap();
-            if s.registered {
-                s.calls.push("unregister".into());
+            if s.gate.is_some() {
+                s.calls.push("unregister_agent".into());
             }
-            s.registered = false;
             s.gate = None;
+            // ... and without one it is not.
+            if let Some(a) = s.adapter.as_mut() {
+                a.pairable = false;
+            }
+        }
+        async fn trust(&self, address: &str) -> Result<(), BtError> {
+            let mut s = self.st.lock().unwrap();
+            if !s.devices.iter().any(|d| d.address == address) {
+                return Err(BtError::NotFound);
+            }
+            s.calls.push(format!("trust={address}"));
+            s.trusted.push(address.to_string());
+            Ok(())
         }
         async fn devices(&self) -> Result<Vec<DeviceInfo>, BtError> {
             Ok(self.st.lock().unwrap().devices.clone())

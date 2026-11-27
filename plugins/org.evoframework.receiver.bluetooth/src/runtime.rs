@@ -462,10 +462,23 @@ impl BluetoothRuntime {
             bluez.set_pairable(false).await.map_err(|e| reason_of(&e))?;
             adapter.pairable = false;
         }
+        // A window that died with the plugin left the stack's own timeouts at
+        // the window's length: put them back.
+        if let Some((d, p)) = g.persisted.restore_timeouts {
+            if bluez.set_timeouts(d, p).await.is_ok() {
+                adapter.discoverable_timeout = d;
+                adapter.pairable_timeout = p;
+                g.persisted.restore_timeouts = None;
+                let _ = state::save(&self.state_dir, &g.persisted);
+            }
+        }
         g.epoch += 1;
         let events = bluez.events();
-        if let Err(e) = bluez.register(self.gate.clone()).await {
-            bluez.unregister().await;
+        // The endpoint only. The agent is registered for a pairing window and
+        // for nothing else: the stack makes the adapter pairable whenever a
+        // default agent exists.
+        if let Err(e) = bluez.register_endpoint().await {
+            bluez.unregister_endpoint().await;
             return Err(reason_of(&e));
         }
         g.devices = bluez.devices().await.unwrap_or_default();
@@ -516,9 +529,18 @@ impl BluetoothRuntime {
             }
             match event {
                 Event::Changed => self.refresh(&mut g).await,
-                Event::Paired(_) => {
-                    // The first pairing closes the window.
-                    self.end_window(&mut g, true).await;
+                Event::Paired(address) => {
+                    if g.window.is_some() {
+                        // Trusted, so the stack authorises the device's audio
+                        // later with no agent (there is none outside the
+                        // window). The first pairing then closes the window.
+                        if let Some(bluez) = g.bluez.clone() {
+                            if let Err(e) = bluez.trust(&address).await {
+                                tracing::warn!(error = %e, "could not mark a newly paired device trusted");
+                            }
+                        }
+                        self.end_window(&mut g, true).await;
+                    }
                     self.refresh(&mut g).await;
                 }
                 Event::Gone => {
@@ -548,6 +570,25 @@ impl BluetoothRuntime {
         if let Ok(a) = bluez.adapter().await {
             g.adapter = Some(a);
         }
+        // Outside a window the adapter is closed. If something else opened it
+        // (another agent, another tool), the plugin closes it again: while the
+        // receiver is enabled the plugin owns the adapter's visibility.
+        if g.window.is_none() {
+            if let Some(a) = g.adapter.clone() {
+                if a.pairable || a.discoverable {
+                    tracing::warn!(
+                        pairable = a.pairable,
+                        discoverable = a.discoverable,
+                        "the adapter was opened outside a pairing window; closing it"
+                    );
+                    let _ = bluez.set_discoverable(false).await;
+                    let _ = bluez.set_pairable(false).await;
+                    if let Ok(a) = bluez.adapter().await {
+                        g.adapter = Some(a);
+                    }
+                }
+            }
+        }
         if let Ok(d) = bluez.devices().await {
             g.devices = d;
         }
@@ -565,9 +606,19 @@ impl BluetoothRuntime {
             window.timer.abort();
         }
         if let Some(bluez) = g.bluez.clone() {
+            // Agent first: with none the stack makes the adapter unpairable
+            // by itself, and the explicit calls below make sure.
+            bluez.unregister_agent().await;
             let _ = bluez.set_discoverable(false).await;
             let _ = bluez.set_pairable(false).await;
-            let _ = bluez.set_timeouts(window.prev.0, window.prev.1).await;
+            if bluez
+                .set_timeouts(window.prev.0, window.prev.1)
+                .await
+                .is_ok()
+                && g.persisted.restore_timeouts.take().is_some()
+            {
+                let _ = state::save(&self.state_dir, &g.persisted);
+            }
             if let Ok(a) = bluez.adapter().await {
                 g.adapter = Some(a);
             }
@@ -621,8 +672,17 @@ impl BluetoothRuntime {
             let refuse = |e: BtError| {
                 VerbError::Invalid(format!("the Bluetooth stack refused: {e}"))
             };
+            // Remember the stack's own timeouts on disk before touching them,
+            // so a plugin that dies mid-window can put them back.
+            if g.persisted.restore_timeouts.is_none() {
+                g.persisted.restore_timeouts = Some(prev);
+                state::save(&self.state_dir, &g.persisted)?;
+            }
+            // The agent is part of the window: registering it is what makes
+            // the stack pairable, and it goes with the window.
             let opened = async {
                 bluez.set_timeouts(seconds, seconds).await?;
+                bluez.register_agent(self.gate.clone()).await?;
                 bluez.set_pairable(true).await?;
                 bluez.set_discoverable(true).await
             }
@@ -630,9 +690,13 @@ impl BluetoothRuntime {
             if let Err(e) = opened {
                 // Never leave half a window.
                 self.gate.close();
+                bluez.unregister_agent().await;
                 let _ = bluez.set_discoverable(false).await;
                 let _ = bluez.set_pairable(false).await;
-                let _ = bluez.set_timeouts(prev.0, prev.1).await;
+                if bluez.set_timeouts(prev.0, prev.1).await.is_ok() {
+                    g.persisted.restore_timeouts = None;
+                    let _ = state::save(&self.state_dir, &g.persisted);
+                }
                 return Err(refuse(e));
             }
             self.gate.open();
@@ -720,7 +784,7 @@ impl BluetoothRuntime {
         g.epoch += 1;
         self.end_window(g, true).await;
         if let Some(bluez) = g.bluez.take() {
-            bluez.unregister().await;
+            bluez.unregister_endpoint().await;
             // Leave the radio as it was found.
             if g.powered_by_us {
                 let _ = bluez.set_powered(false).await;
@@ -909,7 +973,15 @@ mod tests {
         assert!(e.enabled && e.adapter.present && e.adapter.powered);
         assert_eq!(e.friendly_name, "testspeaker");
         let calls = r.bt.calls();
-        assert!(calls.contains(&"register".to_string()), "{calls:?}");
+        assert!(
+            calls.contains(&"register_endpoint".to_string()),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.contains(&"register_agent".to_string()),
+            "no agent outside a pairing window: the stack makes the adapter pairable for one"
+        );
+        assert!(r.bt.st.lock().unwrap().gate.is_none());
         assert!(
             !calls
                 .iter()
@@ -967,7 +1039,7 @@ mod tests {
         assert_eq!(word(&e), "degraded");
         assert_eq!(e.reason.as_deref(), Some(reason::NO_ADAPTER));
         assert!(!e.adapter.present);
-        assert!(!r.bt.calls().contains(&"register".to_string()));
+        assert!(!r.bt.calls().contains(&"register_endpoint".to_string()));
         r.bt.st.lock().unwrap().adapter = Some(adapter(true));
         tokio::time::sleep(Duration::from_secs(1)).await;
         settle().await;
@@ -984,7 +1056,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
         settle().await;
         assert_eq!(word(&r.rt.get_state().await), "ready");
-        assert!(r.bt.st.lock().unwrap().registered);
+        assert!(r.bt.st.lock().unwrap().endpoint);
     }
 
     #[tokio::test(start_paused = true)]
@@ -998,7 +1070,7 @@ mod tests {
         let e = r.rt.enable().await.unwrap();
         assert_eq!(e.reason.as_deref(), Some(reason::BLOCKED));
         assert!(!e.adapter.powered);
-        assert!(!r.bt.st.lock().unwrap().registered);
+        assert!(!r.bt.st.lock().unwrap().endpoint);
         r.bt.st.lock().unwrap().blocked = false;
         tokio::time::sleep(Duration::from_secs(1)).await;
         settle().await;
@@ -1013,7 +1085,7 @@ mod tests {
         let e = r.rt.enable().await.unwrap();
         assert_eq!(e.reason.as_deref(), Some(reason::ENDPOINT_REFUSED));
         let s = r.bt.st.lock().unwrap();
-        assert!(!s.registered && s.gate.is_none());
+        assert!(!s.endpoint && s.gate.is_none());
         assert!(!s.adapter.as_ref().unwrap().pairable);
     }
 
@@ -1048,7 +1120,11 @@ mod tests {
         let a = r.bt.adapter_now();
         assert!(!a.discoverable && !a.pairable);
         assert_eq!((a.discoverable_timeout, a.pairable_timeout), (180, 0));
-        assert!(!r.bt.st.lock().unwrap().gate.clone().unwrap().is_open());
+        assert!(
+            r.bt.st.lock().unwrap().gate.is_none(),
+            "the agent goes with the window"
+        );
+        assert_eq!(state::load(r.dir.path()).restore_timeouts, None);
         // closing again changes nothing
         assert_eq!(word(&r.rt.stop_pairing().await.unwrap()), "ready");
     }
@@ -1090,21 +1166,153 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn outside_the_window_nothing_pairs_and_the_agent_is_a_second_lock() {
+    async fn outside_the_window_nothing_pairs_there_is_no_agent_and_the_adapter_is_shut(
+    ) {
         let r = rig().await;
         r.rt.enable().await.unwrap();
-        // the adapter's own flag is the first lock
+        assert!(
+            r.bt.st.lock().unwrap().gate.is_none(),
+            "no agent: the stack would make the adapter pairable for it"
+        );
         assert_eq!(
             r.bt.pair("AA:BB:CC:DD:EE:01", "stranger"),
             Err("the adapter is not pairable")
         );
-        // even with the adapter flag forced on, the agent refuses
+        assert!(r.rt.get_state().await.devices.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_agent_registered_by_something_else_does_not_leave_the_adapter_open(
+    ) {
+        let r = rig().await;
+        r.rt.enable().await.unwrap();
+        // another tool registers its own agent: the stack makes the adapter
+        // pairable, and tells us something changed
         r.bt.st.lock().unwrap().adapter.as_mut().unwrap().pairable = true;
+        r.bt.st
+            .lock()
+            .unwrap()
+            .adapter
+            .as_mut()
+            .unwrap()
+            .discoverable = true;
+        r.bt.send(Event::Changed);
+        settle().await;
+        let a = r.bt.adapter_now();
+        assert!(
+            !a.pairable && !a.discoverable,
+            "the plugin owns the adapter's visibility while enabled"
+        );
         assert_eq!(
             r.bt.pair("AA:BB:CC:DD:EE:01", "stranger"),
-            Err("the agent rejected the request")
+            Err("the adapter is not pairable")
         );
-        assert!(r.rt.get_state().await.devices.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_agent_exists_only_while_the_window_is_open() {
+        let r = rig().await;
+        r.rt.enable().await.unwrap();
+        assert!(r.bt.st.lock().unwrap().gate.is_none());
+        r.rt.start_pairing(60).await.unwrap();
+        assert!(r.bt.st.lock().unwrap().gate.is_some());
+        assert!(r.bt.adapter_now().pairable);
+        r.rt.stop_pairing().await.unwrap();
+        assert!(r.bt.st.lock().unwrap().gate.is_none());
+        assert!(!r.bt.adapter_now().pairable);
+        // and it goes with the timer, with the first pairing, and with disable
+        r.rt.start_pairing(5).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        settle().await;
+        assert!(r.bt.st.lock().unwrap().gate.is_none(), "timeout");
+        r.rt.start_pairing(60).await.unwrap();
+        r.bt.pair("AA:BB:CC:DD:EE:01", "phone").unwrap();
+        settle().await;
+        assert!(r.bt.st.lock().unwrap().gate.is_none(), "first pairing");
+        r.rt.start_pairing(60).await.unwrap();
+        r.rt.disable().await.unwrap();
+        assert!(r.bt.st.lock().unwrap().gate.is_none(), "disable");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_agent_opens_nothing_and_puts_everything_back() {
+        let r = rig().await;
+        r.rt.enable().await.unwrap();
+        r.bt.st.lock().unwrap().refuse_agent = true;
+        let e = r.rt.start_pairing(60).await.unwrap_err();
+        assert!(e.to_string().contains("refused"), "{e}");
+        let a = r.bt.adapter_now();
+        assert!(!a.discoverable && !a.pairable);
+        assert_eq!((a.discoverable_timeout, a.pairable_timeout), (180, 0));
+        assert_eq!(state::load(r.dir.path()).restore_timeouts, None);
+        assert_eq!(word(&r.rt.get_state().await), "ready");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_window_that_fails_half_way_is_taken_down_again() {
+        let r = rig().await;
+        r.rt.enable().await.unwrap();
+        // the agent goes in (and the stack makes the adapter pairable), then
+        // the next step fails
+        r.bt.st.lock().unwrap().refuse_discoverable = true;
+        assert!(r.rt.start_pairing(60).await.is_err());
+        {
+            let s = r.bt.st.lock().unwrap();
+            assert!(s.gate.is_none(), "the agent must not be left in");
+            let a = s.adapter.as_ref().unwrap();
+            assert!(!a.pairable && !a.discoverable, "nothing left open");
+            assert_eq!((a.discoverable_timeout, a.pairable_timeout), (180, 0));
+        }
+        assert_eq!(state::load(r.dir.path()).restore_timeouts, None);
+        assert_eq!(word(&r.rt.get_state().await), "ready");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_first_pairing_trusts_the_device_and_a_pairing_outside_a_window_does_not(
+    ) {
+        let r = rig().await;
+        r.rt.enable().await.unwrap();
+        r.rt.start_pairing(60).await.unwrap();
+        r.bt.pair("AA:BB:CC:DD:EE:01", "phone").unwrap();
+        settle().await;
+        assert_eq!(r.bt.st.lock().unwrap().trusted, ["AA:BB:CC:DD:EE:01"]);
+        // something pairs a device with no window open (not through us)
+        r.bt.add_paired("AA:BB:CC:DD:EE:02", "other");
+        r.bt.send(Event::Paired("AA:BB:CC:DD:EE:02".into()));
+        settle().await;
+        assert_eq!(
+            r.bt.st.lock().unwrap().trusted,
+            ["AA:BB:CC:DD:EE:01"],
+            "only devices paired inside our window are trusted"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_window_that_died_with_the_plugin_has_its_timeouts_put_back_at_the_next_start(
+    ) {
+        let r = rig().await;
+        r.rt.enable().await.unwrap();
+        r.rt.start_pairing(120).await.unwrap();
+        assert_eq!(
+            state::load(r.dir.path()).restore_timeouts,
+            Some((180, 0)),
+            "kept on disk while the window has them changed"
+        );
+        let a = r.bt.adapter_now();
+        assert_eq!((a.discoverable_timeout, a.pairable_timeout), (120, 120));
+        // the plugin dies: its connection goes, and with it its agent
+        r.bt.st.lock().unwrap().gate = None;
+        let (bt, dir) = (r.bt, r.dir);
+        let r2 = rig_over(bt.clone(), dir).await;
+        r2.rt.reconcile_on_load().await;
+        let a = bt.adapter_now();
+        assert_eq!(
+            (a.discoverable_timeout, a.pairable_timeout),
+            (180, 0),
+            "the stack's own timeouts, not the window's"
+        );
+        assert!(!a.pairable && !a.discoverable);
+        assert_eq!(state::load(r2.dir.path()).restore_timeouts, None);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1188,7 +1396,7 @@ mod tests {
         assert_eq!(word(&e), "disabled");
         assert!(!e.enabled && e.pairing.is_none() && e.devices.is_empty());
         let s = r.bt.st.lock().unwrap();
-        assert!(!s.registered);
+        assert!(!s.endpoint && s.gate.is_none());
         let a = s.adapter.as_ref().unwrap();
         assert!(!a.discoverable && !a.pairable);
         assert_eq!(s.devices.len(), 1, "pairings are the stack's and are kept");
@@ -1344,7 +1552,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
         settle().await;
         assert_eq!(word(&r.rt.get_state().await), "ready");
-        assert!(second.st.lock().unwrap().registered);
+        assert!(second.st.lock().unwrap().endpoint);
         let a = second.adapter_now();
         assert!(!a.discoverable && !a.pairable);
     }
