@@ -8,3 +8,8 @@ Project ownership and marks:
 
 This repository is licensed under the Apache License 2.0.
 See LICENSE for details.
+
+Third-party notices:
+- The AirPlay receiver library under crates/evo-airplay is derived from the
+  MIT-licensed openairplay2 and includes interoperability data derived from
+  Apple's AirPlay. See crates/evo-airplay/NOTICE.md.

@@ -11,6 +11,7 @@ members = [
     "crates/evo-parity-harness",
     "crates/evo-apply-update",
     "crates/evo-dlna",
+    "crates/evo-airplay",
     "plugins/org.evoframework.source.dlna",
     "plugins/org.evoframework.playback.mpd",
     "plugins/org.evoframework.metadata.local",
