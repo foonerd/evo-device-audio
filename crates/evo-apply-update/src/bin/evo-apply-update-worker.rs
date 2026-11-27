@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 
 //! The unit's process. Started by systemd as
 //! `evo-apply-update@<token>.service`; not in any sudoers grant.

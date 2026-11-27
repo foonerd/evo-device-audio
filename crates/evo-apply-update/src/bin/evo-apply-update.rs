@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 
 //! The sudo target. A closed grammar in, one unit
 //! instance started out. See the library for what it will and will not do.
