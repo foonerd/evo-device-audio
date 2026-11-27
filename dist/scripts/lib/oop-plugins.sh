@@ -14,6 +14,11 @@
 # notifications / terminus / metadata.online and left the UI
 # shelves dead.
 #
+# The list and the plugins tree must agree: dist/scripts/tests/
+# oop-list-parity.test.sh fails when a plugin that has a
+# manifest.oop.toml is not on this list, or an entry's crate, wire
+# binary or feature differs from the crate's own.
+#
 # shellcheck shell=bash
 
 OOP_PLUGINS=(
@@ -41,6 +46,8 @@ OOP_PLUGINS=(
     "org.evoframework.system.backup:org-evoframework-system-backup:system-backup-wire:"
     "org.evoframework.identity.locale:org-evoframework-identity-locale:identity-locale-wire:"
     "org.evoframework.system.updater:org-evoframework-system-updater:system-updater-wire:"
+    "org.evoframework.receiver.dlna:org-evoframework-receiver-dlna:receiver-dlna-wire:"
+    "org.evoframework.receiver.airplay:org-evoframework-receiver-airplay:receiver-airplay-wire:alsa-substrate"
 )
 
 # Expected admitted-plugin count after a clean install/reinstall.

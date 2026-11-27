@@ -47,14 +47,16 @@ FAIL=0
 # shellcheck disable=SC2034
 healthy_env() {
     ACTIVE_STATE="active"
-    # Twenty-four: every entry on dist/scripts/lib/oop-plugins.sh,
+    # Twenty-six: every entry on dist/scripts/lib/oop-plugins.sh,
     # the twentieth org.evoframework.alarm, the twenty-first
     # org.evoframework.system.info, the twenty-second
     # org.evoframework.system.backup, the twenty-third
-    # org.evoframework.identity.locale and the twenty-fourth
-    # org.evoframework.system.updater.
-    PLUGINS_ADMITTED=24
-    PLUGINS_EXPECTED=24
+    # org.evoframework.identity.locale, the twenty-fourth
+    # org.evoframework.system.updater, the twenty-fifth
+    # org.evoframework.receiver.dlna and the twenty-sixth
+    # org.evoframework.receiver.airplay.
+    PLUGINS_ADMITTED=26
+    PLUGINS_EXPECTED=26
     ADMISSION_FAILURES=0
     NOT_DECLARED=0
     JOURNAL_FAIL_COUNT=0
@@ -144,20 +146,22 @@ else
 fi
 
 # The healthy count above is the ship list, and the alarm, the
-# system info plugin, the backup plugin, the locale plugin and the
-# updater plugin are on it.
+# system info plugin, the backup plugin, the locale plugin, the
+# updater plugin and the two receivers are on it.
 # shellcheck source=../lib/oop-plugins.sh
 source "$SCRIPT_DIR/../lib/oop-plugins.sh"
-if [[ "${#OOP_PLUGINS[@]}" -eq 24 ]] \
+if [[ "${#OOP_PLUGINS[@]}" -eq 26 ]] \
     && printf '%s\n' "${OOP_PLUGINS[@]}" | grep -q '^org\.evoframework\.alarm:' \
     && printf '%s\n' "${OOP_PLUGINS[@]}" | grep -q '^org\.evoframework\.system\.info:' \
     && printf '%s\n' "${OOP_PLUGINS[@]}" | grep -q '^org\.evoframework\.system\.backup:' \
     && printf '%s\n' "${OOP_PLUGINS[@]}" | grep -q '^org\.evoframework\.identity\.locale:' \
-    && printf '%s\n' "${OOP_PLUGINS[@]}" | grep -q '^org\.evoframework\.system\.updater:'; then
-    echo "PASS  the ship list is 24 plugins, org.evoframework.alarm, org.evoframework.system.info, org.evoframework.system.backup, org.evoframework.identity.locale and org.evoframework.system.updater among them"
+    && printf '%s\n' "${OOP_PLUGINS[@]}" | grep -q '^org\.evoframework\.system\.updater:' \
+    && printf '%s\n' "${OOP_PLUGINS[@]}" | grep -q '^org\.evoframework\.receiver\.dlna:' \
+    && printf '%s\n' "${OOP_PLUGINS[@]}" | grep -q '^org\.evoframework\.receiver\.airplay:'; then
+    echo "PASS  the ship list is 26 plugins, org.evoframework.alarm, org.evoframework.system.info, org.evoframework.system.backup, org.evoframework.identity.locale, org.evoframework.system.updater, org.evoframework.receiver.dlna and org.evoframework.receiver.airplay among them"
     PASS=$((PASS + 1))
 else
-    echo "FAIL  the ship list is ${#OOP_PLUGINS[@]} plugins, or org.evoframework.alarm, org.evoframework.system.info, org.evoframework.system.backup, org.evoframework.identity.locale or org.evoframework.system.updater is not on it"
+    echo "FAIL  the ship list is ${#OOP_PLUGINS[@]} plugins, or org.evoframework.alarm, org.evoframework.system.info, org.evoframework.system.backup, org.evoframework.identity.locale, org.evoframework.system.updater, org.evoframework.receiver.dlna or org.evoframework.receiver.airplay is not on it"
     FAIL=$((FAIL + 1))
 fi
 

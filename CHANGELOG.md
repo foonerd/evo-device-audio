@@ -4,6 +4,12 @@ All notable changes to evo-device-audio are recorded here.
 
 ## Unreleased
 
+- Ship list: the DLNA renderer and the AirPlay receiver
+  (`org.evoframework.receiver.dlna`, `org.evoframework.receiver.airplay`)
+  are on `dist/scripts/lib/oop-plugins.sh`, the one list the installer
+  bundle, the redeploy script and the published pieces are built from. A
+  redeploy no longer removes them, and `oop-list-parity.test.sh` fails when
+  a plugin in the tree is missing from the list.
 - In-app updater: the `org.evoframework.system.updater` plugin and a root
   helper (`evo-apply-update`) that checks a signed registry, applies one
   plugin at a time with the previous bundle kept and a restore if the new
