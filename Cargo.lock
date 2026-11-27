@@ -1841,6 +1841,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "evo-sbc"
+version = "0.1.0"
+
+[[package]]
 name = "evo-sdk-genkit"
 version = "0.1.13"
 source = "git+https://github.com/foonerd/evo-core.git?tag=v0.1.13.2#3c906f1b1bae84215e1da868296783f60b5021a6"

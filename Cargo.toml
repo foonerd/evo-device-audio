@@ -12,6 +12,7 @@ members = [
     "crates/evo-apply-update",
     "crates/evo-dlna",
     "crates/evo-airplay",
+    "crates/evo-sbc",
     "plugins/org.evoframework.source.dlna",
     "plugins/org.evoframework.playback.mpd",
     "plugins/org.evoframework.metadata.local",
