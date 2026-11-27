@@ -37,7 +37,7 @@ async fn start_with_password(
 ) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let sink_factory: SinkFactory = Arc::new(|_, _| Box::new(TestSink));
+    let sink_factory: SinkFactory = Arc::new(|_, _| Ok(Box::new(TestSink)));
     let (events, _) = tokio::sync::mpsc::unbounded_channel();
     let context = Arc::new(Context {
         config: Config {
@@ -53,6 +53,8 @@ async fn start_with_password(
         identity: Identity::generate(),
         sink_factory,
         events,
+        gate: Arc::new(evo_airplay::SingleSession::new()),
+        control: evo_airplay::SessionControl::new(),
     });
     tokio::spawn(serve(listener, context));
     addr
@@ -235,7 +237,7 @@ async fn transient_pairing_then_encrypted_info() {
 
     // SETUP phase 2 (streams array) → data/control ports.
     let mut s = plist::Dictionary::new();
-    s.insert("type".into(), plist::Value::Integer(96u64.into()));
+    s.insert("type".into(), plist::Value::Integer(103u64.into()));
     s.insert("shk".into(), plist::Value::Data(vec![9u8; 32]));
     s.insert("spf".into(), plist::Value::Integer(352u64.into()));
     let mut d = plist::Dictionary::new();
@@ -261,7 +263,10 @@ async fn transient_pairing_then_encrypted_info() {
         .as_array()
         .unwrap();
     let stream0 = streams[0].as_dictionary().unwrap();
-    assert_eq!(stream0.get("type").unwrap().as_unsigned_integer(), Some(96));
+    assert_eq!(
+        stream0.get("type").unwrap().as_unsigned_integer(),
+        Some(103)
+    );
     assert!(
         stream0
             .get("dataPort")

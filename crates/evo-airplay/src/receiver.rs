@@ -13,8 +13,9 @@ use tracing::warn;
 
 use crate::events::EventSender;
 use crate::identity::Identity;
+use crate::policy::{SessionControl, SessionGate, SingleSession};
 use crate::server::{serve, Context};
-use crate::sink::{AudioSink, SinkFactory};
+use crate::sink::{AudioSink, SinkError, SinkFactory};
 use crate::{info, mac, Config};
 
 const DEFAULT_NAME: &str = "Evo Audio";
@@ -63,6 +64,7 @@ pub struct ReceiverBuilder {
     identity: Option<Identity>,
     identity_path: Option<PathBuf>,
     password: Option<String>,
+    gate: Option<Arc<dyn SessionGate>>,
 }
 
 impl ReceiverBuilder {
@@ -74,6 +76,7 @@ impl ReceiverBuilder {
             identity: None,
             identity_path: None,
             password: None,
+            gate: None,
         }
     }
 
@@ -109,6 +112,13 @@ impl ReceiverBuilder {
     /// first run.
     pub fn identity_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.identity_path = Some(path.into());
+        self
+    }
+
+    /// The host's gate over who connects and whether a stream starts.
+    /// Default: [`SingleSession`] (one stream at a time, from anyone).
+    pub fn gate(mut self, gate: Arc<dyn SessionGate>) -> Self {
+        self.gate = Some(gate);
         self
     }
 
@@ -164,6 +174,8 @@ impl ReceiverBuilder {
                 password: self.password,
             },
             identity,
+            gate: self.gate.unwrap_or_else(|| Arc::new(SingleSession::new())),
+            control: SessionControl::new(),
         })
     }
 }
@@ -174,6 +186,8 @@ impl ReceiverBuilder {
 pub struct Receiver {
     config: Config,
     identity: Identity,
+    gate: Arc<dyn SessionGate>,
+    control: SessionControl,
 }
 
 impl Receiver {
@@ -191,6 +205,12 @@ impl Receiver {
     /// The stable device identity (`pk`, `pi`).
     pub fn identity(&self) -> &Identity {
         &self.identity
+    }
+
+    /// The handle with which the host ends the running session from outside.
+    /// Clones share the same session.
+    pub fn session_control(&self) -> SessionControl {
+        self.control.clone()
     }
 
     /// The `_airplay._tcp` TXT records. The host owns mDNS registration:
@@ -215,7 +235,8 @@ impl Receiver {
     /// Serve AirPlay on the caller's runtime until a listener error.
     ///
     /// `sink_factory` is invoked at `SETUP` phase 2 with the negotiated
-    /// sample rate and channel count, once per stream; the sink is then fed
+    /// sample rate and channel count, once per stream. If it fails, the
+    /// stream is refused and nothing is announced. The sink is then fed
     /// from a dedicated playback thread (see [`AudioSink`]). Session
     /// milestones are reported on `events`; dropping the receiving half is
     /// allowed and simply discards them.
@@ -230,7 +251,10 @@ impl Receiver {
         events: EventSender,
     ) -> io::Result<()>
     where
-        F: Fn(u32, u8) -> Box<dyn AudioSink> + Send + Sync + 'static,
+        F: Fn(u32, u8) -> Result<Box<dyn AudioSink>, SinkError>
+            + Send
+            + Sync
+            + 'static,
     {
         // Dual-stack if possible (IPv4 clients arrive v4-mapped), else IPv4.
         let port = self.config.port;
@@ -260,6 +284,8 @@ impl Receiver {
             identity: self.identity,
             sink_factory,
             events,
+            gate: self.gate,
+            control: self.control,
         });
         serve(listener, context).await
     }

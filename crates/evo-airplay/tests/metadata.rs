@@ -30,7 +30,7 @@ impl AudioSink for TestSink {
 async fn start() -> (SocketAddr, UnboundedReceiver<Event>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let sink_factory: SinkFactory = Arc::new(|_, _| Box::new(TestSink));
+    let sink_factory: SinkFactory = Arc::new(|_, _| Ok(Box::new(TestSink)));
     let (events, rx) = tokio::sync::mpsc::unbounded_channel();
     let context = Arc::new(Context {
         config: Config {
@@ -46,6 +46,8 @@ async fn start() -> (SocketAddr, UnboundedReceiver<Event>) {
         identity: Identity::generate(),
         sink_factory,
         events,
+        gate: Arc::new(evo_airplay::SingleSession::new()),
+        control: evo_airplay::SessionControl::new(),
     });
     tokio::spawn(serve(listener, context));
     (addr, rx)

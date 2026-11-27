@@ -9,7 +9,7 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use plist::{Dictionary, Value};
@@ -25,11 +25,48 @@ use crate::events::{Event, EventSender};
 use crate::player::{
     frames_to_duration, Player, PlayerSender, Position, Track, TrackAnchor,
 };
+use crate::policy::{Admission, SessionGate};
 use crate::sink::{AudioSink, SinkFactory};
 
-/// Stream type constants from the SETUP `streams` array.
-const TYPE_REALTIME: u64 = 96;
+/// The one stream type this receiver plays: buffered audio, in the `type`
+/// field of the SETUP `streams` array. Realtime streams (type 96) are refused.
 const TYPE_BUFFERED: u64 = 103;
+
+/// Why a `SETUP` could not be completed, and so which answer the sender gets.
+#[derive(Debug)]
+pub enum SetupError {
+    /// The host's gate said no (for instance, a stream is already running).
+    /// Answered `453`.
+    Refused,
+    /// The receiver cannot serve the stream right now (no sink, no port).
+    /// Answered `503`.
+    Unavailable(String),
+    /// The request is malformed or asks for something this receiver does not
+    /// do. Answered `400`.
+    Invalid(String),
+}
+
+impl std::fmt::Display for SetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SetupError::Refused => f.write_str("refused by the host"),
+            SetupError::Unavailable(why) => write!(f, "unavailable: {why}"),
+            SetupError::Invalid(why) => write!(f, "invalid: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for SetupError {}
+
+impl From<io::Error> for SetupError {
+    fn from(e: io::Error) -> SetupError {
+        if e.kind() == io::ErrorKind::InvalidData {
+            SetupError::Invalid(e.to_string())
+        } else {
+            SetupError::Unavailable(e.to_string())
+        }
+    }
+}
 
 /// `SET_PARAMETER` content type carrying DMAP track metadata.
 const DMAP_CONTENT_TYPE: &str = "application/x-dmap-tagged";
@@ -50,6 +87,10 @@ pub struct Session {
     volume: f32,
     /// Creates the host's sink at SETUP phase 2.
     sink_factory: SinkFactory,
+    /// The host's say over whether a stream may start.
+    gate: Arc<dyn SessionGate>,
+    /// True from the gate's `Allow` until its `released`.
+    admitted: bool,
     /// Where session milestones are reported to the host.
     events: EventSender,
     /// True between `SessionStarted` and `SessionEnded`.
@@ -80,6 +121,7 @@ impl Session {
         local_ip: IpAddr,
         peer_ip: IpAddr,
         sink_factory: SinkFactory,
+        gate: Arc<dyn SessionGate>,
         events: EventSender,
     ) -> Session {
         Session {
@@ -91,6 +133,8 @@ impl Session {
             stream_type: None,
             volume: 0.0,
             sink_factory,
+            gate,
+            admitted: false,
             events,
             session_active: false,
             pending_metadata: None,
@@ -110,7 +154,10 @@ impl Session {
     /// Handle a `SETUP` request. Returns the response plist bytes. Phase 1
     /// (no `streams`) sets up the event/timing channels; phase 2 (`streams`
     /// array) sets up the audio data/control channels.
-    pub async fn handle_setup(&mut self, body: &[u8]) -> io::Result<Vec<u8>> {
+    pub async fn handle_setup(
+        &mut self,
+        body: &[u8],
+    ) -> Result<Vec<u8>, SetupError> {
         let request =
             Value::from_reader(io::Cursor::new(body)).map_err(|e| {
                 io::Error::new(
@@ -130,7 +177,10 @@ impl Session {
     }
 
     /// Phase 1: bind the event channel and report the event/timing ports.
-    async fn setup_timing(&mut self, dict: &Dictionary) -> io::Result<Vec<u8>> {
+    async fn setup_timing(
+        &mut self,
+        dict: &Dictionary,
+    ) -> Result<Vec<u8>, SetupError> {
         let timing = dict
             .get("timingProtocol")
             .and_then(|v| v.as_string())
@@ -158,7 +208,7 @@ impl Session {
         );
         response.insert("timingPort".into(), Value::Integer(0u64.into()));
         response.insert("timingPeerInfo".into(), Value::Dictionary(peer_info));
-        encode_plist(&response)
+        Ok(encode_plist(&response)?)
     }
 
     /// Phase 2: bind the audio data + control channels for stream 0 and report
@@ -166,7 +216,7 @@ impl Session {
     async fn setup_streams(
         &mut self,
         streams: &[Value],
-    ) -> io::Result<Vec<u8>> {
+    ) -> Result<Vec<u8>, SetupError> {
         let stream = streams
             .first()
             .and_then(|v| v.as_dictionary())
@@ -194,32 +244,33 @@ impl Session {
             self.stream_key.as_ref().map_or(0, Vec::len)
         );
 
-        let control =
-            UdpSocket::bind(SocketAddr::new(self.local_ip, 0)).await?;
-        let control_port = control.local_addr()?.port();
-        self.tasks
-            .push(tokio::spawn(audio_channel(control, "control")));
+        // Only buffered audio (type 103) is played: a TCP data channel that
+        // is decrypted, decoded and delivered to the sink. A stream this
+        // receiver cannot play is refused, never accepted and silenced.
+        if stream_type != Some(TYPE_BUFFERED) {
+            return Err(SetupError::Invalid(format!(
+                "stream type {stream_type:?} is not supported; only buffered \
+                 audio ({TYPE_BUFFERED}) is played"
+            )));
+        }
 
-        // Buffered audio (type 103) uses a TCP data channel we decrypt, decode
-        // and play. Realtime (type 96) is UDP, still just logged for now.
-        let data_port = if stream_type == Some(TYPE_BUFFERED) {
-            self.start_buffered_audio().await?
-        } else {
-            let data =
-                UdpSocket::bind(SocketAddr::new(self.local_ip, 0)).await?;
-            let port = data.local_addr()?.port();
-            self.tasks.push(tokio::spawn(audio_channel(data, "audio")));
-            port
+        // Nothing for the stream exists until the host's gate agrees, and the
+        // gate is told when a stream it admitted did not get as far as playing.
+        self.admit()?;
+        let (data_port, control_port) = match self.open_stream().await {
+            Ok(ports) => ports,
+            Err(e) => {
+                self.release();
+                return Err(e);
+            }
         };
         debug!(
             "SETUP phase 2: data port {data_port}, control port {control_port}"
         );
 
         let mut stream_response = Dictionary::new();
-        stream_response.insert(
-            "type".into(),
-            Value::Integer(stream_type.unwrap_or(TYPE_REALTIME).into()),
-        );
+        stream_response
+            .insert("type".into(), Value::Integer(TYPE_BUFFERED.into()));
         stream_response.insert(
             "dataPort".into(),
             Value::Integer(u64::from(data_port).into()),
@@ -228,87 +279,141 @@ impl Session {
             "controlPort".into(),
             Value::Integer(u64::from(control_port).into()),
         );
-        if stream_type == Some(TYPE_BUFFERED) {
-            // A buffered-audio ring the sender can push ahead into (~8 MB).
-            stream_response.insert(
-                "audioBufferSize".into(),
-                Value::Integer(8_388_608u64.into()),
-            );
-        }
+        // A buffered-audio ring the sender can push ahead into (~8 MB).
+        stream_response.insert(
+            "audioBufferSize".into(),
+            Value::Integer(8_388_608u64.into()),
+        );
 
         let mut response = Dictionary::new();
         response.insert(
             "streams".into(),
             Value::Array(vec![Value::Dictionary(stream_response)]),
         );
-        encode_plist(&response)
+        Ok(encode_plist(&response)?)
     }
 
-    /// Bind the buffered-audio TCP data channel and start the
-    /// receive → decrypt → decode → play pipeline. Returns the bound port.
-    async fn start_buffered_audio(&mut self) -> io::Result<u16> {
+    /// Ask the host's gate whether a stream may start; remember the yes so it
+    /// is released exactly once.
+    fn admit(&mut self) -> Result<(), SetupError> {
+        if self.admitted {
+            return Ok(());
+        }
+        match self.gate.admit(self.peer_ip.to_canonical()) {
+            Admission::Allow => {
+                self.admitted = true;
+                Ok(())
+            }
+            Admission::Refuse => Err(SetupError::Refused),
+        }
+    }
+
+    /// Tell the gate this session is over, once, if it was admitted.
+    fn release(&mut self) {
+        if self.admitted {
+            self.admitted = false;
+            self.gate.released(self.peer_ip.to_canonical());
+        }
+    }
+
+    /// Bind the control channel and start the buffered pipeline. Returns the
+    /// data and control ports.
+    async fn open_stream(&mut self) -> Result<(u16, u16), SetupError> {
+        let control =
+            UdpSocket::bind(SocketAddr::new(self.local_ip, 0)).await?;
+        let control_port = control.local_addr()?.port();
+        let data_port = self.start_buffered_audio().await?;
+        self.tasks
+            .push(tokio::spawn(audio_channel(control, "control")));
+        Ok((data_port, control_port))
+    }
+
+    /// Create the host's sink off the async worker; a failure refuses the
+    /// stream before anything is announced.
+    async fn acquire_sink(
+        &self,
+        rate: u32,
+        channels: u8,
+    ) -> Result<Box<dyn AudioSink>, SetupError> {
+        let factory = self.sink_factory.clone();
+        match tokio::task::spawn_blocking(move || factory(rate, channels)).await
+        {
+            Ok(Ok(sink)) => Ok(sink),
+            Ok(Err(e)) => Err(SetupError::Unavailable(format!(
+                "the audio sink could not be created: {e}"
+            ))),
+            Err(e) => Err(SetupError::Unavailable(format!(
+                "the audio sink task failed: {e}"
+            ))),
+        }
+    }
+
+    /// Whether a stream is running: between `SessionStarted` and
+    /// `SessionEnded`.
+    pub fn is_streaming(&self) -> bool {
+        self.session_active
+    }
+
+    /// Start the receive → decrypt → decode → play pipeline and bind its TCP
+    /// data channel. Returns the bound port. Everything that can fail does so
+    /// before the session is announced: the key, the decoder, the sink, the
+    /// port.
+    async fn start_buffered_audio(&mut self) -> Result<u16, SetupError> {
+        let (rate, channels) = aac_params(self.audio_format);
+        let decryptor = self
+            .stream_key
+            .as_deref()
+            .and_then(AudioDecryptor::new)
+            .ok_or_else(|| {
+                SetupError::Invalid(
+                    "buffered stream without a valid session key".into(),
+                )
+            })?;
+        let decoder = AacDecoder::new(rate, channels).map_err(|e| {
+            SetupError::Unavailable(format!("AAC decoder: {e}"))
+        })?;
+        let sink = self.acquire_sink(rate, channels).await?;
         let listener =
             TcpListener::bind(SocketAddr::new(self.local_ip, 0)).await?;
         let port = listener.local_addr()?.port();
 
-        let decryptor =
-            self.stream_key.as_deref().and_then(AudioDecryptor::new);
-        let (rate, channels) = aac_params(self.audio_format);
         // A new stream is a fresh sequence-number epoch: a boundary left over
         // from an earlier stream on this connection would silently discard
         // the new stream's audio (measured at ~47 s in one session).
         self.flush_until_seq.store(0, Ordering::Relaxed);
-        match (decryptor, AacDecoder::new(rate, channels)) {
-            (Some(decryptor), Ok(decoder)) => {
-                self.session_active = true;
-                self.send_event(Event::SessionStarted {
-                    rate,
-                    channels,
-                    peer: self.peer_ip,
-                });
-                // Replay metadata/artwork that arrived before the session
-                // started, so they land inside it.
-                let latched =
-                    [self.pending_metadata.take(), self.pending_artwork.take()];
-                for event in latched.into_iter().flatten() {
-                    self.send_event(event);
-                }
-                let sink: Box<dyn AudioSink> =
-                    (self.sink_factory)(rate, channels);
-                // A new stream is a new track timeline: drop any extent the
-                // previous one left behind, so no position is reported until
-                // the sender says where this track starts.
-                *self.track.lock().unwrap() = None;
-                let position = Position::new(
-                    rate,
-                    self.events.clone(),
-                    self.track.clone(),
-                );
-                let player = Player::spawn(sink, Some(position));
-                let sender = player.sender();
-                self.player_control = Some(player.sender());
-                self.player = Some(player);
-                let max_queued =
-                    crate::player::max_queued_samples(rate, channels);
-                self.tasks.push(tokio::spawn(buffered_audio(
-                    listener,
-                    decryptor,
-                    decoder,
-                    sender,
-                    max_queued,
-                    self.flush_until_seq.clone(),
-                )));
-                debug!("buffered audio: TCP data port {port}, {rate} Hz {channels}ch");
-            }
-            (None, _) => {
-                warn!("buffered audio: missing/invalid shk; draining without decode");
-                self.tasks.push(tokio::spawn(drain_tcp(listener)));
-            }
-            (_, Err(e)) => {
-                warn!("buffered audio: decoder init failed ({e}); draining");
-                self.tasks.push(tokio::spawn(drain_tcp(listener)));
-            }
+        self.session_active = true;
+        self.send_event(Event::SessionStarted {
+            rate,
+            channels,
+            peer: self.peer_ip,
+        });
+        // Replay metadata/artwork that arrived before the session started, so
+        // they land inside it.
+        let latched =
+            [self.pending_metadata.take(), self.pending_artwork.take()];
+        for event in latched.into_iter().flatten() {
+            self.send_event(event);
         }
+        // A new stream is a new track timeline: drop any extent the previous
+        // one left behind, so no position is reported until the sender says
+        // where this track starts.
+        *self.track.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        let position =
+            Position::new(rate, self.events.clone(), self.track.clone());
+        let player = Player::spawn(sink, Some(position));
+        let sender = player.sender();
+        self.player_control = Some(player.sender());
+        self.player = Some(player);
+        let max_queued = crate::player::max_queued_samples(rate, channels);
+        self.tasks.push(tokio::spawn(buffered_audio(
+            listener,
+            decryptor,
+            decoder,
+            sender,
+            max_queued,
+            self.flush_until_seq.clone(),
+        )));
+        debug!("buffered audio: TCP data port {port}, {rate} Hz {channels}ch");
         Ok(port)
     }
 
@@ -504,11 +609,51 @@ impl Session {
     }
 }
 
+/// What a finished session still owes: its playback thread to join and its
+/// gate to release, in that order.
+type Finish = (Option<Player>, Option<(Arc<dyn SessionGate>, IpAddr)>);
+
 impl Drop for Session {
     fn drop(&mut self) {
         self.end_session();
         for task in self.tasks.drain(..) {
             task.abort();
+        }
+        // The playback thread is joined off the async worker, and the gate is
+        // told only once the sink is closed: a next stream must never find the
+        // device still held by this one. A sink that ignores its stop signal
+        // delays the release; it cannot stall the runtime.
+        self.player_control = None;
+        let player = self.player.take();
+        let release = if self.admitted {
+            self.admitted = false;
+            Some((self.gate.clone(), self.peer_ip.to_canonical()))
+        } else {
+            None
+        };
+        if player.is_none() && release.is_none() {
+            return;
+        }
+        let work: Arc<Mutex<Option<Finish>>> =
+            Arc::new(Mutex::new(Some((player, release))));
+        let for_thread = work.clone();
+        let spawned = std::thread::Builder::new()
+            .name("airplay-session-end".into())
+            .spawn(move || finish(&for_thread));
+        if spawned.is_err() {
+            finish(&work);
+        }
+    }
+}
+
+/// Close the sink, then release the gate. Runs once: whichever of the end
+/// thread and the inline fallback gets there first takes the work.
+fn finish(work: &Mutex<Option<Finish>>) {
+    let taken = work.lock().unwrap_or_else(PoisonError::into_inner).take();
+    if let Some((player, release)) = taken {
+        drop(player);
+        if let Some((gate, peer)) = release {
+            gate.released(peer);
         }
     }
 }
@@ -691,20 +836,6 @@ fn skip_before_boundary(flush_until_seq: &AtomicU64, seq: u32) -> bool {
     false
 }
 
-/// Accept and drain a buffered-audio connection we can't decode (missing key
-/// or unsupported format), so the sender isn't left hanging.
-async fn drain_tcp(listener: TcpListener) {
-    let Ok((mut stream, _)) = listener.accept().await else {
-        return;
-    };
-    let mut buf = vec![0u8; 64 * 1024];
-    while let Ok(n) = stream.read(&mut buf).await {
-        if n == 0 {
-            break;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,8 +861,9 @@ mod tests {
     /// A session wired to a discarding sink, plus the host's event receiver.
     fn session() -> (Session, UnboundedReceiver<Event>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let factory: SinkFactory = Arc::new(|_, _| Box::new(TestSink));
-        (Session::new(local(), peer(), factory, tx), rx)
+        let factory: SinkFactory = Arc::new(|_, _| Ok(Box::new(TestSink)));
+        let gate = Arc::new(crate::policy::SingleSession::new());
+        (Session::new(local(), peer(), factory, gate, tx), rx)
     }
 
     #[tokio::test]

@@ -122,6 +122,8 @@ pub struct Player {
     tx: Option<Sender<Command>>,
     handle: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
+    /// Raised at drop so a sink blocked in `write` returns before the join.
+    sink_stop: Option<Arc<AtomicBool>>,
     pending: Arc<AtomicUsize>,
     flush_request: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
@@ -136,6 +138,7 @@ impl Player {
         sink: Box<dyn AudioSink>,
         position: Option<Position>,
     ) -> Player {
+        let sink_stop = sink.stop_signal();
         let (tx, rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let pending = Arc::new(AtomicUsize::new(0));
@@ -155,6 +158,7 @@ impl Player {
             tx: Some(tx),
             handle: Some(handle),
             stop,
+            sink_stop,
             pending,
             flush_request,
             paused,
@@ -174,6 +178,9 @@ impl Player {
 impl Drop for Player {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        if let Some(signal) = &self.sink_stop {
+            signal.store(true, Ordering::Release);
+        }
         if let Some(tx) = &self.tx {
             let _ = tx.send(Command::Stop);
         }

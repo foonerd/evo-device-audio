@@ -8,6 +8,8 @@
 //! `i16` samples that should actually play — audio is withheld while paused
 //! and pre-seek audio is dropped before it ever reaches the sink.
 
+use std::fmt;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 /// Where decoded audio goes. Implemented by the host (the receiver binary's
@@ -22,8 +24,40 @@ pub trait AudioSink: Send + 'static {
     /// buffered of its own (hardware buffers, prebuffer cushions). The
     /// library has already dropped its queued PCM when this is called.
     fn flush(&mut self);
+
+    /// A flag the library sets when the session is over and the playback
+    /// thread is about to be joined. A sink whose [`write`](Self::write) can
+    /// block for as long as its device stays idle (a capture that nobody is
+    /// reading, for example) returns the flag it polls between bounded waits,
+    /// so the join always completes. A sink that always returns promptly
+    /// leaves the default, `None`.
+    fn stop_signal(&self) -> Option<Arc<AtomicBool>> {
+        None
+    }
 }
 
+/// Why a sink could not be created. The session is refused with the reason
+/// in the log; the sender is told the service is unavailable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkError(String);
+
+impl SinkError {
+    /// A sink failure with a human-readable reason.
+    pub fn new(reason: impl Into<String>) -> SinkError {
+        SinkError(reason.into())
+    }
+}
+
+impl fmt::Display for SinkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SinkError {}
+
 /// Creates the sink for a stream, invoked at `SETUP` phase 2 with the
-/// negotiated sample rate and channel count — once per stream.
-pub type SinkFactory = Arc<dyn Fn(u32, u8) -> Box<dyn AudioSink> + Send + Sync>;
+/// negotiated sample rate and channel count — once per stream. An error
+/// refuses the session: the library never accepts a stream it cannot play.
+pub type SinkFactory =
+    Arc<dyn Fn(u32, u8) -> Result<Box<dyn AudioSink>, SinkError> + Send + Sync>;

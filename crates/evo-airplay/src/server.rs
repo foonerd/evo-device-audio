@@ -37,7 +37,8 @@ use crate::http::{Request, Response};
 use crate::identity::Identity;
 use crate::info::info_plist;
 use crate::pairing::{Outcome, PairSetup};
-use crate::session::Session;
+use crate::policy::{SessionControl, SessionGate, SingleSession};
+use crate::session::{Session, SetupError};
 use crate::sink::SinkFactory;
 use crate::Config;
 
@@ -53,6 +54,30 @@ pub struct Context {
     pub sink_factory: SinkFactory,
     /// Where sessions report their milestones to the host.
     pub events: EventSender,
+    /// The host's say over who connects and whether a stream starts.
+    pub gate: Arc<dyn SessionGate>,
+    /// The host's handle for ending the running session from outside.
+    pub control: SessionControl,
+}
+
+impl Context {
+    /// A context with the default gate (one stream at a time, from anyone)
+    /// and a fresh control handle.
+    pub fn new(
+        config: Config,
+        identity: Identity,
+        sink_factory: SinkFactory,
+        events: EventSender,
+    ) -> Context {
+        Context {
+            config,
+            identity,
+            sink_factory,
+            events,
+            gate: Arc::new(SingleSession::new()),
+            control: SessionControl::new(),
+        }
+    }
 }
 
 pub async fn serve(
@@ -62,6 +87,13 @@ pub async fn serve(
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (stream, peer) = listener.accept().await?;
+        // The host may not want to talk to this peer at all: no reply, no
+        // task, no permit.
+        if !context.gate.accept_peer(peer.ip().to_canonical()) {
+            debug!("[{peer}] dropped by the host's gate");
+            drop(stream);
+            continue;
+        }
         // Bound concurrency: over the ceiling, accept and immediately drop
         // rather than queueing (a queued attacker connection is a held socket
         // too). The permit is released when the task ends.
@@ -74,9 +106,12 @@ pub async fn serve(
         tokio::spawn(async move {
             let _permit = permit;
             debug!("[{peer}] connected");
-            if let Err(e) = handle_connection(stream, peer, context).await {
+            if let Err(e) =
+                handle_connection(stream, peer, context.clone()).await
+            {
                 warn!("[{peer}] connection error: {e}");
             }
+            context.control.forget_closed();
             debug!("[{peer}] disconnected");
         });
     }
@@ -96,26 +131,46 @@ async fn handle_connection(
         local_ip,
         peer.ip(),
         context.sink_factory.clone(),
+        context.gate.clone(),
         context.events.clone(),
     );
+    // Set once a stream is running; fires when the host ends the session.
+    let mut host_end: Option<tokio::sync::oneshot::Receiver<()>> = None;
 
     loop {
         // While still in the clear (discovery + pairing), bound how long a
         // request may take to arrive: an unpaired peer that stops sending is a
         // resource leak, not a paused session. Once encrypted, a session may
         // idle indefinitely between requests, so the timeout is lifted.
-        let next = if conn.is_encrypted() {
-            conn.read_request().await?
-        } else {
-            match tokio::time::timeout(HANDSHAKE_TIMEOUT, conn.read_request())
+        let read = async {
+            if conn.is_encrypted() {
+                conn.read_request().await.map(Some)
+            } else {
+                match tokio::time::timeout(
+                    HANDSHAKE_TIMEOUT,
+                    conn.read_request(),
+                )
                 .await
-            {
-                Ok(result) => result?,
-                Err(_) => {
-                    debug!("[{peer}] handshake timed out");
-                    return Ok(());
+                {
+                    Ok(result) => result.map(Some),
+                    Err(_) => {
+                        debug!("[{peer}] handshake timed out");
+                        Ok(None)
+                    }
                 }
             }
+        };
+        let next = tokio::select! {
+            biased;
+            () = host_ended(&mut host_end) => {
+                debug!("[{peer}] session ended by the host");
+                session.teardown();
+                break;
+            }
+            result = read => match result? {
+                Some(next) => next,
+                None => return Ok(()),
+            },
         };
         let Some(request) = next else {
             break;
@@ -163,11 +218,26 @@ async fn handle_connection(
             Some(response) => response,
             None => dispatch(&request, &context),
         };
+        if host_end.is_none() && session.is_streaming() {
+            host_end = Some(context.control.register());
+        }
         let response = finalize(response, &request);
         debug!("[{peer}] -> {} {}", request.method, response.status());
         conn.write_response(&response).await?;
     }
     Ok(())
+}
+
+/// Resolves when the host asks for the running session to end; never, while
+/// no stream is running or once the registration was replaced or withdrawn.
+async fn host_ended(slot: &mut Option<tokio::sync::oneshot::Receiver<()>>) {
+    if let Some(rx) = slot.as_mut() {
+        if rx.await.is_ok() {
+            return;
+        }
+        *slot = None;
+    }
+    std::future::pending::<()>().await
 }
 
 fn log_request(peer: &SocketAddr, request: &Request, encrypted: bool) {
@@ -201,8 +271,16 @@ async fn dispatch_session(
     match request.method.as_str() {
         "SETUP" => Some(match session.handle_setup(&request.body).await {
             Ok(body) => Response::ok(proto).body(INFO_CONTENT_TYPE, body),
-            Err(e) => {
-                warn!("SETUP failed: {e}");
+            Err(SetupError::Refused) => {
+                debug!("SETUP refused by the host's gate");
+                Response::new(proto, 453, "Not Enough Bandwidth")
+            }
+            Err(SetupError::Unavailable(why)) => {
+                warn!("SETUP unavailable: {why}");
+                Response::new(proto, 503, "Service Unavailable")
+            }
+            Err(SetupError::Invalid(why)) => {
+                warn!("SETUP refused: {why}");
                 Response::new(proto, 400, "Bad Request")
             }
         }),

@@ -1,19 +1,26 @@
 // Copyright (c) 2026 Stefan Arentz; modifications (c) 2026 Just a Nerd
 // SPDX-License-Identifier: Apache-2.0 AND MIT
-//! An embeddable AirPlay 2 audio **receiver**: a real Mac/iPhone discovers
-//! it, pairs with it, and streams to it; the host application gets decoded
-//! PCM and session events. The library owns network → PCM (discovery
-//! advertisement, transient pairing, the encrypted control channel, the
-//! buffered-audio channel, decrypt, AAC decode, and the pause/seek/
-//! backpressure semantics); the host owns PCM → speaker via an [`AudioSink`].
+//! An embeddable AirPlay 2 audio **receiver**: a real Mac/iPhone pairs with
+//! it and streams to it; the host application gets decoded PCM and session
+//! events. The library owns network → PCM (transient pairing, the encrypted
+//! control channel, the buffered-audio channel, decrypt, AAC decode, and the
+//! pause/seek/backpressure semantics); the host owns PCM → speaker via an
+//! [`AudioSink`], mDNS registration (see [`Receiver::txt_records`] and
+//! [`Receiver::raop_txt_records`]) and the policy over who may stream (see
+//! [`SessionGate`] and [`SessionControl`]).
 //!
-//! Deliberate scope: one sender → one stream → one output. No PTP — for a
-//! single output, the sender's buffering plus this library's backpressure
-//! suffice (blocking [`AudioSink::write`] paces playback). No AirPlay wire
-//! concepts (plists, `shk`, sequence numbers) appear in this API.
+//! Scope: AirPlay 2 **buffered** audio only (AAC-LC, 44.1 kHz stereo); a
+//! realtime or AirPlay 1 stream is refused. One sender → one stream → one
+//! output; the default gate refuses a second sender while one is streaming.
+//! No PTP — for a single output, the sender's buffering plus this library's
+//! backpressure suffice (blocking [`AudioSink::write`] paces playback). No
+//! AirPlay wire concepts (plists, `shk`, sequence numbers) appear in this API.
+//!
+//! A stream is never accepted that cannot be played: if the sink cannot be
+//! created, the sender is refused and nothing is announced.
 //!
 //! ```no_run
-//! use evo_airplay::{AudioSink, Event, Receiver};
+//! use evo_airplay::{AudioSink, Event, Receiver, SinkError};
 //!
 //! struct MySink;
 //!
@@ -28,13 +35,23 @@
 //!         .name("Office")
 //!         .identity_path("/var/lib/myapp/airplay-identity")
 //!         .build()?;
+//!     // Register `receiver.txt_records()` / `raop_txt_records()` with mDNS.
+//!     let control = receiver.session_control(); // control.end_session()
+//!     let _ = control;
 //!     let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
 //!     tokio::spawn(async move {
 //!         while let Some(event) = rx.recv().await {
 //!             if let Event::Volume { db } = event { /* your gain path */ }
 //!         }
 //!     });
-//!     receiver.run(|_rate, _channels| Box::new(MySink), events).await
+//!     receiver
+//!         .run(
+//!             |_rate, _channels| -> Result<Box<dyn AudioSink>, SinkError> {
+//!                 Ok(Box::new(MySink))
+//!             },
+//!             events,
+//!         )
+//!         .await
 //! }
 //! ```
 
@@ -53,6 +70,7 @@ mod info;
 mod mac;
 mod pairing;
 mod player;
+mod policy;
 mod receiver;
 mod session;
 mod sink;
@@ -63,6 +81,8 @@ mod sink;
 #[doc(hidden)]
 pub mod cipher;
 #[doc(hidden)]
+pub mod sender;
+#[doc(hidden)]
 pub mod server;
 #[doc(hidden)]
 pub mod srp;
@@ -72,8 +92,9 @@ pub mod tlv;
 pub use events::{Event, EventSender};
 pub use identity::Identity;
 pub use info::txt_records;
+pub use policy::{Admission, SessionControl, SessionGate, SingleSession};
 pub use receiver::{Receiver, ReceiverBuilder};
-pub use sink::{AudioSink, SinkFactory};
+pub use sink::{AudioSink, SinkError, SinkFactory};
 
 /// Receiver-wide configuration, resolved by [`ReceiverBuilder::build`].
 #[derive(Debug, Clone)]
