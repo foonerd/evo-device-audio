@@ -28,8 +28,23 @@ released under the repository's Apache-2.0 licence.
 - Logging uses `tracing`, as the rest of the repository does.
 - Public names, the default receiver name and the advertised model string are
   this project's.
-
-Further changes are listed here as they land.
+- The library registers nothing with the system's mDNS daemon: the host does,
+  using the records the library supplies for both `_airplay._tcp` and
+  `_raop._tcp`. The D-Bus client dependency is removed.
+- The host decides who may stream: it can drop a peer at accept, refuse a
+  stream before anything for it exists, and end the running session. By
+  default one stream at a time is admitted.
+- A stream is never accepted that cannot be played: an audio sink that cannot
+  be created, or a stream type other than buffered audio, is refused.
+- A sink blocked on its device can be stopped, and ending a session never
+  blocks the async runtime.
+- Pairing attempts are limited per peer; the pairing verifier checks the shape
+  of an attempt before doing any arithmetic.
+- Request reading, metadata and volume are bounded; request bodies are not
+  logged; a malformed AAC frame is an error and not a panic.
+- The Apple-derived tables are in their own source file.
+- A synthetic sender, used by the tests and the `airplay_sender` example, is
+  part of the crate.
 
 ## Interoperability data derived from Apple's AirPlay
 

@@ -107,6 +107,29 @@ fn random_exponent() -> BigUint {
     BigUint::from_bytes_be(&bytes)
 }
 
+/// A client's proof of the password, checked for shape before any arithmetic:
+/// `A` is an element of the group, so it is no longer than the group's
+/// modulus, and `M1` is a SHA-512 digest. Anything else is not an attempt, and
+/// a huge `A` would cost the sender nothing and us a great deal.
+struct Attempt {
+    a: BigUint,
+    m1: [u8; 64],
+}
+
+impl Attempt {
+    /// `width` is the modulus length in bytes.
+    fn parse(width: usize, a_bytes: &[u8], m1: &[u8]) -> Option<Attempt> {
+        if a_bytes.len() > width {
+            return None;
+        }
+        let m1: [u8; 64] = m1.try_into().ok()?;
+        Some(Attempt {
+            a: BigUint::from_bytes_be(a_bytes),
+            m1,
+        })
+    }
+}
+
 /// SRP-6a server (verifier) side, driving `pair-setup` for a receiver.
 pub struct SrpServer {
     n: BigUint,
@@ -154,14 +177,9 @@ impl SrpServer {
     /// Verify the client's proof `M1` over its public key `A`. On success,
     /// stores the session key and returns the server proof `HAMK`.
     pub fn verify(&mut self, a_bytes: &[u8], m1: &[u8]) -> Option<[u8; 64]> {
-        // `A` is an element of the group and `M1` a SHA-512 digest: anything
-        // longer is not an attempt, and a huge `A` would make the modular
-        // arithmetic below cost the sender nothing and us a great deal.
+        // Nothing below runs on a value that is not shaped like an attempt.
         let width = usize::try_from(self.n.bits().div_ceil(8)).ok()?;
-        if a_bytes.len() > width || m1.len() != 64 {
-            return None;
-        }
-        let a = BigUint::from_bytes_be(a_bytes);
+        let Attempt { a, m1 } = Attempt::parse(width, a_bytes, m1)?;
         if &a % &self.n == BigUint::from(0u32) {
             return None; // SRP-6a safety check
         }
@@ -179,11 +197,11 @@ impl SrpServer {
             &self.big_b,
             &k_session,
         );
-        if !constant_time_eq(&expected, m1) {
+        if !constant_time_eq(&expected, &m1) {
             return None;
         }
         self.session_key = Some(k_session);
-        Some(compute_hamk(&a, m1, &k_session))
+        Some(compute_hamk(&a, &m1, &k_session))
     }
 
     /// The 64-byte SRP session key `K`, available after a successful `verify`.
@@ -303,11 +321,16 @@ mod tests {
 
     #[test]
     fn an_oversized_client_key_and_a_wrong_length_proof_are_not_attempts() {
+        let width = 384;
+        assert!(
+            Attempt::parse(width, &vec![0x7f; width + 1], &[0; 64]).is_none()
+        );
+        assert!(Attempt::parse(width, &vec![0x7f; 100_000], &[0; 64]).is_none());
+        assert!(Attempt::parse(width, &[1; 10], &[0; 63]).is_none());
+        assert!(Attempt::parse(width, &[1; 10], &[0; 65]).is_none());
+        assert!(Attempt::parse(width, &vec![0x7f; width], &[0; 64]).is_some());
+        // Through the verifier: refused, not computed on.
         let mut server = SrpServer::new("3939");
-        let huge = vec![0x7fu8; 100_000];
-        assert!(server.verify(&huge, &[0u8; 64]).is_none());
-        let client = SrpClient::new("3939");
-        assert!(server.verify(&client.public_a(), &[0u8; 63]).is_none());
-        assert!(server.verify(&client.public_a(), &[0u8; 65]).is_none());
+        assert!(server.verify(&vec![0x7f; 100_000], &[0; 64]).is_none());
     }
 }
