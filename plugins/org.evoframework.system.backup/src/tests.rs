@@ -17,6 +17,8 @@ use super::*;
 struct Owners {
     /// The `hw:N,M` outputs this device has.
     hardware: Vec<String>,
+    /// The mixer controls each card has, by card index.
+    mixers: Vec<(u32, Vec<String>)>,
     logical_outputs: Vec<Value>,
     zones: Vec<Value>,
     next_logical: u32,
@@ -48,6 +50,10 @@ impl Owners {
     fn empty() -> Self {
         Self {
             hardware: vec!["hw:0,0".into(), "hw:1,0".into()],
+            mixers: vec![
+                (0, vec!["Master".into()]),
+                (1, vec!["PCM".into(), "Digital".into()]),
+            ],
             logical_outputs: Vec::new(),
             zones: Vec::new(),
             next_logical: 1,
@@ -283,6 +289,22 @@ impl Stub {
                     "v": 1, "name": name, "format": p["format"],
                     "filename": format!("{name}.m3u"), "entries": 1, "content": text,
                 }))
+            }
+            "delivery.list_mixers" => {
+                // As the delivery plugin: the card by index, short id or
+                // name; a card it does not have answers no controls.
+                let card = s("card");
+                let controls: Vec<String> = o
+                    .mixers
+                    .iter()
+                    .find(|(idx, _)| {
+                        card == idx.to_string()
+                            || card == format!("card{idx}")
+                            || card == format!("Card{idx}")
+                    })
+                    .map(|(_, c)| c.clone())
+                    .unwrap_or_default();
+                Ok(json!({ "v": 1, "card": card, "controls": controls }))
             }
             "delivery.list_outputs" => {
                 let rows: Vec<Value> = o
@@ -1200,6 +1222,201 @@ async fn an_unreadable_output_list_leaves_output_device_alone() {
         .expect("reported");
     assert!(row["reason"].as_str().unwrap().contains("could not check"));
     assert_eq!(stub.owners().record["output_device"], "");
+}
+
+// ----- the mixer -----
+
+/// The three mixer fields, as the settings record carries them.
+fn with_mixer(base: &Value, kind: &str, device: &str, control: &str) -> Value {
+    let mut b = base.clone();
+    b["settings"]["record"]["mixer_type"] = json!(kind);
+    b["settings"]["record"]["mixer_device"] = json!(device);
+    b["settings"]["record"]["mixer_control"] = json!(control);
+    b
+}
+
+fn mixer_setters(stub: &Stub) -> Vec<String> {
+    stub.verbs()
+        .into_iter()
+        .filter(|v| v.starts_with("options.set_mixer_"))
+        .collect()
+}
+
+/// A mixer the device has goes back whole, in its order.
+#[tokio::test]
+async fn a_mixer_the_device_has_goes_back_whole() {
+    let (base, _) = export_from(Owners::set_up()).await;
+    for (device, control) in [
+        ("hw:1", "PCM"),
+        ("hw:1", "Digital"),
+        ("hw:CARD=card1", "PCM"),
+        ("hw:1,0", "PCM"),
+        ("card1", "PCM"),
+    ] {
+        let stub = Stub::new(Owners::empty());
+        let refused =
+            import_into(&stub, with_mixer(&base, "hardware", device, control))
+                .await
+                .unwrap();
+        assert!(refused.is_empty(), "{device} {control}: {refused:?}");
+        assert_eq!(mixer_setters(&stub).len(), 3, "{device} {control}");
+        let rec = stub.owners().record;
+        assert_eq!(rec["mixer_type"], "hardware");
+        assert_eq!(rec["mixer_device"], json!(device));
+        assert_eq!(rec["mixer_control"], json!(control));
+    }
+}
+
+/// A mixer the device lacks is refused as one item that names it, none
+/// of the three goes back, and the device keeps its own mixer.
+#[tokio::test]
+async fn a_mixer_the_device_lacks_is_refused_whole_and_its_own_stays() {
+    let (base, _) = export_from(Owners::set_up()).await;
+    for (kind, device, control) in [
+        ("hardware", "hw:3", "Digital"),
+        ("hardware", "hw:1", "Nope"),
+        ("hardware", "hw:CARD=Gone", "PCM"),
+        ("hardware", "hw:0", "PCM"),
+        ("software", "hw:3", "Digital"),
+    ] {
+        let stub = Stub::new(Owners::empty());
+        let refused =
+            import_into(&stub, with_mixer(&base, kind, device, control))
+                .await
+                .unwrap();
+        let rows: Vec<&Value> =
+            refused.iter().filter(|r| r["item"] == "mixer").collect();
+        assert_eq!(rows.len(), 1, "{kind} {device} {control}: {refused:?}");
+        assert_eq!(rows[0]["domain"], "settings");
+        let reason = rows[0]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains(device) && reason.contains(control),
+            "the reason names the mixer: {reason}"
+        );
+        assert!(
+            !refused.iter().any(|r| {
+                ["mixer_type", "mixer_device", "mixer_control"]
+                    .contains(&r["item"].as_str().unwrap())
+            }),
+            "the three are not reported one by one: {refused:?}"
+        );
+        assert!(
+            mixer_setters(&stub).is_empty(),
+            "{kind} {device} {control}: none of the three is sent"
+        );
+        let rec = stub.owners().record;
+        assert_eq!(rec["mixer_type"], "software", "its own stays");
+        assert_eq!(rec["mixer_device"], "");
+        assert_eq!(rec["mixer_control"], "");
+    }
+}
+
+/// A software mixer that names nothing needs nothing from the device.
+#[tokio::test]
+async fn a_software_mixer_naming_nothing_always_goes_back() {
+    let (base, _) = export_from(Owners::set_up()).await;
+    let mut holding = Owners::empty();
+    holding.record["mixer_type"] = json!("hardware");
+    holding.record["mixer_device"] = json!("hw:0");
+    holding.record["mixer_control"] = json!("Master");
+    holding.mixers = Vec::new(); // the device can list nothing
+    let stub = Stub::new(holding);
+    let refused = import_into(&stub, with_mixer(&base, "software", "", ""))
+        .await
+        .unwrap();
+    assert!(refused.is_empty(), "{refused:?}");
+    assert_eq!(mixer_setters(&stub).len(), 3);
+    assert!(
+        !stub.verbs().iter().any(|v| v == "delivery.list_mixers"),
+        "nothing to check, nothing asked"
+    );
+    assert_eq!(stub.owners().record["mixer_type"], "software");
+}
+
+/// Hardware with no device or no control is not a mixer any device has.
+#[tokio::test]
+async fn a_hardware_mixer_without_a_device_or_control_is_refused() {
+    let (base, _) = export_from(Owners::set_up()).await;
+    for (device, control) in [("", "PCM"), ("hw:1", ""), ("", "")] {
+        let stub = Stub::new(Owners::empty());
+        let refused =
+            import_into(&stub, with_mixer(&base, "hardware", device, control))
+                .await
+                .unwrap();
+        let row = refused
+            .iter()
+            .find(|r| r["item"] == "mixer")
+            .unwrap_or_else(|| panic!("{device:?} {control:?}: {refused:?}"));
+        assert!(
+            row["reason"]
+                .as_str()
+                .unwrap()
+                .contains("no complete device"),
+            "{row:?}"
+        );
+        assert!(
+            !stub.verbs().iter().any(|v| v == "delivery.list_mixers"),
+            "an incomplete mixer is refused without asking the device"
+        );
+        assert!(mixer_setters(&stub).is_empty());
+        assert_eq!(stub.owners().record["mixer_type"], "software");
+    }
+}
+
+/// A device that cannot list its mixers does not guess: the mixer is
+/// left alone and the reason says why.
+#[tokio::test]
+async fn an_unreadable_mixer_list_leaves_the_mixer_alone() {
+    let stub = Arc::new(Stub {
+        owners: Mutex::new(Owners::empty()),
+        calls: Mutex::new(Vec::new()),
+        broken: Some("delivery.list_mixers"),
+    });
+    let (backup, _) = export_from(Owners::set_up()).await;
+    let refused = import_into(&stub, backup).await.unwrap();
+    let row = refused
+        .iter()
+        .find(|r| r["item"] == "mixer")
+        .expect("reported");
+    assert!(row["reason"].as_str().unwrap().contains("could not check"));
+    assert!(mixer_setters(&stub).is_empty());
+    assert_eq!(stub.owners().record["mixer_type"], "software");
+}
+
+/// The card is read once, by the token the descriptor names, before any
+/// of the three is sent; the rest of the record is not held back.
+#[tokio::test]
+async fn the_mixer_is_checked_once_before_it_is_sent_and_the_rest_goes_back() {
+    let (base, _) = export_from(Owners::set_up()).await;
+    let stub = Stub::new(Owners::empty());
+    let refused =
+        import_into(&stub, with_mixer(&base, "hardware", "hw:1", "PCM"))
+            .await
+            .unwrap();
+    assert!(refused.is_empty(), "{refused:?}");
+    let calls = stub.calls();
+    let asked: Vec<&Value> = calls
+        .iter()
+        .filter(|(_, v, _)| v == "delivery.list_mixers")
+        .map(|(_, _, p)| p)
+        .collect();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0]["card"], "1");
+    let verbs = stub.verbs();
+    let at = |v: &str| verbs.iter().position(|x| x == v).unwrap();
+    assert!(at("delivery.list_mixers") < at("options.set_mixer_device"));
+
+    let stub = Stub::new(Owners::empty());
+    let refused =
+        import_into(&stub, with_mixer(&base, "hardware", "hw:3", "Digital"))
+            .await
+            .unwrap();
+    assert_eq!(refused.iter().filter(|r| r["item"] == "mixer").count(), 1);
+    assert_eq!(
+        stub.owners().record["crossfade_seconds"],
+        json!(4),
+        "the rest of the record went back"
+    );
 }
 
 // ----- the language and the timezone -----

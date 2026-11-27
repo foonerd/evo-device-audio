@@ -4,6 +4,12 @@ All notable changes to evo-device-audio are recorded here.
 
 ## Unreleased
 
+- Backup restore: the mixer (`mixer_type`, `mixer_device`, `mixer_control`)
+  goes back whole or not at all. A hardware mixer is put back only if the
+  device has that control on that card (read through `delivery.list_mixers`);
+  otherwise the device keeps its own mixer and the restore reports one
+  item, `mixer`, naming it. A backup taken on one device no longer points
+  another device's volume control at a mixer it does not have.
 - Ship list: the DLNA renderer and the AirPlay receiver
   (`org.evoframework.receiver.dlna`, `org.evoframework.receiver.airplay`)
   are on `dist/scripts/lib/oop-plugins.sh`, the one list the installer

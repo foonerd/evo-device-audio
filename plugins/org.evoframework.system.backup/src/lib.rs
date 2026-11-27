@@ -51,6 +51,14 @@
 //!     the default, always goes back. An output the device lacks,
 //!     or a list it cannot read, is reported and the device's own
 //!     `output_device` stays.
+//!   - The mixer (`mixer_type`, `mixer_device`, `mixer_control`) goes
+//!     back whole or not at all. A hardware mixer is put back only if
+//!     the device has that control on that card, read once through
+//!     `delivery.list_mixers` before any of the three is sent; one
+//!     the device lacks, or cannot be checked, or a hardware mixer that
+//!     names no device or control, is reported as the single item
+//!     `mixer`, with a reason that names it, and the device's own mixer
+//!     stays. A software mixer that names nothing always goes back.
 //!   - The language and the timezone go back after the settings and
 //!     before the playlists and the alarm, so an alarm set after them
 //!     is scheduled on the zone in force. A value the device already
@@ -643,10 +651,23 @@ async fn import(
 
     // Settings: the record through its setters, then the presets.
     let record = &backup.settings.record;
+    // The mixer goes back whole or not at all: checked once, before any of
+    // its three setters, and reported once.
+    let mixer_refusal = check_mixer(d, record).await.err();
+    let mut mixer_reported = false;
     for (name, verb, key) in SETTERS {
         let Some(value) = record.get(*name) else {
             continue;
         };
+        if MIXER_FIELDS.contains(name) {
+            if let Some(reason) = &mixer_refusal {
+                if !mixer_reported {
+                    mixer_reported = true;
+                    put("settings", "mixer".to_string(), Err(reason.clone()));
+                }
+                continue;
+            }
+        }
         if *name == "output_device" {
             // The setter takes any name. A device this one lacks would
             // be stored, so it is checked here first.
@@ -999,6 +1020,69 @@ async fn check_output_device(
     } else {
         Err(format!(
             "this device has no output {name:?}; its own output_device stays"
+        ))
+    }
+}
+
+/// The three record fields that make up the mixer. They go back together
+/// or not at all.
+const MIXER_FIELDS: [&str; 3] = ["mixer_type", "mixer_device", "mixer_control"];
+
+/// Whether the mixer in the record may go back: a software mixer that
+/// names no device and no control always may; a hardware mixer (or any
+/// that names a device or control) only if the device has that control on
+/// that card. The reason names the mixer when it may not, and the device's
+/// own mixer stays.
+async fn check_mixer(
+    d: &dyn ShelfRequestDispatcher,
+    record: &serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    let text = |k: &str| record.get(k).and_then(Value::as_str);
+    if MIXER_FIELDS.iter().all(|k| record.get(*k).is_none()) {
+        return Ok(());
+    }
+    let (kind, device, control) = (
+        text("mixer_type").unwrap_or(""),
+        text("mixer_device").unwrap_or(""),
+        text("mixer_control").unwrap_or(""),
+    );
+    if device.is_empty() && control.is_empty() && kind != "hardware" {
+        return Ok(());
+    }
+    if device.is_empty() || control.is_empty() {
+        return Err(format!(
+            "the backup's {kind:?} mixer names no complete device and \
+             control ({device:?}, {control:?}); its own mixer stays"
+        ));
+    }
+    let listed = call(
+        d,
+        DELIVERY,
+        "delivery.list_mixers",
+        json!({ "v": PAYLOAD_VERSION, "card": card_token(device) }),
+    )
+    .await
+    .map_err(|e| {
+        format!(
+            "could not check the mixer {control:?} on {device:?} against \
+             the device's mixers: {e}"
+        )
+    })?;
+    let controls = listed
+        .get("controls")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            format!(
+                "could not check the mixer {control:?} on {device:?}: \
+                 delivery.list_mixers answered no controls"
+            )
+        })?;
+    if controls.iter().any(|c| c.as_str() == Some(control)) {
+        Ok(())
+    } else {
+        Err(format!(
+            "this device has no mixer control {control:?} on {device:?}; its \
+             own mixer stays"
         ))
     }
 }
