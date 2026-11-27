@@ -47,7 +47,8 @@ pub(crate) mod test_mock;
 // the re-exported `publish_now_playing_from_mpd` and so has to be
 // nameable by its callers.
 pub(crate) use actor::{
-    spawn, SupervisorCommandSender, SupervisorHandle, SupervisorSpawn,
+    spawn, CaptureWatch, SupervisorCommandSender, SupervisorHandle,
+    SupervisorSpawn,
 };
 pub(crate) use ambient_observer::{
     spawn as spawn_ambient_observer, AmbientInputs, AmbientObserverHandle,

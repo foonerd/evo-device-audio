@@ -458,6 +458,8 @@ pub struct MpdPlaybackPlugin {
     /// How the plugin learns whether anything is writing to a
     /// capture's device. The system's `/proc/asound`; tests swap it.
     capture_probe: Arc<dyn capture::WriterProbe>,
+    /// How often a queued capture is checked for a writer.
+    capture_watch_every: Duration,
     /// Cumulative count of custodies accepted since construction.
     /// Does not decrement on release.
     custodies_taken: u64,
@@ -755,6 +757,7 @@ impl MpdPlaybackPlugin {
             audio_routing: None,
             custodies: HashMap::new(),
             capture_probe: Arc::new(capture::ProcWriterProbe::system()),
+            capture_watch_every: Duration::from_secs(2),
             custodies_taken: 0,
             active_command_sender: Arc::new(tokio::sync::Mutex::new(None)),
             envelope_subscriber: None,
@@ -2973,6 +2976,10 @@ impl Warden for MpdPlaybackPlugin {
                         ),
                     mute: self.mute.clone(),
                     shuffle: self.shuffle.clone(),
+                    capture_watch: Some(playback_supervisor::CaptureWatch {
+                        probe: self.capture_probe.clone(),
+                        every: self.capture_watch_every,
+                    }),
                 },
             )
             .await
@@ -5370,11 +5377,13 @@ mod tests {
     #[tokio::test]
     async fn course_correct_maps_ack_to_permanent() {
         // Command-conn sequence (with audio-protocol-settings apply
-        // at session-init): 1 = crossfade, 2 = single, 3 = status,
-        // 4 = currentsong, 5 = play -> ACK.
+        // at session-init): 1 = crossfade, 2 = single, 3 = replay gain,
+        // 4 = status, 5 = currentsong, 6 = the start-up capture sweep's
+        // playlistfind, 7 = its second (presence) playlistfind, 8 = play
+        // -> ACK.
         let (mut p, _mock) = loaded_plugin_with_mock(vec![
             ConnBehaviour::AckOnNth {
-                nth: 6,
+                nth: 8,
                 code: 2,
                 message: "Bad song index".to_string(),
             },
@@ -7103,6 +7112,7 @@ mod tests {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
                 shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                capture_watch: None,
             },
         )
         .await
@@ -7229,7 +7239,11 @@ mod tests {
 
     impl CaptureRig {
         async fn new(writer_present: bool) -> Self {
-            let model = FakeMpd::new(&MUSIC);
+            Self::with_queue(&MUSIC, writer_present).await
+        }
+
+        async fn with_queue(queue: &[&str], writer_present: bool) -> Self {
+            let model = FakeMpd::new(queue);
             let (mut plugin, mock) = loaded_plugin_with_mock(vec![
                 F4Conn::Model(model.clone()),
                 F4Conn::Model(model.clone()),
@@ -7238,6 +7252,7 @@ mod tests {
             let writer =
                 Arc::new(std::sync::atomic::AtomicBool::new(writer_present));
             plugin.capture_probe = Arc::new(SwitchProbe(writer.clone()));
+            plugin.capture_watch_every = std::time::Duration::from_millis(30);
             let reporter: Arc<dyn CustodyStateReporter> =
                 Arc::new(CapturingReporter::default());
             let handle =
@@ -7562,6 +7577,60 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PluginError::Transient(_)), "{err:?}");
+        rig.release().await;
+    }
+
+    #[tokio::test]
+    async fn a_capture_left_in_the_queue_by_a_receiver_that_went_away_is_taken_out_at_start(
+    ) {
+        let mut queue: Vec<&str> = MUSIC.to_vec();
+        queue.push(crate::capture::AIRPLAY.uri);
+        let rig = CaptureRig::with_queue(&queue, false).await;
+        rig.until("the stale capture is gone", |m| {
+            m.uris() == CaptureRig::music()
+        })
+        .await;
+        rig.release().await;
+    }
+
+    #[tokio::test]
+    async fn a_capture_that_lost_its_writer_is_ended_and_the_music_does_not_start(
+    ) {
+        let rig = CaptureRig::new(true).await;
+        rig.model.lock().unwrap().repeat = true;
+        rig.call("play_capture", json!({ "v": 1, "capture": "airplay" }))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            rig.uris().len(),
+            MUSIC.len() + 1,
+            "a written capture stays"
+        );
+        // The receiver crashed: nothing writes any more.
+        rig.writer.store(false, std::sync::atomic::Ordering::SeqCst);
+        rig.until("the capture is ended", |m| m.uris() == CaptureRig::music())
+            .await;
+        assert_eq!(rig.model.lock().unwrap().state, "stop");
+        rig.release().await;
+    }
+
+    #[tokio::test]
+    async fn the_writer_watch_asks_the_player_nothing_when_there_is_no_capture()
+    {
+        let rig = CaptureRig::new(true).await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let asked = rig
+            .model
+            .lock()
+            .unwrap()
+            .log
+            .iter()
+            .filter(|c| c.starts_with("playlistfind"))
+            .count();
+        // The start-up sweep asks, once or twice; a ticking watch would ask
+        // every 30 ms.
+        assert!(asked <= 3, "{asked} questions with nothing to watch");
         rig.release().await;
     }
 

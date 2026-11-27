@@ -44,6 +44,11 @@ pub(crate) const AIRPLAY: CaptureSource = CaptureSource {
 /// The whole table. Adding a capture is adding a line here.
 const TABLE: [CaptureSource; 1] = [AIRPLAY];
 
+/// Every capture in the table.
+pub(crate) fn sources() -> &'static [CaptureSource] {
+    &TABLE
+}
+
 /// The capture a caller named, or `None` when it is not in the table.
 pub(crate) fn resolve(name: &str) -> Option<CaptureSource> {
     TABLE.iter().copied().find(|s| s.name == name)
@@ -325,6 +330,34 @@ pub(crate) async fn reap_all(conn: &mut MpdConnection) -> Result<(), MpdError> {
         reap(conn, source).await?;
     }
     Ok(())
+}
+
+/// Whether any capture is in the queue.
+pub(crate) async fn present(
+    conn: &mut MpdConnection,
+) -> Result<bool, MpdError> {
+    for source in &TABLE {
+        if find(conn, source).await?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// End a capture that nothing is writing to: its writer went away (the
+/// receiver crashed or was stopped) and the player would play silence for
+/// good. Returns whether one was ended.
+pub(crate) async fn end_unwritten(
+    conn: &mut MpdConnection,
+    probe: &dyn WriterProbe,
+) -> Result<bool, MpdError> {
+    for source in &TABLE {
+        if find(conn, source).await?.is_some() && !probe.has_writer(source) {
+            end(conn, source).await?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether any capture is the song the player is on. A capture is a

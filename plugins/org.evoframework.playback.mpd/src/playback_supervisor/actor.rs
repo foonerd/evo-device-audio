@@ -303,6 +303,17 @@ impl SupervisorCommandSender {
     }
 }
 
+/// A queued capture is ended when nothing writes to it any more: its
+/// writer was the AirPlay receiver, and if that stops or crashes the player
+/// would play silence for good.
+#[derive(Clone)]
+pub(crate) struct CaptureWatch {
+    /// Says whether anything is writing to a capture's device.
+    pub(crate) probe: Arc<dyn capture::WriterProbe>,
+    /// How often a queued capture is checked for a writer.
+    pub(crate) every: Duration,
+}
+
 /// Open both connections, emit the initial state report, spawn
 /// both tasks, return the handle.
 ///
@@ -330,6 +341,9 @@ pub(crate) struct SupervisorSpawn {
     /// report an album mode, so every now-playing publisher
     /// reads it from here instead of guessing.
     pub(crate) shuffle: crate::album_shuffle::ShuffleModeCell,
+    /// Ends a capture that has lost its writer. `None` leaves captures to
+    /// their verbs and the sweep on player wakes.
+    pub(crate) capture_watch: Option<CaptureWatch>,
 }
 
 pub(crate) async fn spawn(
@@ -406,6 +420,23 @@ pub(crate) async fn spawn(
     )
     .await?;
 
+    // A capture left in the queue by a receiver that went away (a crash, a
+    // reboot with the queue kept by MPD) is not the playing item: take it out
+    // now rather than at some later player wake.
+    let mut watching_capture = false;
+    if io.capture_watch.is_some() {
+        if let Err(e) = capture::reap_all(&mut cmd_conn).await {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "initial capture sweep failed"
+            );
+        } else {
+            watching_capture =
+                capture::present(&mut cmd_conn).await.unwrap_or(false);
+        }
+    }
+
     let (command_tx, command_rx) =
         mpsc::channel::<SupervisorMessage>(COMMAND_CHANNEL_CAPACITY);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -433,6 +464,9 @@ pub(crate) async fn spawn(
         muted: io.mute,
         shuffle_mode: io.shuffle,
         pre_mute_volume: initial_pre_mute_volume,
+        capture_watch: io.capture_watch,
+        watching_capture,
+        capture_misses: 0,
     };
     let task_handle =
         tokio::spawn(task_state.run(command_rx, shutdown_rx, idle_rx));
@@ -753,9 +787,65 @@ struct SupervisorTask {
     /// pre-mute value was captured, e.g. unmute called on a
     /// session that started muted).
     pre_mute_volume: u8,
+    /// Ends a capture that has lost its writer, if wanted.
+    capture_watch: Option<CaptureWatch>,
+    /// Whether a capture is (or may be) queued, so the watch only asks the
+    /// player when there is something to watch.
+    watching_capture: bool,
+    /// Checks in a row that found a queued capture with no writer.
+    capture_misses: u32,
 }
 
 impl SupervisorTask {
+    /// One check of a queued capture: if nothing has been writing to it for
+    /// two checks running, end it.
+    async fn watch_capture(&mut self) {
+        let Some(watch) = self.capture_watch.clone() else {
+            return;
+        };
+        match capture::present(&mut self.cmd_conn).await {
+            Ok(false) => {
+                self.watching_capture = false;
+                self.capture_misses = 0;
+            }
+            Ok(true) => {
+                let unwritten = capture::sources()
+                    .iter()
+                    .any(|s| !watch.probe.has_writer(s));
+                if unwritten {
+                    self.capture_misses += 1;
+                } else {
+                    self.capture_misses = 0;
+                }
+                if self.capture_misses >= 2 {
+                    self.capture_misses = 0;
+                    match capture::end_unwritten(
+                        &mut self.cmd_conn,
+                        watch.probe.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(true) => tracing::info!(
+                            plugin = PLUGIN_NAME,
+                            "a capture lost its writer; ended it"
+                        ),
+                        Ok(false) => {}
+                        Err(e) => tracing::debug!(
+                            plugin = PLUGIN_NAME,
+                            error = %e,
+                            "ending an unwritten capture failed"
+                        ),
+                    }
+                }
+            }
+            Err(e) => tracing::debug!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "capture watch could not read the queue"
+            ),
+        }
+    }
+
     /// The supervisor task body. Consumes `self` (the run is the
     /// whole life of the task) and the three channel receivers,
     /// and loops until shutdown or one of the channels closes.
@@ -774,6 +864,13 @@ impl SupervisorTask {
             "playback supervisor task started"
         );
 
+        let mut capture_tick = tokio::time::interval(
+            self.capture_watch
+                .as_ref()
+                .map_or(Duration::from_secs(3600), |w| w.every),
+        );
+        capture_tick
+            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 biased;
@@ -860,6 +957,13 @@ impl SupervisorTask {
                                 self.timeouts,
                             ).await;
                             let ok = result.is_ok();
+                            if matches!(
+                                (&request, &result),
+                                (CaptureRequest::Play { .. }, Ok(_))
+                            ) {
+                                self.watching_capture = true;
+                                self.capture_misses = 0;
+                            }
                             let _ = reply.send(result);
                             if ok {
                                 emit_best_effort_report(
@@ -906,6 +1010,11 @@ impl SupervisorTask {
                             let _ = reply.send(result);
                         }
                     }
+                }
+                _ = capture_tick.tick(),
+                    if self.watching_capture && self.capture_watch.is_some() =>
+                {
+                    self.watch_capture().await;
                 }
                 evt = idle_rx.recv() => {
                     match evt {
@@ -1752,6 +1861,7 @@ mod tests {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
                 shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                capture_watch: None,
             },
         )
         .await
@@ -1807,6 +1917,7 @@ mod tests {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
                 shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                capture_watch: None,
             },
         )
         .await
@@ -1845,6 +1956,7 @@ mod tests {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
                 shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                capture_watch: None,
             },
         )
         .await
@@ -1924,6 +2036,7 @@ mod tests {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
                 shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                capture_watch: None,
             },
         )
         .await
@@ -1993,6 +2106,7 @@ mod tests {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
                 shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                capture_watch: None,
             },
         )
         .await
@@ -2079,6 +2193,7 @@ mod tests {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
                 shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                capture_watch: None,
             },
         )
         .await
@@ -2143,6 +2258,7 @@ mod tests {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
                 shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                capture_watch: None,
             },
         )
         .await
@@ -2213,6 +2329,7 @@ mod tests {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
                 shuffle,
+                capture_watch: None,
             },
         )
         .await
@@ -2287,6 +2404,7 @@ mod tests {
                     music_directory: None,
                     mute: crate::mute_cell::MuteCell::new(),
                     shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                    capture_watch: None,
                 },
             )
             .await
@@ -2341,6 +2459,7 @@ mod tests {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
                 shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                capture_watch: None,
             },
         )
         .await
@@ -2406,6 +2525,7 @@ mod tests {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
                 shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                capture_watch: None,
             },
         )
         .await
@@ -2455,6 +2575,7 @@ mod tests {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
                 shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                capture_watch: None,
             },
         )
         .await
@@ -2511,6 +2632,7 @@ mod tests {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
                 shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                capture_watch: None,
             },
         )
         .await
@@ -2552,6 +2674,7 @@ mod tests {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
                 shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                capture_watch: None,
             },
         )
         .await
@@ -2588,6 +2711,7 @@ mod tests {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
                 shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                capture_watch: None,
             },
         )
         .await
@@ -2637,6 +2761,7 @@ mod tests {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
                 shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                capture_watch: None,
             },
         )
         .await
@@ -2692,6 +2817,7 @@ mod tests {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
                 shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                capture_watch: None,
             },
         )
         .await
@@ -2738,6 +2864,7 @@ mod tests {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
                 shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                capture_watch: None,
             },
         )
         .await
@@ -2802,6 +2929,7 @@ mod tests {
                 music_directory: None,
                 mute: crate::mute_cell::MuteCell::new(),
                 shuffle: crate::album_shuffle::ShuffleModeCell::new(),
+                capture_watch: None,
             },
         )
         .await

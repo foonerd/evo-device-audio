@@ -92,7 +92,7 @@ Three brand-neutral audio plugins live in this repository, signed by the evo pro
 
 | Plugin | Slot | Version |
 |--------|------|---------|
-| `org.evoframework.playback.mpd` | `audio.playback` | 0.1.2 |
+| `org.evoframework.playback.mpd` | `audio.playback` | 0.1.3 |
 | `org.evoframework.metadata.local` | `metadata.providers` | 0.1.1 |
 | `org.evoframework.artwork.local` | `artwork.providers` | 0.1.0 |
 | `org.evoframework.composition.alsa` | `audio.composition` | 0.1.0 |
