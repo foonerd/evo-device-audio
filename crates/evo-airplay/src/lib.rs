@@ -98,7 +98,7 @@ pub use identity::Identity;
 pub use info::txt_records;
 pub use limiter::PairingLimiter;
 pub use policy::{Admission, SessionControl, SessionGate, SingleSession};
-pub use receiver::{Receiver, ReceiverBuilder};
+pub use receiver::{BoundReceiver, Receiver, ReceiverBuilder};
 pub use sink::{AudioSink, SinkError, SinkFactory};
 
 /// Receiver-wide configuration, resolved by [`ReceiverBuilder::build`].

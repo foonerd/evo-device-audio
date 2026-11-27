@@ -274,6 +274,13 @@ impl Receiver {
             + Sync
             + 'static,
     {
+        self.bind().await?.run(sink_factory, events).await
+    }
+
+    /// Bind the control port without serving yet, so the host learns the port
+    /// it actually got (port `0` asks for any free one) and can refuse to go
+    /// on if binding fails, before it advertises anything.
+    pub async fn bind(self) -> io::Result<BoundReceiver> {
         // Dual-stack if possible (IPv4 clients arrive v4-mapped), else IPv4.
         let port = self.config.port;
         let listener = match TcpListener::bind(SocketAddr::from((
@@ -295,18 +302,64 @@ impl Receiver {
                 )
             })?,
         };
+        let bound = listener.local_addr()?.port();
+        Ok(BoundReceiver {
+            receiver: self,
+            listener,
+            port: bound,
+        })
+    }
+}
 
+/// A [`Receiver`] whose control port is bound and not yet served.
+pub struct BoundReceiver {
+    receiver: Receiver,
+    listener: TcpListener,
+    port: u16,
+}
+
+impl BoundReceiver {
+    /// The control port actually bound.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// The receiver this was bound from, for its records and name.
+    pub fn receiver(&self) -> &Receiver {
+        &self.receiver
+    }
+
+    /// Serve until a listener error. The same contract as [`Receiver::run`]:
+    /// dropping the returned future closes the listener and every accepted
+    /// connection.
+    pub async fn run<F>(
+        self,
+        sink_factory: F,
+        events: EventSender,
+    ) -> io::Result<()>
+    where
+        F: Fn(u32, u8) -> Result<Box<dyn AudioSink>, SinkError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let Receiver {
+            config,
+            identity,
+            gate,
+            control,
+        } = self.receiver;
         let sink_factory: SinkFactory = Arc::new(sink_factory);
         let context = Arc::new(Context {
-            config: self.config,
-            identity: self.identity,
+            config,
+            identity,
             sink_factory,
             events,
-            gate: self.gate,
-            control: self.control,
+            gate,
+            control,
             limiter: crate::limiter::PairingLimiter::default(),
         });
-        serve(listener, context).await
+        serve(self.listener, context).await
     }
 }
 
@@ -468,5 +521,27 @@ mod tests {
         assert!(records.iter().any(|r| r == "deviceid=AA:BB:CC:DD:EE:FF"));
         let pk = format!("pk={}", receiver.identity().public_key_hex());
         assert!(records.iter().any(|r| r == &pk));
+    }
+
+    #[tokio::test]
+    async fn bind_reports_the_port_it_got_and_a_busy_port_is_an_error() {
+        let first = Receiver::builder()
+            .identity(Identity::generate())
+            .port(0)
+            .build()
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        assert_ne!(first.port(), 0, "port 0 asks for any free port");
+        let busy = Receiver::builder()
+            .identity(Identity::generate())
+            .port(first.port())
+            .build()
+            .unwrap()
+            .bind()
+            .await;
+        let err = busy.err().expect("the port is taken");
+        assert!(err.to_string().contains("cannot bind control port"));
     }
 }
