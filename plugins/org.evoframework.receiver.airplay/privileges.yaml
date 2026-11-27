@@ -28,7 +28,7 @@ capability_intent:
   - id: mdns_registration
     need: connect to the system message bus and ask the local mDNS daemon to publish `_airplay._tcp` and `_raop._tcp` for the device, and to withdraw them.
     access_path: system message bus
-    failure_mode: the daemon being absent or refusing leaves the plugin enabled but degraded with reason `avahi_unavailable`; the listener is closed, registration is retried, and nothing is left half open.
+    failure_mode: the daemon being absent or refusing leaves the plugin enabled but degraded with reason `avahi_unavailable`; the listener is closed, registration is retried, and nothing is left half open. If the daemon restarts, or another device on the network is using the name, the registration is lost and made again, with the next free name after a collision.
 
   - id: loopback_substream
     need: open the reserved ALSA Loopback playback substream `hw:Loopback,0,4` for writing, and write the decoded audio of one stream to it; the player plays the capture end of the same substream.

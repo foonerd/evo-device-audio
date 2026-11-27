@@ -12,8 +12,11 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::StreamExt;
+use tokio::task::JoinHandle;
+use zbus::message::Type as MessageType;
 use zbus::zvariant::OwnedObjectPath;
-use zbus::Connection;
+use zbus::{Connection, MatchRule, MessageStream};
 
 const AVAHI_DEST: &str = "org.freedesktop.Avahi";
 const SERVER_IFACE: &str = "org.freedesktop.Avahi.Server";
@@ -44,14 +47,33 @@ pub struct ServiceRecords {
 #[error("{0}")]
 pub struct AdvertiseError(pub String);
 
+/// Why a standing registration ended without being withdrawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Loss {
+    /// Another device on the network is using the name.
+    Collision,
+    /// The mDNS daemon went away (stopped or restarted); its entries went
+    /// with it.
+    DaemonGone,
+}
+
+/// A registration that stands, and the way to hear that it stops standing.
+pub struct Registered {
+    /// The publication. Withdraw it to end it.
+    pub registration: Box<dyn Registration>,
+    /// Resolves if the registration is lost without being withdrawn.
+    pub lost: tokio::sync::oneshot::Receiver<Loss>,
+}
+
 /// Something that can publish the device.
 #[async_trait]
 pub trait Advertiser: Send + Sync {
-    /// Publish `records`. The returned registration keeps them published.
+    /// Publish `records`. The registration keeps them published until it is
+    /// withdrawn; `lost` says if it stopped standing first.
     async fn register(
         &self,
         records: &ServiceRecords,
-    ) -> Result<Box<dyn Registration>, AdvertiseError>;
+    ) -> Result<Registered, AdvertiseError>;
 }
 
 /// A live publication. Dropping it without calling `withdraw` still ends it,
@@ -69,6 +91,7 @@ pub struct AvahiAdvertiser;
 struct AvahiRegistration {
     connection: Connection,
     group: OwnedObjectPath,
+    watcher: JoinHandle<()>,
 }
 
 fn fail(what: &str, e: impl std::fmt::Display) -> AdvertiseError {
@@ -80,7 +103,7 @@ impl Advertiser for AvahiAdvertiser {
     async fn register(
         &self,
         records: &ServiceRecords,
-    ) -> Result<Box<dyn Registration>, AdvertiseError> {
+    ) -> Result<Registered, AdvertiseError> {
         match tokio::time::timeout(REGISTER_TIMEOUT, publish(records)).await {
             Ok(result) => result,
             Err(_) => Err(AdvertiseError(
@@ -90,9 +113,13 @@ impl Advertiser for AvahiAdvertiser {
     }
 }
 
+/// The group's own state changes, as the daemon sends them.
+const GROUP_COLLISION: i32 = 3;
+const GROUP_FAILURE: i32 = 4;
+
 async fn publish(
     records: &ServiceRecords,
-) -> Result<Box<dyn Registration>, AdvertiseError> {
+) -> Result<Registered, AdvertiseError> {
     let connection = Connection::system()
         .await
         .map_err(|e| fail("system bus", e))?;
@@ -109,6 +136,38 @@ async fn publish(
         .body()
         .deserialize()
         .map_err(|e| fail("mDNS daemon reply", e))?;
+
+    // Listen before committing, so no change of state is missed: the daemon
+    // probes the name for a moment after the commit and may find another
+    // device using it, or itself go away.
+    let state_rule = MatchRule::builder()
+        .msg_type(MessageType::Signal)
+        .sender(AVAHI_DEST)
+        .map_err(|e| fail("match rule", e))?
+        .interface(GROUP_IFACE)
+        .map_err(|e| fail("match rule", e))?
+        .member("StateChanged")
+        .map_err(|e| fail("match rule", e))?
+        .path(group.as_ref())
+        .map_err(|e| fail("match rule", e))?
+        .build();
+    let state = MessageStream::for_match_rule(state_rule, &connection, None)
+        .await
+        .map_err(|e| fail("state subscription", e))?;
+    let owner_rule = MatchRule::builder()
+        .msg_type(MessageType::Signal)
+        .sender("org.freedesktop.DBus")
+        .map_err(|e| fail("match rule", e))?
+        .interface("org.freedesktop.DBus")
+        .map_err(|e| fail("match rule", e))?
+        .member("NameOwnerChanged")
+        .map_err(|e| fail("match rule", e))?
+        .add_arg(AVAHI_DEST)
+        .map_err(|e| fail("match rule", e))?
+        .build();
+    let owner = MessageStream::for_match_rule(owner_rule, &connection, None)
+        .await
+        .map_err(|e| fail("owner subscription", e))?;
 
     for (name, service, txt) in [
         (&records.airplay_name, "_airplay._tcp", &records.airplay_txt),
@@ -141,12 +200,56 @@ async fn publish(
         .call_method(Some(AVAHI_DEST), &group, Some(GROUP_IFACE), "Commit", &())
         .await
         .map_err(|e| fail("commit", e))?;
-    Ok(Box::new(AvahiRegistration { connection, group }))
+
+    let (tx, lost) = tokio::sync::oneshot::channel();
+    let watcher = tokio::spawn(watch(state, owner, tx));
+    Ok(Registered {
+        registration: Box::new(AvahiRegistration {
+            connection,
+            group,
+            watcher,
+        }),
+        lost,
+    })
+}
+
+/// Say, once, that the registration stopped standing.
+async fn watch(
+    mut state: MessageStream,
+    mut owner: MessageStream,
+    tx: tokio::sync::oneshot::Sender<Loss>,
+) {
+    let loss = loop {
+        tokio::select! {
+            msg = state.next() => {
+                let Some(Ok(msg)) = msg else { break Loss::DaemonGone };
+                if let Ok((code, _reason)) =
+                    msg.body().deserialize::<(i32, String)>()
+                {
+                    if code == GROUP_COLLISION || code == GROUP_FAILURE {
+                        break Loss::Collision;
+                    }
+                }
+            }
+            msg = owner.next() => {
+                let Some(Ok(msg)) = msg else { break Loss::DaemonGone };
+                if let Ok((_name, _old, new)) =
+                    msg.body().deserialize::<(String, String, String)>()
+                {
+                    if new.is_empty() {
+                        break Loss::DaemonGone;
+                    }
+                }
+            }
+        }
+    };
+    let _ = tx.send(loss);
 }
 
 #[async_trait]
 impl Registration for AvahiRegistration {
     async fn withdraw(self: Box<Self>) {
+        self.watcher.abort();
         let freed = self
             .connection
             .call_method(
@@ -160,6 +263,12 @@ impl Registration for AvahiRegistration {
         if let Err(e) = freed {
             tracing::debug!(error = %e, "mDNS entry group free failed; dropping the connection withdraws it");
         }
+    }
+}
+
+impl Drop for AvahiRegistration {
+    fn drop(&mut self) {
+        self.watcher.abort();
     }
 }
 
@@ -181,6 +290,31 @@ pub(crate) mod fake {
         pub published: Mutex<Vec<ServiceRecords>>,
         /// Registrations currently live.
         pub live: Arc<AtomicUsize>,
+        /// The loss channel of every registration, oldest first.
+        lose: Mutex<Vec<Option<tokio::sync::oneshot::Sender<Loss>>>>,
+    }
+
+    impl FakeAdvertiser {
+        /// The daemon says the newest registration is lost.
+        pub fn lose(&self, loss: Loss) {
+            let last = self.lose.lock().unwrap().len().saturating_sub(1);
+            self.lose_nth(last, loss);
+        }
+
+        /// The daemon says the `n`th registration ever made is lost, which
+        /// for an earlier one is a report arriving late.
+        pub fn lose_nth(&self, n: usize, loss: Loss) {
+            if let Some(Some(tx)) =
+                self.lose.lock().unwrap().get_mut(n).map(Option::take)
+            {
+                let _ = tx.send(loss);
+            }
+        }
+
+        /// The names of the newest publication.
+        pub fn newest(&self) -> Option<ServiceRecords> {
+            self.published.lock().unwrap().last().cloned()
+        }
     }
 
     struct FakeRegistration(Arc<AtomicUsize>);
@@ -190,13 +324,18 @@ pub(crate) mod fake {
         async fn register(
             &self,
             records: &ServiceRecords,
-        ) -> Result<Box<dyn Registration>, AdvertiseError> {
+        ) -> Result<Registered, AdvertiseError> {
             if self.fail.load(Ordering::SeqCst) {
                 return Err(AdvertiseError("no mDNS daemon".into()));
             }
             self.published.lock().unwrap().push(records.clone());
             self.live.fetch_add(1, Ordering::SeqCst);
-            Ok(Box::new(FakeRegistration(self.live.clone())))
+            let (tx, lost) = tokio::sync::oneshot::channel();
+            self.lose.lock().unwrap().push(Some(tx));
+            Ok(Registered {
+                registration: Box::new(FakeRegistration(self.live.clone())),
+                lost,
+            })
         }
     }
 

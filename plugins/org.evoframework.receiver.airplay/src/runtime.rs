@@ -30,7 +30,7 @@ use tokio::task::JoinHandle;
 
 use crate::conduct::Conduct;
 use crate::lan::LanGate;
-use crate::mdns::{Advertiser, Registration, ServiceRecords};
+use crate::mdns::{Advertiser, Loss, Registered, Registration, ServiceRecords};
 use crate::player::{Player, Tags};
 use crate::sink::{EndCapture, LoopbackSink, Note, PcmOpener};
 use crate::state::{self, Persisted};
@@ -48,6 +48,10 @@ pub const VERBS: [&str; 3] = [
     "receiver.airplay.enable",
     "receiver.airplay.disable",
 ];
+
+/// How many alternative names are tried before the receiver reports that
+/// none is free.
+const MAX_NAME_ATTEMPTS: u32 = 9;
 
 /// The shortest and longest pairing password accepted, in characters.
 pub const PASSWORD_LEN: std::ops::RangeInclusive<usize> = 1..=128;
@@ -180,6 +184,9 @@ struct Running {
     events: JoinHandle<()>,
     control: SessionControl,
     registration: Option<Box<dyn Registration>>,
+    /// Which start this is, so a loss reported for an earlier registration
+    /// is not mistaken for this one's.
+    generation: u64,
 }
 
 struct Inner {
@@ -192,6 +199,14 @@ struct Inner {
     session: Option<Conduct>,
     /// Why the receiver is degraded once the running stream is over.
     after_session: Option<&'static str>,
+    /// Counts starts.
+    generation: u64,
+    /// How many names this device has had to give up because another device
+    /// on the network was using them. The name shown is the base name for
+    /// `0`, and `<base> #<n + 1>` after.
+    name_attempt: u32,
+    /// Watches a refusal's cause, to clear the degraded state when it goes.
+    recheck: Option<JoinHandle<()>>,
 }
 
 /// The runtime behind the verbs.
@@ -313,16 +328,27 @@ impl ReceiverRuntime {
                 retry: None,
                 session: None,
                 after_session: None,
+                generation: 0,
+                name_attempt: 0,
+                recheck: None,
             }),
             publisher: StdMutex::new(None),
         }
     }
 
-    fn friendly_name(&self) -> String {
-        self.cfg
+    /// The name senders show: the base name, or after a collision the base
+    /// name with a number, as the mDNS daemon itself names a second device.
+    fn friendly_name(&self, attempt: u32) -> String {
+        let base = self
+            .cfg
             .friendly_name
             .clone()
-            .unwrap_or_else(host_friendly_name)
+            .unwrap_or_else(host_friendly_name);
+        if attempt == 0 {
+            base
+        } else {
+            format!("{base} #{}", attempt + 1)
+        }
     }
 
     fn envelope_of(&self, g: &Inner) -> Envelope {
@@ -334,7 +360,7 @@ impl ReceiverRuntime {
                 _ => None,
             },
             enabled: g.persisted.enabled,
-            friendly_name: self.friendly_name(),
+            friendly_name: self.friendly_name(g.name_attempt),
             port: g.persisted.port,
             open: g.password.is_none(),
             session: match &g.status {
@@ -413,7 +439,7 @@ impl ReceiverRuntime {
             _ => {}
         }
         g.status = Status::Starting;
-        let name = self.friendly_name();
+        let name = self.friendly_name(g.name_attempt);
         let password = g.password.clone();
         let wanted = if g.persisted.port != 0 {
             g.persisted.port
@@ -466,18 +492,30 @@ impl ReceiverRuntime {
             raop_txt: receiver.raop_txt_records(),
         };
         let control = receiver.session_control();
-        let registration = match self.advertiser.register(&records).await {
-            Ok(r) => r,
-            Err(e) => {
-                // Nothing may be left half open: the listener goes with it.
-                drop(bound);
-                let env = self
-                    .degrade(&mut g, "avahi_unavailable", &e.to_string())
-                    .await;
-                self.schedule_retry(&mut g);
-                return env;
-            }
-        };
+        // Nothing is advertised that cannot be played: the substream must
+        // open now. A device that would accept a sender and then refuse it
+        // is worse than one that is not on the network.
+        if let Err(e) = self.playable().await {
+            drop(bound);
+            let env = self
+                .degrade(&mut g, "loopback_unavailable", &e.to_string())
+                .await;
+            self.schedule_retry(&mut g);
+            return env;
+        }
+        let Registered { registration, lost } =
+            match self.advertiser.register(&records).await {
+                Ok(r) => r,
+                Err(e) => {
+                    // Nothing may be left half open: the listener goes with it.
+                    drop(bound);
+                    let env = self
+                        .degrade(&mut g, "avahi_unavailable", &e.to_string())
+                        .await;
+                    self.schedule_retry(&mut g);
+                    return env;
+                }
+            };
 
         if port != g.persisted.port {
             g.persisted.port = port;
@@ -510,17 +548,173 @@ impl ReceiverRuntime {
                 }
             }
         });
+        g.generation += 1;
+        let generation = g.generation;
         g.running = Some(Running {
             serve,
             events,
             control,
             registration: Some(registration),
+            generation,
         });
         g.status = Status::Advertising;
         let env = self.envelope_of(&g);
         drop(g);
+        // If the daemon loses the registration (another device took the
+        // name, or the daemon restarted), start again.
+        self.watch_loss(lost, generation);
+        // A capture left in the player by a receiver that is gone is taken
+        // out; nothing else can be writing to it.
+        self.clear_stale_capture().await;
         self.publish(&env).await;
         env
+    }
+
+    /// While the receiver is degraded by a refused stream, ask now and then
+    /// whether the cause is gone, and say so when it is.
+    fn watch_cause(self: &Arc<Self>, reason: &'static str) -> JoinHandle<()> {
+        let rt = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(rt.cfg.retry_every).await;
+                {
+                    let g = rt.inner.lock().await;
+                    let still = g.running.is_some()
+                        && g.status == Status::Degraded(reason.to_string());
+                    if !still {
+                        return;
+                    }
+                }
+                let fixed = match reason {
+                    "loopback_unavailable" => rt.playable().await.is_ok(),
+                    _ => rt.audio.player.end_capture().await.is_ok(),
+                };
+                if !fixed {
+                    continue;
+                }
+                let env = {
+                    let mut g = rt.inner.lock().await;
+                    if g.running.is_none()
+                        || g.status != Status::Degraded(reason.to_string())
+                    {
+                        return;
+                    }
+                    g.status = Status::Advertising;
+                    rt.envelope_of(&g)
+                };
+                rt.publish(&env).await;
+                return;
+            }
+        })
+    }
+
+    fn watch_loss(
+        self: &Arc<Self>,
+        lost: tokio::sync::oneshot::Receiver<Loss>,
+        generation: u64,
+    ) {
+        let rt = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Ok(loss) = lost.await {
+                rt.on_registration_lost(loss, generation).await;
+            }
+        });
+    }
+
+    /// Whether the audio device opens right now. A few tries: a stream that
+    /// has just ended may still be closing it.
+    async fn playable(&self) -> Result<(), SinkError> {
+        let mut last = SinkError::new("the audio device did not open");
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            let opener = self.audio.pcm.clone();
+            let opened = tokio::task::spawn_blocking(move || {
+                opener.open(44_100, 2).map(drop)
+            })
+            .await;
+            match opened {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(e)) => last = e,
+                Err(e) => last = SinkError::new(e.to_string()),
+            }
+        }
+        Err(last)
+    }
+
+    /// Ask the player to drop any capture it holds. The first ask is made
+    /// now; if the player is not answering yet (this plugin may have loaded
+    /// before it), asking goes on in the background until it does, and stops
+    /// if a stream has begun, since that capture is not stale.
+    async fn clear_stale_capture(self: &Arc<Self>) {
+        let ask = |player: Arc<dyn Player>| async move {
+            tokio::time::timeout(Duration::from_secs(2), player.end_capture())
+                .await
+                .map_err(|_| ())
+                .and_then(|r| r.map_err(|_| ()))
+        };
+        if ask(self.audio.player.clone()).await.is_ok() {
+            return;
+        }
+        let rt = Arc::clone(self);
+        tokio::spawn(async move {
+            for _ in 0..20 {
+                tokio::time::sleep(rt.cfg.retry_every).await;
+                {
+                    let g = rt.inner.lock().await;
+                    if g.running.is_none() || g.session.is_some() {
+                        return;
+                    }
+                }
+                if ask(rt.audio.player.clone()).await.is_ok() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// The registration stopped standing. Close everything and start again:
+    /// after a collision with the next name, after the daemon went away as
+    /// soon as it is back (and degraded, retrying, until then).
+    async fn on_registration_lost(
+        self: &Arc<Self>,
+        loss: Loss,
+        generation: u64,
+    ) {
+        {
+            let mut g = self.inner.lock().await;
+            let current = g
+                .running
+                .as_ref()
+                .is_some_and(|r| r.generation == generation);
+            if !current || !g.persisted.enabled {
+                return;
+            }
+            if loss == Loss::Collision {
+                g.name_attempt += 1;
+                tracing::warn!(
+                    attempt = g.name_attempt,
+                    "another device is using the name; choosing another"
+                );
+            } else {
+                tracing::warn!("the mDNS daemon went away; registering again");
+            }
+            if g.name_attempt > MAX_NAME_ATTEMPTS {
+                g.name_attempt = 0;
+                drop(g);
+                self.stop().await;
+                let mut g = self.inner.lock().await;
+                let env = self
+                    .degrade(&mut g, "name_unavailable", "every name was taken")
+                    .await;
+                self.schedule_retry(&mut g);
+                drop(env);
+                return;
+            }
+        }
+        self.stop().await;
+        let _ = self.start_inner(true).await;
     }
 
     fn schedule_retry(self: &Arc<Self>, g: &mut Inner) {
@@ -586,7 +780,7 @@ impl ReceiverRuntime {
         })
     }
 
-    async fn on_note(&self, note: Note) {
+    async fn on_note(self: &Arc<Self>, note: Note) {
         let env = {
             let mut g = self.inner.lock().await;
             if g.running.is_none() {
@@ -594,9 +788,14 @@ impl ReceiverRuntime {
             }
             match note {
                 Note::Refused(reason) => {
-                    // No stream is running: say why the last one was refused.
+                    // No stream is running: say why the last one was refused,
+                    // and watch for the cause to go.
                     if !matches!(g.status, Status::Session { .. }) {
                         g.status = Status::Degraded(reason.to_string());
+                        if let Some(old) = g.recheck.take() {
+                            old.abort();
+                        }
+                        g.recheck = Some(self.watch_cause(reason));
                     }
                 }
                 Note::WriteFailed(why) => {
@@ -705,6 +904,9 @@ impl ReceiverRuntime {
         if let Some(pending) = g.retry.take() {
             pending.abort();
         }
+        if let Some(watch) = g.recheck.take() {
+            watch.abort();
+        }
         if let Some(mut running) = g.running.take() {
             // Out of sight of the network first, then out of existence.
             if let Some(registration) = running.registration.take() {
@@ -763,6 +965,7 @@ impl ReceiverRuntime {
         self.stop().await;
         let env = {
             let mut g = self.inner.lock().await;
+            g.name_attempt = 0;
             if g.password.take().is_some() {
                 state::store_password(&self.credentials_dir, None)?;
             }
@@ -996,9 +1199,8 @@ mod tests {
         assert_eq!(reply.code(), 200, "{}", reply.status);
         let ports = ports.expect("ports");
         // The player took the capture before the sender was told yes.
-        assert_eq!(
-            r.player.calls().first(),
-            Some(&Call::Play(Tags::default())),
+        assert!(
+            r.player.calls().contains(&Call::Play(Tags::default())),
             "{:?}",
             r.player.calls()
         );
@@ -1114,8 +1316,9 @@ mod tests {
     ) {
         use crate::player::fake::Call;
         let r = rig();
-        *r.opener.fail.lock().unwrap() = Some("busy".into());
         let e = r.rt.enable(None).await.unwrap();
+        // It opened when the receiver came up; now something else holds it.
+        *r.opener.fail.lock().unwrap() = Some("busy".into());
         let (_s, reply, _) = begin(e.port).await;
         assert_eq!(reply.code(), 503, "{}", reply.status);
         assert_eq!(r.player.count(|c| matches!(c, Call::Play(_))), 0);
@@ -1130,8 +1333,8 @@ mod tests {
     #[tokio::test]
     async fn a_good_stream_after_a_refused_one_clears_the_reason() {
         let r = rig();
-        *r.opener.fail.lock().unwrap() = Some("busy".into());
         let e = r.rt.enable(None).await.unwrap();
+        *r.opener.fail.lock().unwrap() = Some("busy".into());
         let (_s, reply, _) = begin(e.port).await;
         assert_eq!(reply.code(), 503);
         *r.opener.fail.lock().unwrap() = None;
@@ -1244,8 +1447,8 @@ mod tests {
         assert!(ports.is_none());
         assert_eq!(
             r.opener.opened.load(Ordering::SeqCst),
-            1,
-            "one device open"
+            2,
+            "one open to check the device at start, one for the stream"
         );
     }
 
@@ -1540,5 +1743,205 @@ mod tests {
         assert!(!gate.accept_peer("2001:db8::1".parse().unwrap()));
         assert!(gate.accept_peer("192.168.1.10".parse().unwrap()));
         assert!(gate.accept_peer("::ffff:10.0.0.7".parse().unwrap()));
+    }
+
+    // ----- slice 4: what the receiver does when things go wrong -----
+
+    use crate::mdns::Loss;
+
+    fn status_is(r: &Rig, want: Status) -> bool {
+        r.rt.inner.try_lock().is_ok_and(|g| g.status == want)
+    }
+
+    #[tokio::test]
+    async fn a_device_that_does_not_open_at_enable_is_not_advertised_and_is_retried(
+    ) {
+        let r = rig();
+        *r.opener.fail.lock().unwrap() = Some("no loopback".into());
+        let e = r.rt.enable(None).await.unwrap();
+        assert_eq!(e.state, "degraded");
+        assert_eq!(e.reason.as_deref(), Some("loopback_unavailable"));
+        assert_eq!(live(&r), 0, "nothing is advertised that cannot be played");
+        let port = r.rt.get_state().await.port;
+        assert!(
+            port == 0
+                || tokio::net::TcpStream::connect(addr(port)).await.is_err(),
+            "and no listener is left open"
+        );
+        // The device appears; the retry brings the receiver up by itself.
+        *r.opener.fail.lock().unwrap() = None;
+        eventually("it advertises", || status_is(&r, Status::Advertising))
+            .await;
+        assert_eq!(live(&r), 1);
+    }
+
+    #[tokio::test]
+    async fn a_name_another_device_took_is_replaced_by_the_next_and_shown() {
+        let r = rig();
+        let e = r.rt.enable(None).await.unwrap();
+        assert_eq!(e.friendly_name, "Test receiver");
+        r.adv.lose(Loss::Collision);
+        eventually("it moves to the second name", || {
+            r.adv
+                .newest()
+                .is_some_and(|p| p.airplay_name == "Test receiver #2")
+        })
+        .await;
+        let second = r.adv.newest().unwrap();
+        assert!(
+            second.raop_name.ends_with("@Test receiver #2"),
+            "both services take the same name: {second:?}"
+        );
+        eventually("advertising again", || status_is(&r, Status::Advertising))
+            .await;
+        assert_eq!(r.rt.get_state().await.friendly_name, "Test receiver #2");
+        assert_eq!(live(&r), 1, "one registration stands, not two");
+        // And again.
+        r.adv.lose(Loss::Collision);
+        eventually("the third name", || {
+            r.adv
+                .newest()
+                .is_some_and(|p| p.airplay_name == "Test receiver #3")
+        })
+        .await;
+        // Disabled and enabled again, the base name is tried first.
+        r.rt.disable().await.unwrap();
+        r.rt.enable(None).await.unwrap();
+        assert_eq!(r.rt.get_state().await.friendly_name, "Test receiver");
+    }
+
+    #[tokio::test]
+    async fn when_no_name_is_free_the_receiver_says_so_and_tries_the_first_again(
+    ) {
+        let r = rig();
+        r.rt.enable(None).await.unwrap();
+        for n in 2..=MAX_NAME_ATTEMPTS + 1 {
+            r.adv.lose(Loss::Collision);
+            let want = format!("Test receiver #{n}");
+            eventually("the next name", || {
+                r.adv.newest().is_some_and(|p| p.airplay_name == want)
+                    && status_is(&r, Status::Advertising)
+            })
+            .await;
+        }
+        r.adv.lose(Loss::Collision);
+        eventually("it gives up and says why", || {
+            status_is(&r, Status::Degraded("name_unavailable".into()))
+        })
+        .await;
+        assert_eq!(live(&r), 0);
+        eventually("it tries the first name again", || {
+            status_is(&r, Status::Advertising)
+        })
+        .await;
+        assert_eq!(r.rt.get_state().await.friendly_name, "Test receiver");
+    }
+
+    #[tokio::test]
+    async fn the_mdns_daemon_going_away_closes_the_listener_and_the_receiver_registers_again_when_it_is_back(
+    ) {
+        let r = rig();
+        let e = r.rt.enable(None).await.unwrap();
+        r.adv.fail.store(true, Ordering::SeqCst);
+        r.adv.lose(Loss::DaemonGone);
+        eventually("degraded, nothing left open", || {
+            status_is(&r, Status::Degraded("avahi_unavailable".into()))
+                && live(&r) == 0
+        })
+        .await;
+        assert!(
+            tokio::net::TcpStream::connect(addr(e.port)).await.is_err(),
+            "the listener is closed while nothing is advertised"
+        );
+        r.adv.fail.store(false, Ordering::SeqCst);
+        eventually("registered again", || status_is(&r, Status::Advertising))
+            .await;
+        assert_eq!(live(&r), 1);
+    }
+
+    #[tokio::test]
+    async fn a_loss_reported_for_an_earlier_registration_changes_nothing() {
+        let r = rig();
+        r.rt.enable(None).await.unwrap();
+        r.adv.lose(Loss::Collision);
+        eventually("second name", || {
+            r.adv
+                .newest()
+                .is_some_and(|p| p.airplay_name.ends_with("#2"))
+        })
+        .await;
+        eventually("advertising", || status_is(&r, Status::Advertising)).await;
+        // A disabled receiver does not start again for a late loss.
+        r.rt.disable().await.unwrap();
+        r.adv.lose(Loss::Collision);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(r.rt.get_state().await.state, "disabled");
+        assert_eq!(live(&r), 0);
+    }
+
+    #[tokio::test]
+    async fn a_capture_left_in_the_player_by_an_earlier_receiver_is_taken_out_at_start(
+    ) {
+        use crate::player::fake::Call;
+        let r = rig();
+        r.rt.enable(None).await.unwrap();
+        assert_eq!(
+            r.player.calls().first(),
+            Some(&Call::End),
+            "before anything else: {:?}",
+            r.player.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_player_not_up_yet_is_asked_again_until_it_answers() {
+        use crate::player::fake::Call;
+        let r = rig();
+        *r.player.end_error.lock().unwrap() =
+            Some(crate::player::PlayerError::Unavailable("not up".into()));
+        r.rt.enable(None).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let asked = r.player.count(|c| *c == Call::End);
+        assert!(asked >= 2, "asked again: {asked}");
+        *r.player.end_error.lock().unwrap() = None;
+        eventually("it stops asking once answered", || {
+            let n = r.player.count(|c| *c == Call::End);
+            std::thread::sleep(Duration::from_millis(200));
+            n == r.player.count(|c| *c == Call::End)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_refusal_clears_when_its_cause_goes() {
+        let r = rig();
+        let e = r.rt.enable(None).await.unwrap();
+        *r.player.play_error.lock().unwrap() =
+            Some(crate::player::PlayerError::Unavailable("away".into()));
+        let (_s, reply, _) = begin(e.port).await;
+        assert_eq!(reply.code(), 503);
+        eventually("degraded", || {
+            status_is(&r, Status::Degraded("playback_refused".into()))
+        })
+        .await;
+        // The player is back: the receiver stops saying so without a stream.
+        *r.player.play_error.lock().unwrap() = None;
+        eventually("healthy again", || status_is(&r, Status::Advertising))
+            .await;
+    }
+    #[tokio::test]
+    async fn a_late_loss_for_a_registration_that_was_replaced_changes_nothing()
+    {
+        let r = rig();
+        r.rt.enable(None).await.unwrap();
+        r.rt.disable().await.unwrap();
+        r.rt.enable(None).await.unwrap();
+        let published = r.adv.published.lock().unwrap().len();
+        // The first registration's loss arrives after the second stands.
+        r.adv.lose_nth(0, Loss::Collision);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(r.adv.published.lock().unwrap().len(), published);
+        assert_eq!(r.rt.get_state().await.friendly_name, "Test receiver");
+        assert_eq!(live(&r), 1);
     }
 }

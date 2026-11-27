@@ -246,6 +246,8 @@ pub(crate) mod fake {
         pub calls: Mutex<Vec<Call>>,
         pub play_error: Mutex<Option<PlayerError>>,
         pub tags_error: Mutex<Option<PlayerError>>,
+        /// Make ending the capture fail.
+        pub end_error: Mutex<Option<PlayerError>>,
         /// How long ending the capture takes, so a test can tell the
         /// receiver waiting for it from something else ending it.
         pub end_delay: Mutex<Duration>,
@@ -292,7 +294,10 @@ pub(crate) mod fake {
             let delay = *self.end_delay.lock().unwrap();
             tokio::time::sleep(delay).await;
             self.record(Call::End);
-            Ok(())
+            match self.end_error.lock().unwrap().clone() {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
         }
         async fn set_volume(&self, volume: u8) -> Result<(), PlayerError> {
             self.record(Call::Volume(volume));
