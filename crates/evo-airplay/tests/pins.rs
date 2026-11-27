@@ -182,3 +182,27 @@ fn no_third_party_airplay_daemon_is_installed_or_shipped() {
         }
     }
 }
+
+#[test]
+fn a_property_list_from_the_network_is_only_ever_read_as_binary() {
+    // Every plist parse of sender-controlled bytes goes through `bplist`, which
+    // refuses XML. The only other readers are the test sender and test code.
+    for entry in fs::read_dir(crate_dir().join("src")).expect("src") {
+        let path = entry.expect("entry").path();
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        if name == "bplist.rs" || name == "sender.rs" || !name.ends_with(".rs")
+        {
+            continue;
+        }
+        let text = fs::read_to_string(&path).expect("read");
+        let production = text.split("#[cfg(test)]").next().unwrap_or_default();
+        assert!(
+            !production.contains("from_reader"),
+            "{name} reads a property list directly; use bplist::parse"
+        );
+    }
+}

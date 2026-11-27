@@ -576,3 +576,46 @@ async fn hostile_connections_do_not_disturb_a_running_session() {
     wait_event(&mut h.events, |e| matches!(e, Event::SessionStarted { .. }))
         .await;
 }
+
+#[tokio::test]
+async fn a_setup_that_is_not_a_binary_plist_or_nests_absurdly_is_refused_and_the_receiver_lives(
+) {
+    let (factory, _pcm) = capture();
+    let h = start(factory, CountingGate::new(false)).await;
+    let mut sender = Sender::connect(h.addr, "3939").await.expect("pair");
+    sender.fp_setup().await.expect("fp-setup");
+    let headers = "Content-Type: application/x-apple-binary-plist\r\n";
+
+    let xml = b"<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>streams</key>\
+        <array/></dict></plist>";
+    let reply = sender
+        .request("SETUP rtsp://x/1 RTSP/1.0", headers, xml)
+        .await
+        .expect("answered");
+    assert_eq!(reply.code(), 400, "{}", reply.status);
+
+    // 200,000 nested arrays: a stack overflow would abort this whole test run.
+    let depth = 200_000usize;
+    let mut deep = b"bplist00".to_vec();
+    for i in 0..depth {
+        deep.push(0xA1);
+        deep.extend_from_slice(&((i as u32) + 1).to_be_bytes());
+    }
+    deep.extend_from_slice(&[0x10, 0x01]);
+    let table_at = deep.len();
+    for i in 0..=depth {
+        deep.extend_from_slice(&((8 + 5 * i) as u32).to_be_bytes());
+    }
+    deep.extend_from_slice(&[0; 6]);
+    deep.extend_from_slice(&[4, 4]);
+    deep.extend_from_slice(&((depth + 1) as u64).to_be_bytes());
+    deep.extend_from_slice(&0u64.to_be_bytes());
+    deep.extend_from_slice(&(table_at as u64).to_be_bytes());
+    let reply = sender
+        .request("SETUP rtsp://x/1 RTSP/1.0", headers, &deep)
+        .await
+        .expect("answered");
+    assert_eq!(reply.code(), 400, "{}", reply.status);
+
+    assert!(sender.info().await.expect("still serving").is_ok());
+}

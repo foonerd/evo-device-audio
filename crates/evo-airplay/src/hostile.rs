@@ -9,6 +9,7 @@
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
 
+use crate::bplist;
 use crate::buffered::{split_blocks, AudioDecryptor};
 use crate::cipher::control_channel;
 use crate::decode::AacDecoder;
@@ -163,4 +164,70 @@ fn the_aac_decoder_survives_hostile_frames() {
     // And it still decodes a good frame afterwards.
     let mut fresh = AacDecoder::new(44_100, 2).expect("decoder");
     assert!(fresh.decode(frames[5]).is_ok());
+}
+
+/// A binary property list `depth` arrays deep, each holding the next, ending
+/// in one integer: the smallest body that nests as deeply as it can.
+fn nested_bplist(depth: usize) -> Vec<u8> {
+    let objects = depth + 1;
+    let mut out = b"bplist00".to_vec();
+    for i in 0..depth {
+        out.push(0xA1); // an array of one element
+        out.extend_from_slice(&((i as u32) + 1).to_be_bytes());
+    }
+    out.extend_from_slice(&[0x10, 0x01]); // the integer 1
+    let table_at = out.len();
+    for i in 0..depth {
+        out.extend_from_slice(&((8 + 5 * i) as u32).to_be_bytes());
+    }
+    out.extend_from_slice(&((8 + 5 * depth) as u32).to_be_bytes());
+    out.extend_from_slice(&[0; 6]);
+    out.push(4); // offset size
+    out.push(4); // object reference size
+    out.extend_from_slice(&(objects as u64).to_be_bytes());
+    out.extend_from_slice(&0u64.to_be_bytes()); // top object
+    out.extend_from_slice(&(table_at as u64).to_be_bytes());
+    out
+}
+
+#[test]
+fn a_property_list_nested_without_limit_cannot_overflow_the_stack() {
+    // A worker thread's stack is small; a body may be megabytes. If parsing or
+    // dropping the value recursed natively this would abort the process.
+    let body = nested_bplist(300_000);
+    assert!(body.len() < 4 * 1024 * 1024, "within the body limit");
+    let outcome = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || bplist::parse(&body).is_some())
+        .expect("thread")
+        .join();
+    assert!(outcome.is_ok(), "the parse did not survive");
+}
+
+#[test]
+fn property_lists_survive_hostile_bytes() {
+    let mut rng = StdRng::seed_from_u64(9);
+    let mut stream = plist::Dictionary::new();
+    stream.insert("type".into(), plist::Value::Integer(103u64.into()));
+    stream.insert("shk".into(), plist::Value::Data(vec![7; 32]));
+    let mut top = plist::Dictionary::new();
+    top.insert(
+        "streams".into(),
+        plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+    );
+    let mut valid = Vec::new();
+    plist::Value::Dictionary(top)
+        .to_writer_binary(&mut valid)
+        .expect("serialise");
+    for _ in 0..rounds() {
+        let mut body = corrupt(&mut rng, &valid);
+        if rng.gen_bool(0.1) {
+            body = random_bytes(&mut rng, 120);
+        }
+        let _ = bplist::parse(&body);
+        // Keep the magic so the structural check, not the prefix test, decides.
+        let mut framed = b"bplist00".to_vec();
+        framed.extend_from_slice(&random_bytes(&mut rng, 120));
+        let _ = bplist::parse(&framed);
+    }
 }

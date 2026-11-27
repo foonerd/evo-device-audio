@@ -58,6 +58,7 @@
 #![warn(missing_docs)]
 
 mod apple_interop;
+mod bplist;
 mod buffered;
 mod crypto_stream;
 mod decode;

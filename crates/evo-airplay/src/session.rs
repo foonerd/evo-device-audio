@@ -158,13 +158,12 @@ impl Session {
         &mut self,
         body: &[u8],
     ) -> Result<Vec<u8>, SetupError> {
-        let request =
-            Value::from_reader(io::Cursor::new(body)).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("SETUP plist: {e}"),
-                )
-            })?;
+        let request = crate::bplist::parse(body).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SETUP body is not a binary property list",
+            )
+        })?;
         let dict = request.as_dictionary().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "SETUP body not a dict")
         })?;
@@ -720,7 +719,7 @@ fn aac_params(_audio_format: Option<u64>) -> (u32, u8) {
 /// Parse a `SETRATEANCHORTIME` plist into `(rate, rtpTime)`. `rate` is 0
 /// (pause) or 1 (play); `rtpTime` is the anchor timestamp.
 pub(crate) fn parse_rate_anchor(body: &[u8]) -> Option<(u64, u64)> {
-    let value = Value::from_reader(io::Cursor::new(body)).ok()?;
+    let value = crate::bplist::parse(body)?;
     let dict = value.as_dictionary()?;
     let rate = dict.get("rate").and_then(int_field)?;
     let rtp = dict.get("rtpTime").and_then(int_field).unwrap_or(0);
@@ -736,7 +735,7 @@ fn int_field(v: &Value) -> Option<u64> {
 /// Parse a `FLUSHBUFFERED` plist for its `flushUntilSeq` boundary (drop all
 /// packets with a lower sequence number).
 pub(crate) fn parse_flush_until_seq(body: &[u8]) -> Option<u64> {
-    let value = Value::from_reader(io::Cursor::new(body)).ok()?;
+    let value = crate::bplist::parse(body)?;
     value
         .as_dictionary()?
         .get("flushUntilSeq")
