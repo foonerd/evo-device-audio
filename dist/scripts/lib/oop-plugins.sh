@@ -16,8 +16,8 @@
 #
 # The list and the plugins tree must agree: dist/scripts/tests/
 # oop-list-parity.test.sh fails when a plugin that has a
-# manifest.oop.toml is not on this list, or an entry's crate, wire
-# binary or feature differs from the crate's own.
+# manifest.oop.toml is on neither this list nor the staged list below, or an
+# entry's crate, wire binary or feature differs from the crate's own.
 #
 # shellcheck shell=bash
 
@@ -48,6 +48,16 @@ OOP_PLUGINS=(
     "org.evoframework.system.updater:org-evoframework-system-updater:system-updater-wire:"
     "org.evoframework.receiver.dlna:org-evoframework-receiver-dlna:receiver-dlna-wire:"
     "org.evoframework.receiver.airplay:org-evoframework-receiver-airplay:receiver-airplay-wire:alsa-substrate"
+)
+
+# Plugins that are built and in the tree but deliberately NOT shipped yet.
+# The installer bundle, the redeploy script and the published pieces read
+# OOP_PLUGINS only and never see these, so a staged plugin is neither
+# installed by them nor counted below. It leaves this list by moving onto
+# OOP_PLUGINS in the change that ships it. The parity test requires every
+# plugin with an out-of-process manifest to be on exactly one of the two.
+OOP_PLUGINS_STAGED=(
+    "org.evoframework.receiver.bluetooth:org-evoframework-receiver-bluetooth:receiver-bluetooth-wire:"
 )
 
 # Expected admitted-plugin count after a clean install/reinstall.

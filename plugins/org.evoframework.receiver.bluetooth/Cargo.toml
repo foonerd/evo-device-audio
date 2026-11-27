@@ -1,0 +1,38 @@
+[package]
+name = "org-evoframework-receiver-bluetooth"
+# Keep in sync with manifest.toml [plugin].version and PluginIdentity in describe().
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The device as a Bluetooth audio sink, built in-process on the platform's Bluetooth stack. Registers an A2DP sink endpoint and a pairing agent with the host stack, owns the pairing window and the paired-device list, and publishes the reactive audio_receiver_bluetooth subject. Default disabled; enable, disable and pairing are write verbs under network_admin."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "receiver-bluetooth-wire"
+path = "src/bin/receiver-bluetooth-wire.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = "0.1"
+evo-plugin-sdk = { workspace = true }
+futures = "0.3"
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time", "sync", "rt", "macros", "fs"] }
+tracing = { workspace = true }
+# The system-bus client that talks to the host Bluetooth stack (the same
+# client the network plugin uses for NetworkManager).
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

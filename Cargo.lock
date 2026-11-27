@@ -4048,6 +4048,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "org-evoframework-receiver-bluetooth"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "evo-plugin-sdk",
+ "futures",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "zbus",
+]
+
+[[package]]
 name = "org-evoframework-receiver-dlna"
 version = "0.1.0"
 dependencies = [

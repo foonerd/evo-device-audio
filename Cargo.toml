@@ -31,6 +31,7 @@ members = [
     "plugins/org.evoframework.network.smb-server",
     "plugins/org.evoframework.receiver.dlna",
     "plugins/org.evoframework.receiver.airplay",
+    "plugins/org.evoframework.receiver.bluetooth",
     "plugins/org.evoframework.system.notifications",
     "plugins/org.evoframework.system.kiosk",
     "plugins/org.evoframework.storage.usb",

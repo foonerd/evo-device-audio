@@ -11,12 +11,15 @@
 # shipped by those paths and is deleted by a redeploy. This test makes that
 # drift fail here, offline, instead of on a device:
 #
-#   1. every plugin that has an out-of-process manifest is on the list;
-#   2. every list entry has its manifest, privileges file and crate, with
-#      the crate name, the wire binary and any feature spelled as the
-#      crate declares them;
+#   1. every plugin that has an out-of-process manifest is on the list, or
+#      on the staged list of plugins deliberately not shipped yet (which the
+#      bundle, the redeploy and the published pieces never read);
+#   2. every entry of either list has its manifest, privileges file and
+#      crate, with the crate name, the wire binary and any feature spelled as
+#      the crate declares them;
 #   3. a crate that declares the ALSA device feature is built with it;
-#   4. the expected-count constant is the list's length.
+#   4. no plugin is on both lists, or twice;
+#   5. the expected-count constant is the shipped list's length.
 #
 # It reads only the repository; it needs python3 (3.11 or newer) for TOML.
 
@@ -35,8 +38,14 @@ bad() { echo "FAIL  $1"; FAIL=$((FAIL + 1)); }
 # shellcheck source=../lib/oop-plugins.sh
 source "$LIST"
 
-# Names on the list, one per line.
-listed="$(for e in "${OOP_PLUGINS[@]}"; do echo "${e%%:*}"; done | sort)"
+# Staged plugins: in the tree, deliberately not shipped. May be absent.
+STAGED=("${OOP_PLUGINS_STAGED[@]+"${OOP_PLUGINS_STAGED[@]}"}")
+[[ -n "${STAGED[*]-}" ]] || STAGED=()
+
+# Names on the shipped list, and on either list, one per line.
+shipped="$(for e in "${OOP_PLUGINS[@]}"; do echo "${e%%:*}"; done | sort)"
+staged="$(for e in "${STAGED[@]+"${STAGED[@]}"}"; do [[ -n "$e" ]] && echo "${e%%:*}"; done | sort)"
+listed="$(printf '%s\n%s\n' "$shipped" "$staged" | grep . | sort)"
 # Plugins in the tree that ship out of process.
 in_tree="$(cd "$PLUGINS_DIR" && for d in */; do
     d="${d%/}"
@@ -46,29 +55,29 @@ done | sort)"
 # 1. nothing in the tree is missing from the list
 missing="$(comm -13 <(echo "$listed") <(echo "$in_tree"))"
 if [[ -z "$missing" ]]; then
-    ok "every plugin with an out-of-process manifest is on the ship list"
+    ok "every plugin with an out-of-process manifest is on the ship list or the staged list"
 else
-    bad "plugins in the tree but not on the ship list (never shipped, deleted by a redeploy): $(echo "$missing" | tr '\n' ' ')"
+    bad "plugins in the tree but on neither list (never shipped, deleted by a redeploy): $(echo "$missing" | tr '\n' ' ')"
 fi
 
 # 2a. nothing on the list is missing from the tree
 extra="$(comm -23 <(echo "$listed") <(echo "$in_tree"))"
 if [[ -z "$extra" ]]; then
-    ok "every ship-list entry has an out-of-process manifest in the tree"
+    ok "every listed entry has an out-of-process manifest in the tree"
 else
-    bad "ship-list entries with no manifest.oop.toml: $(echo "$extra" | tr '\n' ' ')"
+    bad "listed entries with no manifest.oop.toml: $(echo "$extra" | tr '\n' ' ')"
 fi
 
 # no name twice
 dups="$(echo "$listed" | uniq -d)"
 if [[ -z "$dups" ]]; then
-    ok "no plugin is on the ship list twice"
+    ok "no plugin is on the lists twice, or on both"
 else
-    bad "plugins on the ship list twice: $(echo "$dups" | tr '\n' ' ')"
+    bad "plugins listed twice, or on both the ship list and the staged list: $(echo "$dups" | tr '\n' ' ')"
 fi
 
 # 2b/3. each entry's crate, wire binary, feature and privileges file
-report="$(python3 - "$PLUGINS_DIR" "${OOP_PLUGINS[@]}" <<'PY'
+report="$(python3 - "$PLUGINS_DIR" "${OOP_PLUGINS[@]}" "${STAGED[@]+"${STAGED[@]}"}" <<'PY'
 import sys, tomllib, os
 root, entries = sys.argv[1], sys.argv[2:]
 for e in entries:
@@ -102,12 +111,13 @@ else
     bad "entry does not match its crate: $(echo "$report" | tr '\n' ';')"
 fi
 
-# 4. the expected count is the list
+# 5. the expected count is the shipped list; the tree is shipped plus staged
+n_staged="$(echo "$staged" | grep -c . || true)"
 if [[ "$OOP_PLUGINS_EXPECTED_COUNT" -eq "${#OOP_PLUGINS[@]}" ]] \
-    && [[ "$OOP_PLUGINS_EXPECTED_COUNT" -eq "$(echo "$in_tree" | grep -c .)" ]]; then
-    ok "the expected-count constant (${OOP_PLUGINS_EXPECTED_COUNT}) is the length of the list and the number of plugins in the tree"
+    && [[ "$(( OOP_PLUGINS_EXPECTED_COUNT + n_staged ))" -eq "$(echo "$in_tree" | grep -c .)" ]]; then
+    ok "the expected-count constant (${OOP_PLUGINS_EXPECTED_COUNT}) is the length of the ship list, and with the ${n_staged} staged it is the number of plugins in the tree"
 else
-    bad "expected count ${OOP_PLUGINS_EXPECTED_COUNT}, list ${#OOP_PLUGINS[@]}, tree $(echo "$in_tree" | grep -c .)"
+    bad "expected count ${OOP_PLUGINS_EXPECTED_COUNT}, ship list ${#OOP_PLUGINS[@]}, staged ${n_staged}, tree $(echo "$in_tree" | grep -c .)"
 fi
 
 echo ""

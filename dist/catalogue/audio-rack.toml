@@ -79,9 +79,12 @@ plugin per protocol with disjoint verb sets. The DLNA renderer \
 / enable / disable and publishes audio_receiver_dlna. The \
 AirPlay receiver (org.evoframework.receiver.airplay) stocks \
 receiver.airplay.get_state / enable / disable and publishes \
-audio_receiver_airplay. Default disabled; enabling is a write \
-under network_admin. Orthogonal to audio.dlna, the MediaServer \
-client.
+audio_receiver_airplay. The Bluetooth sink \
+(org.evoframework.receiver.bluetooth) stocks \
+receiver.bluetooth.get_state / enable / disable / start_pairing / \
+stop_pairing / forget_device and publishes audio_receiver_bluetooth. \
+Default disabled; enabling is a write under network_admin. \
+Orthogonal to audio.dlna, the MediaServer client.
 """
 
 [[racks.shelves]]
@@ -962,6 +965,17 @@ name = "audio_receiver_dlna"
 # Republished on every transition.
 [[subjects]]
 name = "audio_receiver_airplay"
+
+# Published by `org.evoframework.receiver.bluetooth`: singleton
+# `audio_receiver_bluetooth` carrying the sink's state
+# (disabled / starting / ready / pairing / connected / degraded +
+# reason), the operator switch, the name a phone shows, the radio
+# (present, powered, address), the pairing window while one is open
+# (when it closes) and the devices the host stack knows (address,
+# name, paired, connected). Never a link key. Republished on every
+# transition.
+[[subjects]]
+name = "audio_receiver_bluetooth"
 
 # Published by `org.evoframework.storage.usb`: singleton
 # `storage_usb_drives` carrying the full USB-drive inventory

@@ -1,0 +1,62 @@
+# org.evoframework.receiver.bluetooth: the device as a Bluetooth audio sink.
+#
+# The plugin owns the sink. It registers an A2DP sink endpoint and a pairing
+# agent with the platform's Bluetooth stack over the system message bus, owns
+# the pairing window and the paired-device list, and publishes honest state.
+# There is no separate Bluetooth audio daemon. Disabled by default; nothing is
+# registered and the adapter is neither discoverable nor pairable while
+# disabled.
+[plugin]
+name = "org.evoframework.receiver.bluetooth"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "audio.receiver"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+evo_min_version = "0.1.12"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 32
+max_cpu_percent = 10
+
+[lifecycle]
+mode = "reload-cleanable"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = [
+    "receiver.bluetooth.get_state",
+    "receiver.bluetooth.enable",
+    "receiver.bluetooth.disable",
+    "receiver.bluetooth.start_pairing",
+    "receiver.bluetooth.stop_pairing",
+    "receiver.bluetooth.forget_device",
+]
+response_budget_ms = 10000
+
+[capabilities.respondent.verb_capabilities]
+"receiver.bluetooth.get_state" = { kind = "none" }
+"receiver.bluetooth.enable" = { kind = "write", scope = "network_admin" }
+"receiver.bluetooth.disable" = { kind = "write", scope = "network_admin" }
+"receiver.bluetooth.start_pairing" = { kind = "write", scope = "network_admin" }
+"receiver.bluetooth.stop_pairing" = { kind = "write", scope = "network_admin" }
+"receiver.bluetooth.forget_device" = { kind = "write", scope = "network_admin" }
