@@ -129,6 +129,10 @@ pub(crate) struct PlaylistContext {
     /// Scan-time local artwork hashes carried on list rows as
     /// `artwork_hash`. See [`crate::artwork_hash`].
     pub(crate) artwork_hashes: crate::artwork_hash::ArtworkHashIndex,
+    /// What streams were last known by; shared with the queue. MPD
+    /// reads no tag from an HTTP stream, so a stored playlist of bare
+    /// URLs lists them untitled unless this says otherwise.
+    pub(crate) stream_tags: crate::stream_tags::StreamTagStore,
 }
 
 impl PlaylistContext {
@@ -152,7 +156,19 @@ impl PlaylistContext {
             item_count_cache: Arc::new(Mutex::new(HashMap::new())),
             shelf_dispatcher,
             artwork_hashes: Default::default(),
+            stream_tags: Default::default(),
         }
+    }
+
+    /// Share what streams are called with the queue, so a stored
+    /// playlist's view names a stream the plugin has seen. Without
+    /// this the context knows no stream and lists them bare.
+    pub(crate) fn with_stream_tags(
+        mut self,
+        store: crate::stream_tags::StreamTagStore,
+    ) -> Self {
+        self.stream_tags = store;
+        self
     }
 
     /// Share the scan-time artwork hash index. Without this the
@@ -358,7 +374,9 @@ async fn build_get_playlist_envelope(
     entries: &[MpdPlaylistEntry],
 ) -> serde_json::Value {
     let mut rendered = Vec::with_capacity(entries.len());
-    for entry in entries {
+    for listed in entries {
+        let named = named_from_memory(&ctx.stream_tags, listed);
+        let entry = &named;
         let source_id = resolve_source(
             &ctx.music_directory,
             &entry.file_path,
@@ -413,6 +431,28 @@ async fn build_get_playlist_envelope(
         "items":      rendered,
         "item_count": entries.len(),
     })
+}
+
+/// `entry` with what the plugin knows its stream by put in the fields
+/// MPD left empty. MPD reads no tag from an HTTP stream, so a stored
+/// playlist of bare URLs lists them untitled; the queue keeps their
+/// tags on its own rows and the plugin remembers them by URL. A field
+/// MPD did state stands, a library row is never read from the memory,
+/// and a stream the plugin has not seen stays as MPD gave it: nothing
+/// is made up.
+fn named_from_memory(
+    memory: &crate::stream_tags::StreamTagStore,
+    entry: &MpdPlaylistEntry,
+) -> MpdPlaylistEntry {
+    let mut named = entry.clone();
+    let Some(known) = memory.get(&entry.file_path) else {
+        return named;
+    };
+    named.title = named.title.or(known.title);
+    named.artist = named.artist.or(known.artist);
+    named.album = named.album.or(known.album);
+    named.classical.composer = named.classical.composer.or(known.composer);
+    named
 }
 
 async fn compute_available(
@@ -1447,6 +1487,118 @@ mod tests {
             playlists,
             commands,
         }
+    }
+
+    // ----- a stored playlist's view names the streams it knows -----
+
+    const PLEX_URL: &str = "http://192.0.2.9:32469/object/aaa/file.mp3";
+
+    fn bare_entry(position: u32, uri: &str) -> MpdPlaylistEntry {
+        MpdPlaylistEntry {
+            position,
+            file_path: uri.to_string(),
+            title: None,
+            artist: None,
+            album: None,
+            duration: None,
+            classical: Default::default(),
+        }
+    }
+
+    fn known_stream(title: &str) -> crate::stream_tags::StreamTags {
+        crate::stream_tags::StreamTags {
+            title: Some(title.to_string()),
+            artist: Some("The Artist".to_string()),
+            album: Some("The Album".to_string()),
+            composer: Some("The Composer".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// The view of `entries` as the verb builds it, with `store` as
+    /// the plugin's memory.
+    async fn view_of(
+        store: crate::stream_tags::StreamTagStore,
+        entries: Vec<MpdPlaylistEntry>,
+    ) -> Vec<serde_json::Value> {
+        let mut h = create_harness(stock_library(), Vec::new()).await;
+        h.ctx = h.ctx.clone().with_stream_tags(store);
+        let env =
+            build_get_playlist_envelope(&h.ctx, &mut h.conn, "Plex", &entries)
+                .await;
+        env["items"].as_array().cloned().expect("items")
+    }
+
+    #[tokio::test]
+    async fn a_bare_stream_row_is_listed_by_what_the_plugin_knows_it_as() {
+        let store = crate::stream_tags::StreamTagStore::default();
+        store.remember(PLEX_URL, known_stream("Remembered title"));
+        let items = view_of(store, vec![bare_entry(0, PLEX_URL)]).await;
+        assert_eq!(items[0]["title"], "Remembered title");
+        assert_eq!(items[0]["artist"], "The Artist");
+        assert_eq!(items[0]["album"], "The Album");
+        assert_eq!(items[0]["composer"], "The Composer");
+        assert_eq!(items[0]["uri"], PLEX_URL, "the row is still that URL");
+        assert_eq!(items[0]["position"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_stream_the_plugin_never_saw_is_listed_without_a_title() {
+        let store = crate::stream_tags::StreamTagStore::default();
+        store.remember(PLEX_URL, known_stream("Someone else"));
+        let other = "http://192.0.2.9:32469/object/zzz/file.mp3";
+        let items = view_of(store, vec![bare_entry(0, other)]).await;
+        assert!(items[0]["title"].is_null(), "no title is made up");
+        assert!(items[0]["artist"].is_null());
+        assert!(items[0]["album"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_library_row_is_listed_exactly_as_mpd_gave_it() {
+        // The memory never keeps a library path, and a row of the
+        // library is never read from it.
+        let store = crate::stream_tags::StreamTagStore::default();
+        store.remember("INTERNAL/a.flac", known_stream("Not for the library"));
+        let mut own = bare_entry(0, "INTERNAL/a.flac");
+        own.title = Some("Its own".to_string());
+        let untagged = bare_entry(1, "INTERNAL/b.flac");
+        let items = view_of(store, vec![own, untagged]).await;
+        assert_eq!(items[0]["title"], "Its own");
+        assert!(items[0]["artist"].is_null());
+        assert!(items[1]["title"].is_null());
+    }
+
+    #[tokio::test]
+    async fn what_mpd_already_said_about_a_stream_is_not_replaced() {
+        let store = crate::stream_tags::StreamTagStore::default();
+        store.remember(PLEX_URL, known_stream("Remembered title"));
+        let mut tagged = bare_entry(0, PLEX_URL);
+        tagged.title = Some("MPD's title".to_string());
+        let items = view_of(store, vec![tagged]).await;
+        assert_eq!(items[0]["title"], "MPD's title", "MPD's word stands");
+        assert_eq!(
+            items[0]["artist"], "The Artist",
+            "what MPD left out is filled in"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_playlist_of_streams_and_local_rows_is_each_row_by_its_own() {
+        let store = crate::stream_tags::StreamTagStore::default();
+        store.remember(PLEX_URL, known_stream("Remembered title"));
+        let items = view_of(
+            store,
+            vec![
+                bare_entry(0, "INTERNAL/a.flac"),
+                bare_entry(1, PLEX_URL),
+                bare_entry(2, "http://192.0.2.9:32469/object/zzz/file.mp3"),
+            ],
+        )
+        .await;
+        assert!(items[0]["title"].is_null());
+        assert_eq!(items[1]["title"], "Remembered title");
+        assert!(items[2]["title"].is_null());
+        assert_eq!(items.len(), 3);
     }
 
     /// A library whose first song sits one directory down, the

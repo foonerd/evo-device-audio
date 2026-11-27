@@ -206,6 +206,11 @@ impl ShelfBundle {
         );
 
         // Construct each shelf's context.
+        // One memory of what streams are called, shared by the queue
+        // and the stored playlists' view.
+        let stream_tags = crate::stream_tags::StreamTagStore::at(
+            state_dir.join("stream-tags.toml"),
+        );
         let queue = QueueContext::new(
             music_directory.clone(),
             registry.clone(),
@@ -218,9 +223,7 @@ impl ShelfBundle {
         .with_last_queue_store(crate::last_queue::LastQueueStore::at(
             state_dir.join("last-queue.toml"),
         ))
-        .with_stream_tags(crate::stream_tags::StreamTagStore::at(
-            state_dir.join("stream-tags.toml"),
-        ))
+        .with_stream_tags(stream_tags.clone())
         .with_artwork_hashes(artwork_hashes.clone());
         let playlist = PlaylistContext::new(
             music_directory.clone(),
@@ -229,6 +232,7 @@ impl ShelfBundle {
             DEFAULT_FAVOURITES_PLAYLIST_NAME.to_string(),
             shelf_dispatcher.clone(),
         )
+        .with_stream_tags(stream_tags)
         .with_artwork_hashes(artwork_hashes.clone());
         let favourites = FavouritesContext::new(
             music_directory.clone(),
@@ -1980,6 +1984,31 @@ mod tests {
         assert_eq!(
             again.get(url).and_then(|t| t.title).as_deref(),
             Some("Kept at stop")
+        );
+    }
+
+    /// The stored playlists' view and the queue read one memory of what
+    /// streams are called: what the queue learns, the view names.
+    #[tokio::test]
+    async fn the_playlist_view_and_the_queue_share_what_streams_are_called() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = live_bundle(dir.path()).await;
+        let url = "http://192.0.2.9:32469/object/aaa/file.mp3";
+        bundle.queue.stream_tags.remember(
+            url,
+            crate::stream_tags::StreamTags {
+                title: Some("Shared title".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            bundle
+                .playlist
+                .stream_tags
+                .get(url)
+                .and_then(|t| t.title)
+                .as_deref(),
+            Some("Shared title")
         );
     }
 

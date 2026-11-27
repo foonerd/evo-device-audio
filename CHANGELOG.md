@@ -4,6 +4,13 @@ All notable changes to evo-device-audio are recorded here.
 
 ## Unreleased
 
+- Stored playlists: a playlist's view lists a network stream by the title,
+  artist, album and composer the player last knew it by, where the server
+  gave the playlist none (MPD reads no tag from an HTTP stream, so a saved
+  playlist of DLNA tracks showed bare addresses). Only fields MPD left empty
+  are filled; a library row is listed as MPD gives it, and a stream the
+  player has never seen is still listed without a title.
+  `org.evoframework.playback.mpd` is 0.1.4.
 - Backup restore: the mixer (`mixer_type`, `mixer_device`, `mixer_control`)
   goes back whole or not at all. A hardware mixer is put back only if the
   device has that control on that card (read through `delivery.list_mixers`);
