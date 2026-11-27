@@ -47,7 +47,9 @@ pub trait Pcm: Send + 'static {
     /// Write as many of `samples` as fit without blocking; the number of
     /// samples taken is returned. A whole number of frames is taken.
     fn write(&mut self, samples: &[i16]) -> Result<usize, PcmError>;
-    /// Wait up to `slice` for room.
+    /// Wait up to `slice` for room. A device that ran dry while waited on
+    /// is made ready again and this returns `Ok`; only a device that is
+    /// really gone fails.
     fn wait(&mut self, slice: Duration) -> Result<(), PcmError>;
     /// Throw away whatever is queued and make the device ready again.
     fn flush(&mut self) -> Result<(), PcmError>;
@@ -261,6 +263,17 @@ mod alsa_device {
         channels: usize,
     }
 
+    impl AlsaPcm {
+        /// Put a device error right (an underrun or a suspend are routine on
+        /// a loaded machine); `Underrun` says it was, `Failed` says it was not.
+        fn recovered(&self, e: alsa::Error) -> PcmError {
+            match self.pcm.try_recover(e, true) {
+                Ok(()) => PcmError::Underrun,
+                Err(e) => PcmError::Failed(e.to_string()),
+            }
+        }
+    }
+
     impl Pcm for AlsaPcm {
         fn write(&mut self, samples: &[i16]) -> Result<usize, PcmError> {
             let whole = samples.len() - samples.len() % self.channels;
@@ -274,19 +287,22 @@ mod alsa_device {
             match io.writei(&samples[..whole]) {
                 Ok(frames) => Ok(frames * self.channels),
                 Err(e) if e.errno() == EAGAIN => Err(PcmError::Full),
-                Err(e) => match self.pcm.try_recover(e, true) {
-                    Ok(()) => Err(PcmError::Underrun),
-                    Err(e) => Err(PcmError::Failed(e.to_string())),
-                },
+                Err(e) => Err(self.recovered(e)),
             }
         }
 
         fn wait(&mut self, slice: Duration) -> Result<(), PcmError> {
             let ms = u32::try_from(slice.as_millis()).unwrap_or(u32::MAX);
-            self.pcm
-                .wait(Some(ms))
-                .map(|_| ())
-                .map_err(|e| PcmError::Failed(e.to_string()))
+            match self.pcm.wait(Some(ms)) {
+                Ok(_) => Ok(()),
+                // The device can run dry (or be suspended) while it is
+                // waited on, not only while it is written: that costs a
+                // moment of silence, not the stream.
+                Err(e) => match self.recovered(e) {
+                    PcmError::Underrun => Ok(()),
+                    failed => Err(failed),
+                },
+            }
         }
 
         fn flush(&mut self) -> Result<(), PcmError> {
@@ -322,6 +338,8 @@ pub(crate) mod fake {
         pub room: Option<usize>,
         /// Answers to give before behaving, front first.
         pub script: VecDeque<PcmError>,
+        /// Answers `wait` gives before behaving, front first.
+        pub wait_script: VecDeque<PcmError>,
         /// How many times the sink waited.
         pub waits: usize,
         /// How many times the device was flushed.
@@ -351,9 +369,13 @@ pub(crate) mod fake {
         fn wait(&mut self, _: Duration) -> Result<(), PcmError> {
             let mut d = self.0.lock().unwrap();
             d.waits += 1;
+            let scripted = d.wait_script.pop_front();
             drop(d);
             std::thread::sleep(Duration::from_millis(2));
-            Ok(())
+            match scripted {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
         }
 
         fn flush(&mut self) -> Result<(), PcmError> {
@@ -488,6 +510,43 @@ mod tests {
         let audio: Vec<i16> = (0..100).collect();
         s.write(&audio);
         assert_eq!(d.lock().unwrap().taken, audio);
+    }
+
+    #[test]
+    fn a_device_that_runs_dry_while_waited_on_does_not_end_the_stream() {
+        let d = device();
+        {
+            let mut dev = d.lock().unwrap();
+            dev.room = Some(0);
+            dev.wait_script.push_back(PcmError::Underrun);
+            dev.wait_script.push_back(PcmError::Underrun);
+        }
+        let (mut s, mut rx) = sink(&d);
+        let opener = {
+            let d = d.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                d.lock().unwrap().room = None;
+            })
+        };
+        let audio: Vec<i16> = (0..64).collect();
+        s.write(&audio);
+        opener.join().unwrap();
+        assert_eq!(d.lock().unwrap().taken, audio, "nothing lost");
+        assert!(rx.try_recv().is_err(), "an underrun is not a failure");
+    }
+
+    #[test]
+    fn a_device_that_fails_while_waited_on_is_reported() {
+        let d = device();
+        {
+            let mut dev = d.lock().unwrap();
+            dev.room = Some(0);
+            dev.wait_script.push_back(PcmError::Failed("gone".into()));
+        }
+        let (mut s, mut rx) = sink(&d);
+        s.write(&[1, 2, 3, 4]);
+        assert_eq!(rx.try_recv(), Ok(Note::WriteFailed("gone".into())));
     }
 
     #[test]
