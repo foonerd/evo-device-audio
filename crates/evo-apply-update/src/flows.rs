@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 
 //! End-to-end flows over fakes: a signed registry and carrier served from
 //! a map, a host that records what it was asked, and real directories in a

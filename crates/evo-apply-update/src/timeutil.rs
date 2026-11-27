@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 
 //! UTC time without a time crate: epoch seconds to and from the
 //! `YYYY-MM-DDTHH:MM:SSZ` form the documents use.

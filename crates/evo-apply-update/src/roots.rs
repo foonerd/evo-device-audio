@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 
 //! Where the worker reads and writes, and the check that those places are
 //! root-owned all the way up. The service user owns

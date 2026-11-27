@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 
 //! The closed request grammar. The caller supplies a
 //! component name, a version and a channel value, and nothing else. The

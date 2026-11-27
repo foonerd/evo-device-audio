@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Just a Nerd
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 
 //! Inbound-pump task: bridges the audio-plane's
 //! `DomainWitnessInbound` broadcast channel into the

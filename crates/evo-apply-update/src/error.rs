@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 
 //! The one error type: a stable machine code and a human detail.
 

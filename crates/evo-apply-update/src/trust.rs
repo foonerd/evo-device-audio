@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 
 //! The worker's trust roots: Ed25519 public keys in a root-owned directory,
 //! each with a sidecar naming the plugin names it may sign for (the same

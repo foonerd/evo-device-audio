@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 
 //! What the worker asks of the host: the service user, a steward restart,
 //! whether a plugin is admitted again, a sudoers syntax check, and the

@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 use std::path::PathBuf;
 use std::process::Command;
 

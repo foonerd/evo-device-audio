@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Just a Nerd
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 
 //! The two audio chains this distribution publishes, and the
 //! controller that picks between them.

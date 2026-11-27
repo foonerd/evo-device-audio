@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 
 //! The two signed documents the worker reads, and the worker's own config
 //! files. Parsing is separate from verifying: [`verify_document`] is the

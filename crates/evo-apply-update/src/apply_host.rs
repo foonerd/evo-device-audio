@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 
 //! Apply the signed host-files carrier: the
 //! wrappers and sudoers drop-ins `dist/` ships, then `installed.toml`

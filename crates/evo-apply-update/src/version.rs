@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 
 //! Dotted numeric versions. The train's versions have four parts
 //! (`0.1.13.1`), which semver does not accept, so they are compared here.

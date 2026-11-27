@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 
 //! The check: fetch and verify the recorded channel's registry and
 //! host-files document, and say what is offered and why. Nothing is installed.

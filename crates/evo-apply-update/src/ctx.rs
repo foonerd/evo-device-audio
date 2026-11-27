@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 
 //! The worker's dependencies, gathered once so every operation takes one
 //! argument and a test can fake the network and the host.

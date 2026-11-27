@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 
 //! Apply one plugin. The old bundle is kept, the new
 //! one is swapped in by rename, the steward is restarted, and the result is

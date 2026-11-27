@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 
 //! The unit's process: parse the token with the same closed grammar, take
 //! the lock, run one operation, and record how it ended.

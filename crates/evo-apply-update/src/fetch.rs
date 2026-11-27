@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 
 //! Fetching over HTTPS. The worker shells out to `/usr/bin/curl` by
 //! absolute path with a cleared environment: no TLS stack is linked into a

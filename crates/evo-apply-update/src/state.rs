@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 
 //! The worker's state under `/var/lib/evo-updater`: the channel, the last
 //! status and inventory, the history, the record of what it applied, and
