@@ -4024,6 +4024,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "org-evoframework-receiver-airplay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "evo-airplay",
+ "evo-plugin-sdk",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "zbus",
+]
+
+[[package]]
 name = "org-evoframework-receiver-dlna"
 version = "0.1.0"
 dependencies = [

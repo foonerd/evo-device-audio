@@ -1,0 +1,55 @@
+# org.evoframework.receiver.airplay: the device as an AirPlay 2 audio receiver.
+#
+# The plugin owns the receiver. It binds the control port, registers the
+# device with the local mDNS daemon, filters peers to the local network,
+# admits one stream at a time and holds the pairing password. There is no
+# external AirPlay daemon. Disabled by default; no socket is open and
+# nothing is registered while disabled.
+[plugin]
+name = "org.evoframework.receiver.airplay"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "audio.receiver"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+evo_min_version = "0.1.12"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 48
+max_cpu_percent = 10
+
+[lifecycle]
+mode = "reload-cleanable"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = [
+    "receiver.airplay.get_state",
+    "receiver.airplay.enable",
+    "receiver.airplay.disable",
+]
+response_budget_ms = 10000
+
+[capabilities.respondent.verb_capabilities]
+"receiver.airplay.get_state" = { kind = "none" }
+"receiver.airplay.enable" = { kind = "write", scope = "network_admin" }
+"receiver.airplay.disable" = { kind = "write", scope = "network_admin" }

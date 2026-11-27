@@ -76,9 +76,12 @@ Audio receivers: the device as a network target that other \
 players send audio to. Multi-occupant respondent shelf, one \
 plugin per protocol with disjoint verb sets. The DLNA renderer \
 (org.evoframework.receiver.dlna) stocks receiver.dlna.get_state \
-/ enable / disable and publishes audio_receiver_dlna. Default \
-disabled; enabling is a write under network_admin. Orthogonal \
-to audio.dlna, the MediaServer client.
+/ enable / disable and publishes audio_receiver_dlna. The \
+AirPlay receiver (org.evoframework.receiver.airplay) stocks \
+receiver.airplay.get_state / enable / disable and publishes \
+audio_receiver_airplay. Default disabled; enabling is a write \
+under network_admin. Orthogonal to audio.dlna, the MediaServer \
+client.
 """
 
 [[racks.shelves]]
@@ -949,6 +952,16 @@ name = "system_smb_server"
 # the description port. Republished on every transition.
 [[subjects]]
 name = "audio_receiver_dlna"
+
+# Published by `org.evoframework.receiver.airplay`: singleton
+# `audio_receiver_airplay` carrying the receiver's state
+# (disabled / starting / advertising / session / degraded +
+# reason), the operator switch, the friendly name, the control
+# port, whether the receiver is open (no password) and, while a
+# sender is streaming, its address. Never the password.
+# Republished on every transition.
+[[subjects]]
+name = "audio_receiver_airplay"
 
 # Published by `org.evoframework.storage.usb`: singleton
 # `storage_usb_drives` carrying the full USB-drive inventory

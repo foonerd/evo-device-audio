@@ -1,0 +1,45 @@
+schema_version: "1.0"
+plugin: org.evoframework.receiver.airplay
+owner: evo-device-audio
+isolation: oop
+has_os_dependencies: false
+
+# Out-of-process plugin shipped as a signed bundle. The plugin is the
+# receiver: it needs no host binary, no systemd unit and no sudo. While
+# enabled it holds one network listener, one connection to the system
+# message bus, and nothing else outside its own state and credentials
+# directories:
+#
+#   - TCP, one persisted port at or above 1024, for the AirPlay control
+#     connection, plus the per-session event, control and audio ports the
+#     receiver opens while a sender is streaming;
+#   - the system message bus, to register `_airplay._tcp` and `_raop._tcp`
+#     with the local mDNS daemon and withdraw them again.
+#
+# Peers are accepted from the local network only (RFC1918, loopback,
+# link-local, unique-local). Nothing is open and nothing is registered
+# while the plugin is disabled, which is the default.
+
+capability_intent:
+  - id: control_listener
+    need: bind one TCP port at or above 1024 on all interfaces for the AirPlay control connection, and ephemeral UDP and TCP ports at or above 1024 for the streams of a session, answering local-network peers only.
+    access_path: direct socket
+    failure_mode: bind failure leaves the plugin enabled but degraded with reason `port_bind_failed`; nothing is advertised without a listener to point at.
+  - id: mdns_registration
+    need: connect to the system message bus and ask the local mDNS daemon to publish `_airplay._tcp` and `_raop._tcp` for the device, and to withdraw them.
+    access_path: system message bus
+    failure_mode: the daemon being absent or refusing leaves the plugin enabled but degraded with reason `avahi_unavailable`; the listener is closed, registration is retried, and nothing is left half open.
+
+required_binaries: []
+
+required_kernel_modules: []
+
+required_system_services: []
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+  expected:
+    - state directory exists as the steward identity
+
+host_provisioning: {}
