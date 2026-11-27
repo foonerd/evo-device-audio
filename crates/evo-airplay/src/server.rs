@@ -271,23 +271,31 @@ async fn host_ended(slot: &mut Option<tokio::sync::oneshot::Receiver<()>>) {
 }
 
 fn log_request(peer: &SocketAddr, request: &Request, encrypted: bool) {
+    for line in request_log_lines(peer, request, encrypted) {
+        debug!("{line}");
+    }
+}
+
+/// What is written to the debug log about a request: its line, its headers
+/// and the size of its body. Never the body: it can carry the pairing proof or
+/// the stream key, and a log is readable by more people than the session is.
+fn request_log_lines(
+    peer: &SocketAddr,
+    request: &Request,
+    encrypted: bool,
+) -> Vec<String> {
     let lock = if encrypted { " [enc]" } else { "" };
-    debug!(
+    let mut lines = vec![format!(
         "[{peer}]{lock} {} {} {}",
         request.method, request.target, request.protocol
-    );
+    )];
     for (name, value) in request.headers.iter() {
-        debug!("[{peer}]   {name}: {value}");
+        lines.push(format!("[{peer}]   {name}: {value}"));
     }
     if !request.body.is_empty() {
-        // Dump the body as hex so the real request contents (SETUP plists,
-        // pairing TLVs) can be inspected offline during bring-up.
-        debug!(
-            "[{peer}]   body ({} bytes): {}",
-            request.body.len(),
-            hex::encode(&request.body)
-        );
+        lines.push(format!("[{peer}]   body: {} bytes", request.body.len()));
     }
+    lines
 }
 
 /// Handle the streaming-session methods (SETUP and the control verbs) that
@@ -383,4 +391,28 @@ fn finalize(mut response: Response, request: &Request) -> Response {
         response = response.header("CSeq", cseq);
     }
     response.header("Server", SERVER_ID)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::parse_head;
+
+    #[test]
+    fn a_request_body_is_never_written_to_the_log() {
+        let (method, target, protocol, headers) = parse_head(
+            "POST /pair-setup RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 6",
+        )
+        .unwrap();
+        let secret = vec![0xde, 0xad, 0xbe, 0xef, 0x12, 0x34];
+        let request =
+            Request::from_parts(method, target, protocol, headers, secret);
+        let peer: SocketAddr = "192.168.1.9:50000".parse().unwrap();
+        let lines = request_log_lines(&peer, &request, true).join("\n");
+        assert!(lines.contains("POST /pair-setup RTSP/1.0"));
+        assert!(lines.contains("body: 6 bytes"));
+        for leak in ["deadbeef", "DEADBEEF", "de ad", "0xde", "[222"] {
+            assert!(!lines.contains(leak), "the log shows body bytes: {lines}");
+        }
+    }
 }

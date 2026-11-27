@@ -44,9 +44,14 @@ impl AudioDecryptor {
         if packet.len() < HEADER_LEN + NONCE_SUFFIX_LEN + TAG_LEN {
             return None;
         }
-        let seq = packet_seq(packet).unwrap();
-        let timestamp = u32::from_be_bytes(packet[4..8].try_into().unwrap());
-        let ssrc = u32::from_be_bytes(packet[8..12].try_into().unwrap());
+        let (seq, timestamp, ssrc) = match packet {
+            [s0, s1, s2, s3, t0, t1, t2, t3, r0, r1, r2, r3, ..] => (
+                u32::from_be_bytes([*s0, *s1, *s2, *s3]) & 0xFF_FFFF,
+                u32::from_be_bytes([*t0, *t1, *t2, *t3]),
+                u32::from_be_bytes([*r0, *r1, *r2, *r3]),
+            ),
+            _ => return None,
+        };
 
         let nonce_start = packet.len() - NONCE_SUFFIX_LEN;
         let mut nonce = [0u8; 12];
@@ -77,10 +82,12 @@ impl AudioDecryptor {
 /// decrypting — used to drop packets below a `FLUSHBUFFERED` boundary cheaply.
 /// Returns `None` if the packet is too short to hold a header.
 pub fn packet_seq(packet: &[u8]) -> Option<u32> {
-    if packet.len() < 4 {
-        return None;
+    match packet {
+        [a, b, c, d, ..] => {
+            Some(u32::from_be_bytes([*a, *b, *c, *d]) & 0xFF_FFFF)
+        }
+        _ => None,
     }
-    Some(u32::from_be_bytes(packet[0..4].try_into().unwrap()) & 0xFF_FFFF)
 }
 
 /// Split a buffer of TCP bytes into complete `[u16 len][packet]` blocks,

@@ -243,7 +243,11 @@ impl Position {
     /// Note that the audio at `ts` is playing, and report the position when
     /// the displayed second changes.
     fn played(&mut self, ts: u32) {
-        let Some(track) = *self.track.lock().unwrap() else {
+        let Some(track) = *self
+            .track
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        else {
             return; // the sender hasn't said where the track starts
         };
         let Some((elapsed, duration)) = extent(track, ts, self.rate) else {

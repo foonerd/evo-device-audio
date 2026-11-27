@@ -64,6 +64,8 @@ mod decode;
 mod dmap;
 mod events;
 mod fairplay;
+#[cfg(test)]
+mod hostile;
 mod http;
 mod identity;
 mod info;

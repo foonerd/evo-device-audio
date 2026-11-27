@@ -498,7 +498,13 @@ impl Session {
         for line in text.lines() {
             let line = line.trim();
             if let Some(v) = line.strip_prefix("volume:") {
-                if let Ok(db) = v.trim().parse::<f32>() {
+                // A number the host can use: AirPlay volume runs from 0 dB
+                // (full) down to -144 dB (mute). "NaN" and "inf" parse as
+                // floats and are not volumes.
+                if let Some(db) =
+                    v.trim().parse::<f32>().ok().filter(|db| db.is_finite())
+                {
+                    let db = db.clamp(-144.0, 0.0);
                     self.volume = db;
                     debug!("SET_PARAMETER volume {db} dB");
                     self.send_event(Event::Volume { db });
@@ -525,7 +531,8 @@ impl Session {
             debug!("SET_PARAMETER progress: unparseable value {value:?}");
             return;
         };
-        *self.track.lock().unwrap() = Some(Track { start, end });
+        *self.track.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(Track { start, end });
         if !self.session_active {
             return; // a position without a stream means nothing
         }
@@ -712,7 +719,7 @@ fn aac_params(_audio_format: Option<u64>) -> (u32, u8) {
 
 /// Parse a `SETRATEANCHORTIME` plist into `(rate, rtpTime)`. `rate` is 0
 /// (pause) or 1 (play); `rtpTime` is the anchor timestamp.
-fn parse_rate_anchor(body: &[u8]) -> Option<(u64, u64)> {
+pub(crate) fn parse_rate_anchor(body: &[u8]) -> Option<(u64, u64)> {
     let value = Value::from_reader(io::Cursor::new(body)).ok()?;
     let dict = value.as_dictionary()?;
     let rate = dict.get("rate").and_then(int_field)?;
@@ -728,7 +735,7 @@ fn int_field(v: &Value) -> Option<u64> {
 
 /// Parse a `FLUSHBUFFERED` plist for its `flushUntilSeq` boundary (drop all
 /// packets with a lower sequence number).
-fn parse_flush_until_seq(body: &[u8]) -> Option<u64> {
+pub(crate) fn parse_flush_until_seq(body: &[u8]) -> Option<u64> {
     let value = Value::from_reader(io::Cursor::new(body)).ok()?;
     value
         .as_dictionary()?
@@ -1270,5 +1277,25 @@ mod tests {
         // No rate field at all → None.
         let empty = encode_plist(&Dictionary::new()).unwrap();
         assert_eq!(parse_rate_anchor(&empty), None);
+    }
+
+    #[tokio::test]
+    async fn a_volume_that_is_not_a_volume_is_not_passed_on() {
+        let (mut session, mut events) = session();
+        for line in ["volume: NaN", "volume: inf", "volume: -inf", "volume: x"]
+        {
+            session.set_parameter(Some("text/parameters"), line.as_bytes());
+        }
+        assert!(events.try_recv().is_err(), "nothing reaches the host");
+        assert_eq!(session.volume, 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_volume_outside_the_range_is_clamped() {
+        let (mut session, mut events) = session();
+        session.set_parameter(Some("text/parameters"), b"volume: 12\r\n");
+        assert_eq!(events.try_recv().unwrap(), Event::Volume { db: 0.0 });
+        session.set_parameter(Some("text/parameters"), b"volume: -900\r\n");
+        assert_eq!(events.try_recv().unwrap(), Event::Volume { db: -144.0 });
     }
 }

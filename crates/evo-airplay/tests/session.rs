@@ -520,3 +520,59 @@ async fn a_success_resets_the_failure_count() {
         "two failures after a success are not a lockout"
     );
 }
+
+#[tokio::test]
+async fn hostile_connections_do_not_disturb_a_running_session() {
+    use rand::{RngCore, SeedableRng};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let (factory, pcm) = capture();
+    let mut h = start(factory, CountingGate::new(false)).await;
+    let (mut sender, reply, ports) = begin(h.addr, 103).await;
+    assert!(reply.is_ok());
+    let ports = ports.expect("ports");
+    sender.record().await.expect("record");
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+    let mut noise = vec![0u8; 4096];
+    rng.fill_bytes(&mut noise);
+    let mut long_head = b"GET /info HTTP/1.1\r\n".to_vec();
+    for _ in 0..4000 {
+        long_head.extend_from_slice(b"X-Pad: padpadpadpad\r\n");
+    }
+    let attacks: Vec<Vec<u8>> = vec![
+        noise,
+        long_head,
+        b"POST /pair-setup RTSP/1.0\r\nContent-Length: 99999999\r\n\r\n".to_vec(),
+        b"POST /pair-setup RTSP/1.0\r\nContent-Length: 4\r\n\r\n\xff\xff\xff\xff"
+            .to_vec(),
+        b"POST /pair-setup RTSP/1.0\r\nContent-Length: -1\r\n\r\n".to_vec(),
+        b"\x00\x01\x02".to_vec(),
+        b"SETUP rtsp://x/1 RTSP/1.0\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        b"\r\n\r\n\r\n\r\n".to_vec(),
+    ];
+    for attack in attacks {
+        let mut hostile = TcpStream::connect(h.addr).await.expect("connect");
+        let _ = hostile.write_all(&attack).await;
+        let _ = hostile.shutdown().await;
+        let mut sink = Vec::new();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(3),
+            hostile.read_to_end(&mut sink),
+        )
+        .await
+        .expect("the receiver must close or answer, not hang");
+    }
+
+    // The session that was playing all along still works.
+    assert!(sender.info().await.expect("info").is_ok());
+    send_all(&sender, ports).await;
+    sender.set_rate(1, 1_000_000).await.expect("rate");
+    eventually("the stream still plays", || {
+        pcm.lock().expect("pcm").len() >= THREE_SECONDS - 4_096
+    })
+    .await;
+    wait_event(&mut h.events, |e| matches!(e, Event::SessionStarted { .. }))
+        .await;
+}

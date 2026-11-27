@@ -24,6 +24,20 @@ pub struct TrackMetadata {
     pub album: Option<String>,
 }
 
+/// The longest metadata string passed on, in bytes. A sender's title is a
+/// display string, not a document.
+const MAX_FIELD_BYTES: usize = 1024;
+
+/// A lossy string, cut to [`MAX_FIELD_BYTES`] at a character boundary.
+fn bounded(payload: &[u8]) -> String {
+    let text = String::from_utf8_lossy(payload);
+    let mut end = text.len().min(MAX_FIELD_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
 /// Extract track metadata from a DMAP payload. Returns `None` when the body
 /// contains no `mlit` container — without it there is nothing recognizable
 /// as a track statement. Strings are converted lossily; malformed trailing
@@ -40,7 +54,7 @@ pub fn parse(body: &[u8]) -> Option<TrackMetadata> {
                     b"asal" => &mut m.album,
                     _ => return,
                 };
-                *field = Some(String::from_utf8_lossy(payload).into_owned());
+                *field = Some(bounded(payload));
             });
         }
     });
@@ -51,10 +65,9 @@ pub fn parse(body: &[u8]) -> Option<TrackMetadata> {
 /// entry whose declared length runs past the end of the data (truncation —
 /// or bytes that are not DMAP at all) ends the walk.
 fn walk(mut data: &[u8], f: &mut impl FnMut([u8; 4], &[u8])) {
-    while data.len() >= 8 {
-        let tag: [u8; 4] = data[..4].try_into().unwrap();
-        let len = u32::from_be_bytes(data[4..8].try_into().unwrap()) as usize;
-        let rest = &data[8..];
+    while let [t0, t1, t2, t3, l0, l1, l2, l3, rest @ ..] = data {
+        let tag = [*t0, *t1, *t2, *t3];
+        let len = u32::from_be_bytes([*l0, *l1, *l2, *l3]) as usize;
         if len > rest.len() {
             return;
         }
@@ -150,5 +163,15 @@ mod tests {
     fn invalid_utf8_is_converted_lossily() {
         let meta = parse(&mlit(&[entry(b"minm", &[0xff, b'A'])])).unwrap();
         assert_eq!(meta.title.as_deref(), Some("\u{fffd}A"));
+    }
+
+    #[test]
+    fn a_long_title_is_cut_at_a_character_boundary() {
+        let long = "é".repeat(3_000); // two bytes each
+        let body = mlit(&[entry(b"minm", long.as_bytes())]);
+        let title = parse(&body).unwrap().title.unwrap();
+        assert!(title.len() <= MAX_FIELD_BYTES);
+        assert!(title.chars().all(|c| c == 'é'), "no split character");
+        assert!(!title.is_empty());
     }
 }

@@ -14,6 +14,8 @@ use symphonia::core::formats::Packet;
 
 pub struct AacDecoder {
     decoder: Box<dyn Decoder>,
+    sample_rate: u32,
+    channels: u8,
 }
 
 #[derive(Debug)]
@@ -33,27 +35,58 @@ impl std::fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
+fn make_decoder(
+    sample_rate: u32,
+    channels: u8,
+) -> Result<Box<dyn Decoder>, DecodeError> {
+    let asc = audio_specific_config(sample_rate, channels)
+        .ok_or(DecodeError::Config)?;
+    let mut params = CodecParameters::new();
+    params
+        .for_codec(CODEC_TYPE_AAC)
+        .with_sample_rate(sample_rate)
+        .with_extra_data(asc.into_boxed_slice());
+    symphonia::default::get_codecs()
+        .make(&params, &DecoderOptions::default())
+        .map_err(|e| DecodeError::Decode(e.to_string()))
+}
+
 impl AacDecoder {
     /// Build a decoder for AAC-LC at the given rate and channel count.
     pub fn new(
         sample_rate: u32,
         channels: u8,
     ) -> Result<AacDecoder, DecodeError> {
-        let asc = audio_specific_config(sample_rate, channels)
-            .ok_or(DecodeError::Config)?;
-        let mut params = CodecParameters::new();
-        params
-            .for_codec(CODEC_TYPE_AAC)
-            .with_sample_rate(sample_rate)
-            .with_extra_data(asc.into_boxed_slice());
-        let decoder = symphonia::default::get_codecs()
-            .make(&params, &DecoderOptions::default())
-            .map_err(|e| DecodeError::Decode(e.to_string()))?;
-        Ok(AacDecoder { decoder })
+        Ok(AacDecoder {
+            decoder: make_decoder(sample_rate, channels)?,
+            sample_rate,
+            channels,
+        })
     }
 
     /// Decode one raw AAC-LC frame to interleaved `i16` PCM.
+    ///
+    /// A malformed frame is an error, never a panic: the decoder library has
+    /// been seen to index out of bounds on corrupted input, so the call is
+    /// guarded, and after such a failure the decoder is rebuilt because its
+    /// state can no longer be trusted. A frame comes from the network.
     pub fn decode(&mut self, frame: &[u8]) -> Result<Vec<i16>, DecodeError> {
+        let attempt =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.decode_frame(frame)
+            }));
+        match attempt {
+            Ok(result) => result,
+            Err(_) => {
+                self.decoder = make_decoder(self.sample_rate, self.channels)?;
+                Err(DecodeError::Decode(
+                    "the decoder failed on a malformed frame".into(),
+                ))
+            }
+        }
+    }
+
+    fn decode_frame(&mut self, frame: &[u8]) -> Result<Vec<i16>, DecodeError> {
         let packet = Packet::new_from_slice(0, 0, 0, frame);
         let decoded = self
             .decoder
@@ -136,5 +169,38 @@ mod tests {
             decoded_any,
             "decoder produced no PCM from the golden frames"
         );
+    }
+
+    /// A 207-byte frame, found by corrupting real ones, on which the AAC
+    /// library indexes out of bounds. It must come back as an error.
+    const PANICKING_FRAME: &str = concat!(
+        "d08c4cea5c8e12f14259aedf9a44d1204ecac42c380fb471c7c44f005a2ef887",
+        "e767002fca06a1db508204f67d6143f7528b410d781a2d52af7a9c2065d51f22",
+        "91f6ca1f7d60e7d7b33d45241650815b64a10cfba7b62c3facb77affdd29ea3a",
+        "d014195790424ab53adf0ef842dfc11e3177ecc10110628a1ce086afc393c9c9",
+        "8cedaa02daec79d9939fe7e5d16a6b27f2125afefa43c961297b2e5c09df7db4",
+        "92e47e4c5f744390f44d04347d0954cfa467fb04a0796abb263b10f30ba22f0e",
+        "ee7e714c3e81cc2a2e20da0f20ad94",
+    );
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len() / 2)
+            .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_frame_that_panics_the_library_is_an_error_and_decoding_goes_on() {
+        let frame = unhex(PANICKING_FRAME);
+        let mut decoder = AacDecoder::new(44100, 2).unwrap();
+        let outcome = decoder.decode(&frame);
+        assert!(
+            matches!(&outcome, Err(DecodeError::Decode(why)) if why.contains("malformed")),
+            "expected the guarded failure, got {outcome:?}"
+        );
+        // The decoder was rebuilt: it takes a good frame next.
+        let good = include_bytes!("../tests/data/tone_lr.frames");
+        let frames = crate::sender::parse_frames(good);
+        assert!(decoder.decode(frames[5]).is_ok());
     }
 }

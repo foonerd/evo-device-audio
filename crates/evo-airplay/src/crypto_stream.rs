@@ -18,7 +18,9 @@ use crate::cipher::{Decryptor, Encryptor};
 use crate::http::{parse_head, Request, Response};
 
 const MAX_HEAD: usize = 16 * 1024;
-const MAX_BODY: usize = 8 * 1024 * 1024;
+/// The largest request body accepted: cover art is the biggest thing a sender
+/// legitimately posts, and it is far under this.
+const MAX_BODY: usize = 4 * 1024 * 1024;
 const READ_CHUNK: usize = 8 * 1024;
 
 pub struct ControlConnection<R, W> {
@@ -124,18 +126,24 @@ where
     }
 
     async fn read_exact_n(&mut self, n: usize) -> io::Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(n);
+        // The declared length is the peer's claim, not something it has sent:
+        // reserve no more than one read's worth up front, so a peer that
+        // declares megabytes and sends nothing costs us nothing.
+        let mut out = Vec::with_capacity(n.min(READ_CHUNK));
         while out.len() < n {
-            if let Some(b) = self.plain.pop_front() {
-                out.push(b);
+            if !self.plain.is_empty() {
+                let take = self.plain.len().min(n - out.len());
+                out.extend(self.plain.drain(..take));
                 continue;
             }
             match &self.dec {
                 None => {
-                    // Read at most the remaining count so we never overshoot
-                    // the message boundary while in the clear.
-                    let mut buf = vec![0u8; n - out.len()];
-                    let r = self.reader.read(&mut buf).await?;
+                    // Read at most the remaining count, and never more than a
+                    // chunk, so we neither overshoot the message boundary
+                    // while in the clear nor ask for a huge buffer.
+                    let want = (n - out.len()).min(READ_CHUNK);
+                    let mut buf = [0u8; READ_CHUNK];
+                    let r = self.reader.read(&mut buf[..want]).await?;
                     if r == 0 {
                         return Err(eof("EOF inside request body"));
                     }
@@ -154,7 +162,9 @@ where
     /// Read more ciphertext and decrypt whatever complete blocks it yields into
     /// `plain`. Returns `false` on EOF with no more data.
     async fn fill_encrypted(&mut self) -> io::Result<bool> {
-        let dec = self.dec.as_mut().expect("encrypted mode");
+        let Some(dec) = self.dec.as_mut() else {
+            return Ok(false);
+        };
         loop {
             let (plaintext, used) = dec
                 .decrypt_available(&self.cipher_pending)
@@ -240,5 +250,83 @@ mod tests {
         let n = sender_rd.read(&mut buf).await.unwrap();
         let (plain, _) = sender_dec.decrypt_available(&buf[..n]).unwrap();
         assert!(String::from_utf8_lossy(&plain).starts_with("RTSP/1.0 200 OK"));
+    }
+
+    /// A reader that fails the test if it is ever asked for more than one
+    /// chunk at a time: a declared length is a claim, not a buffer to fill.
+    struct ChunkedReader {
+        data: Vec<u8>,
+        at: usize,
+        largest_ask: usize,
+    }
+
+    impl AsyncRead for ChunkedReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            let ask = buf.remaining();
+            self.largest_ask = self.largest_ask.max(ask);
+            let n = ask.min(self.data.len() - self.at).min(1500);
+            let from = self.at;
+            buf.put_slice(&self.data[from..from + n]);
+            self.at += n;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_large_body_is_read_in_chunks_never_in_one_declared_buffer() {
+        let body_len = 3 * 1024 * 1024;
+        let mut wire =
+            format!("POST /x HTTP/1.1\r\nContent-Length: {body_len}\r\n\r\n")
+                .into_bytes();
+        wire.extend(std::iter::repeat(0x5a).take(body_len));
+        let reader = ChunkedReader {
+            data: wire,
+            at: 0,
+            largest_ask: 0,
+        };
+        let mut conn = ControlConnection::new(reader, tokio::io::sink());
+        let request = conn.read_request().await.unwrap().unwrap();
+        assert_eq!(request.body.len(), body_len);
+        assert!(
+            conn.reader.largest_ask <= READ_CHUNK,
+            "asked the socket for {} bytes at once",
+            conn.reader.largest_ask
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_limit_is_refused_before_any_of_it_is_read() {
+        let wire = format!(
+            "POST /x HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY + 1
+        )
+        .into_bytes();
+        let reader = ChunkedReader {
+            data: wire,
+            at: 0,
+            largest_ask: 0,
+        };
+        let mut conn = ControlConnection::new(reader, tokio::io::sink());
+        let err = conn.read_request().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn a_declared_body_that_never_arrives_is_an_error_not_a_hang_of_memory(
+    ) {
+        let wire =
+            b"POST /x HTTP/1.1\r\nContent-Length: 4000000\r\n\r\nabc".to_vec();
+        let reader = ChunkedReader {
+            data: wire,
+            at: 0,
+            largest_ask: 0,
+        };
+        let mut conn = ControlConnection::new(reader, tokio::io::sink());
+        let err = conn.read_request().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 }
