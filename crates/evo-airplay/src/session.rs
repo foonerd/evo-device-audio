@@ -101,6 +101,10 @@ pub struct Session {
     /// `SessionStarted`, so the host only ever sees them inside a session.
     pending_metadata: Option<Event>,
     pending_artwork: Option<Event>,
+    /// The tasks of the running stream (its control channel and its audio
+    /// reader), ended with the stream. The event channel is not among them:
+    /// it belongs to the connection, and a sender may stream again on it.
+    stream_tasks: Vec<tokio::task::JoinHandle<()>>,
     /// The playback thread, alive for the duration of a buffered stream.
     player: Option<Player>,
     /// Control handle for the player (pause/resume, flush) from the RTSP path.
@@ -139,6 +143,7 @@ impl Session {
             session_active: false,
             pending_metadata: None,
             pending_artwork: None,
+            stream_tasks: Vec::new(),
             player: None,
             player_control: None,
             flush_until_seq: Arc::new(AtomicU64::new(0)),
@@ -322,7 +327,7 @@ impl Session {
             UdpSocket::bind(SocketAddr::new(self.local_ip, 0)).await?;
         let control_port = control.local_addr()?.port();
         let data_port = self.start_buffered_audio().await?;
-        self.tasks
+        self.stream_tasks
             .push(tokio::spawn(audio_channel(control, "control")));
         Ok((data_port, control_port))
     }
@@ -404,7 +409,7 @@ impl Session {
         self.player_control = Some(player.sender());
         self.player = Some(player);
         let max_queued = crate::player::max_queued_samples(rate, channels);
-        self.tasks.push(tokio::spawn(buffered_audio(
+        self.stream_tasks.push(tokio::spawn(buffered_audio(
             listener,
             decryptor,
             decoder,
@@ -601,34 +606,27 @@ impl Session {
     }
 
     /// Handle `TEARDOWN`: the sender is done with the stream.
+    ///
+    /// The stream is closed now, not when the connection is: its sink is
+    /// closed and the host's gate released, so the device is free for the
+    /// next stream even if the sender keeps this connection open.
     pub fn teardown(&mut self) {
         debug!("ack TEARDOWN");
-        self.end_session();
+        self.close_stream();
     }
 
-    /// Report `SessionEnded` once per started session.
-    fn end_session(&mut self) {
-        if self.session_active {
-            self.session_active = false;
-            self.send_event(Event::SessionEnded);
-        }
-    }
-}
-
-/// What a finished session still owes: its playback thread to join and its
-/// gate to release, in that order.
-type Finish = (Option<Player>, Option<(Arc<dyn SessionGate>, IpAddr)>);
-
-impl Drop for Session {
-    fn drop(&mut self) {
+    /// End the running stream, if there is one: tell the host, stop its
+    /// tasks, and hand its sink and the gate to a thread that closes the sink
+    /// first and then releases the gate. The playback thread is joined off
+    /// the async worker, and the gate is told only once the sink is closed: a
+    /// next stream must never find the device still held by this one. A sink
+    /// that ignores its stop signal delays the release; it cannot stall the
+    /// runtime.
+    fn close_stream(&mut self) {
         self.end_session();
-        for task in self.tasks.drain(..) {
+        for task in self.stream_tasks.drain(..) {
             task.abort();
         }
-        // The playback thread is joined off the async worker, and the gate is
-        // told only once the sink is closed: a next stream must never find the
-        // device still held by this one. A sink that ignores its stop signal
-        // delays the release; it cannot stall the runtime.
         self.player_control = None;
         let player = self.player.take();
         let release = if self.admitted {
@@ -649,6 +647,27 @@ impl Drop for Session {
         if spawned.is_err() {
             finish(&work);
         }
+    }
+
+    /// Report `SessionEnded` once per started session.
+    fn end_session(&mut self) {
+        if self.session_active {
+            self.session_active = false;
+            self.send_event(Event::SessionEnded);
+        }
+    }
+}
+
+/// What a finished session still owes: its playback thread to join and its
+/// gate to release, in that order.
+type Finish = (Option<Player>, Option<(Arc<dyn SessionGate>, IpAddr)>);
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+        self.close_stream();
     }
 }
 

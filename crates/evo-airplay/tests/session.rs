@@ -361,6 +361,47 @@ async fn a_stream_type_the_receiver_cannot_play_is_refused_not_silenced() {
     );
 }
 
+/// A sender that tears its stream down but keeps the connection open frees
+/// the device and the gate at once: the next stream, from this sender or
+/// another, must not find them held until the connection is dropped.
+#[tokio::test]
+async fn a_teardown_closes_the_stream_while_the_connection_stays_open() {
+    let closed = Arc::new(AtomicUsize::new(0));
+    let closes = closed.clone();
+    struct Closing(Arc<AtomicUsize>);
+    impl AudioSink for Closing {
+        fn write(&mut self, _pcm: &[i16]) {}
+        fn flush(&mut self) {}
+    }
+    impl Drop for Closing {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let factory: SinkFactory =
+        Arc::new(move |_, _| Ok(Box::new(Closing(closes.clone()))));
+    let gate = CountingGate::new(false);
+    let h = start(factory, gate.clone()).await;
+
+    let (mut sender, reply, ports) = begin(h.addr, 103).await;
+    assert!(reply.is_ok());
+    assert!(ports.is_some());
+    assert_eq!(gate.admits(), 1);
+
+    assert!(sender.teardown().await.expect("teardown").is_ok());
+    eventually("the sink is closed", || closed.load(Ordering::SeqCst) == 1)
+        .await;
+    eventually("the gate is released", || gate.releases() == 1).await;
+    assert!(
+        !sender.is_closed().await,
+        "the sender's connection is not the receiver's to close"
+    );
+    // The connection streams again.
+    let (again, _) = sender.setup_stream(103, &KEY).await.expect("setup");
+    assert!(again.is_ok(), "{}", again.status);
+    assert_eq!(gate.admits(), 2);
+}
+
 #[tokio::test]
 async fn the_host_can_end_the_running_session() {
     let (factory, _pcm) = capture();
