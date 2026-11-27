@@ -447,6 +447,15 @@ pub(crate) enum ConnBehaviour {
         items: Vec<(u32, String)>,
         playing: Option<u32>,
     },
+    /// A queue that behaves like MPD's for the commands a capture
+    /// uses: songs with tags and ids, a current position and a play
+    /// state, `playlistfind`, `addid`, `addtagid`, `cleartagid`,
+    /// `playid`, `deleteid`, `stop`, `pause`, `next`, `previous`
+    /// and `idle`, which answers when the queue or the player has
+    /// changed. Every connection of one test shares the one
+    /// [`FakeMpd`], so a command connection and an idle connection
+    /// see the same player.
+    Model(Arc<Mutex<FakeMpd>>),
     /// MPD's stored-playlist namespace, plus enough of the
     /// library to seed a new playlist from.
     ///
@@ -473,6 +482,312 @@ pub(crate) enum ConnBehaviour {
         library: Vec<(String, Vec<String>, Vec<String>)>,
         queue: Vec<String>,
     },
+}
+
+// ----- a queue that behaves like MPD's -----
+
+/// One queued song of a [`FakeMpd`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FakeItem {
+    pub(crate) id: u32,
+    pub(crate) uri: String,
+    pub(crate) tags: Vec<(String, String)>,
+}
+
+/// A stateful stand-in for MPD's queue and player, for tests that
+/// care what is left in the queue and what is playing.
+///
+/// It models what a capture exercises and no more: it does not
+/// decode, count time or honour `repeat`, `random` or `consume`.
+/// Deleting the playing song moves on to the song after it, or
+/// stops, as MPD does.
+#[derive(Debug)]
+pub(crate) struct FakeMpd {
+    pub(crate) queue: Vec<FakeItem>,
+    pub(crate) current: Option<usize>,
+    pub(crate) state: &'static str,
+    /// `repeat`: the queue wraps round to its start.
+    pub(crate) repeat: bool,
+    next_id: u32,
+    /// Every command line received, in order.
+    pub(crate) log: Vec<String>,
+    /// Commands the player answers with an ACK, to show a refusal.
+    pub(crate) refuse: Vec<&'static str>,
+    pub(crate) version: tokio::sync::watch::Sender<u64>,
+}
+
+/// Split a command line into its words, honouring MPD's double
+/// quotes and backslash escapes.
+fn words(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut started = false;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if quoted => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            '"' => {
+                quoted = !quoted;
+                started = true;
+            }
+            ' ' if !quoted => {
+                if started || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if started || !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+impl FakeMpd {
+    /// A queue of `uris`, stopped, nothing selected.
+    pub(crate) fn new(uris: &[&str]) -> Arc<Mutex<FakeMpd>> {
+        let (version, _) = tokio::sync::watch::channel(0);
+        let queue = uris
+            .iter()
+            .enumerate()
+            .map(|(i, uri)| FakeItem {
+                id: 100 + i as u32,
+                uri: (*uri).to_string(),
+                tags: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let next_id = 100 + queue.len() as u32;
+        Arc::new(Mutex::new(FakeMpd {
+            queue,
+            current: None,
+            state: "stop",
+            repeat: false,
+            next_id,
+            log: Vec::new(),
+            refuse: Vec::new(),
+            version,
+        }))
+    }
+
+    /// The queue's URIs in order.
+    pub(crate) fn uris(&self) -> Vec<String> {
+        self.queue.iter().map(|i| i.uri.clone()).collect()
+    }
+
+    /// Play the song at `pos`, as MPD's `play` does.
+    pub(crate) fn start_at(&mut self, pos: usize) {
+        self.current = Some(pos);
+        self.state = "play";
+    }
+
+    fn changed(&self) {
+        self.version.send_modify(|v| *v += 1);
+    }
+
+    fn position_of(&self, id: u32) -> Option<usize> {
+        self.queue.iter().position(|i| i.id == id)
+    }
+
+    fn item_block(&self, pos: usize) -> String {
+        let item = &self.queue[pos];
+        let mut out = format!("file: {}\n", item.uri);
+        for (tag, value) in &item.tags {
+            out.push_str(&format!("{tag}: {value}\n"));
+        }
+        out.push_str(&format!("Pos: {pos}\nId: {}\n", item.id));
+        out
+    }
+
+    /// Execute one command line; the reply is the wire text.
+    pub(crate) fn exec(&mut self, line: &str) -> String {
+        self.log.push(line.to_string());
+        let w = words(line);
+        let name = w.first().map(String::as_str).unwrap_or_default();
+        let arg = |n: usize| w.get(n).map(String::as_str).unwrap_or_default();
+        let id_arg = || arg(1).parse::<u32>().ok();
+        if self.refuse.contains(&name) {
+            return format!("ACK [52@0] {{{name}}} refused\n");
+        }
+        match name {
+            "status" => {
+                let mut out = format!(
+                    "volume: 30\nrepeat: {}\nstate: {}\nplaylistlength: {}\n",
+                    u8::from(self.repeat),
+                    self.state,
+                    self.queue.len()
+                );
+                if let Some(pos) = self.current {
+                    out.push_str(&format!("song: {pos}\n"));
+                    if self.state != "stop" {
+                        out.push_str("elapsed: 1.000\n");
+                    }
+                }
+                out.push_str("OK\n");
+                out
+            }
+            "currentsong" => match self.current {
+                Some(pos) if pos < self.queue.len() => {
+                    format!("{}OK\n", self.item_block(pos))
+                }
+                _ => "OK\n".to_string(),
+            },
+            "playlistinfo" => {
+                let mut out = String::new();
+                for pos in 0..self.queue.len() {
+                    out.push_str(&self.item_block(pos));
+                }
+                out.push_str("OK\n");
+                out
+            }
+            "playlistfind" => {
+                let mut out = String::new();
+                if arg(1) == "file" {
+                    for pos in 0..self.queue.len() {
+                        if self.queue[pos].uri == arg(2) {
+                            out.push_str(&self.item_block(pos));
+                        }
+                    }
+                }
+                out.push_str("OK\n");
+                out
+            }
+            "addid" => {
+                let at = arg(2).parse::<usize>().ok();
+                if at.is_some_and(|p| p > self.queue.len()) {
+                    return "ACK [2@0] {addid} Bad song index\n".to_string();
+                }
+                let id = self.next_id;
+                self.next_id += 1;
+                let item = FakeItem {
+                    id,
+                    uri: arg(1).to_string(),
+                    tags: Vec::new(),
+                };
+                match at {
+                    Some(p) => {
+                        self.queue.insert(p, item);
+                        if let Some(cur) = self.current {
+                            if cur >= p {
+                                self.current = Some(cur + 1);
+                            }
+                        }
+                    }
+                    None => self.queue.push(item),
+                }
+                self.changed();
+                format!("Id: {id}\nOK\n")
+            }
+            "addtagid" => match id_arg().and_then(|id| self.position_of(id)) {
+                Some(pos) => {
+                    self.queue[pos]
+                        .tags
+                        .push((arg(2).to_string(), arg(3).to_string()));
+                    self.changed();
+                    "OK\n".to_string()
+                }
+                None => "ACK [50@0] {addtagid} No such song\n".to_string(),
+            },
+            "cleartagid" => {
+                match id_arg().and_then(|id| self.position_of(id)) {
+                    Some(pos) => {
+                        self.queue[pos]
+                            .tags
+                            .retain(|(t, _)| !t.eq_ignore_ascii_case(arg(2)));
+                        self.changed();
+                        "OK\n".to_string()
+                    }
+                    None => {
+                        "ACK [50@0] {cleartagid} No such song\n".to_string()
+                    }
+                }
+            }
+            "playid" => match id_arg().and_then(|id| self.position_of(id)) {
+                Some(pos) => {
+                    self.start_at(pos);
+                    self.changed();
+                    "OK\n".to_string()
+                }
+                None => "ACK [50@0] {playid} No such song\n".to_string(),
+            },
+            "deleteid" => match id_arg().and_then(|id| self.position_of(id)) {
+                Some(pos) => {
+                    self.queue.remove(pos);
+                    if let Some(cur) = self.current {
+                        match cur.cmp(&pos) {
+                            std::cmp::Ordering::Greater => {
+                                self.current = Some(cur - 1);
+                            }
+                            std::cmp::Ordering::Less => {}
+                            std::cmp::Ordering::Equal => {
+                                if self.state == "stop" {
+                                    self.current = None;
+                                } else if pos < self.queue.len() {
+                                    self.current = Some(pos);
+                                } else if self.repeat && !self.queue.is_empty()
+                                {
+                                    // MPD wraps round and plays on.
+                                    self.current = Some(0);
+                                } else {
+                                    self.current = None;
+                                    self.state = "stop";
+                                }
+                            }
+                        }
+                    }
+                    self.changed();
+                    "OK\n".to_string()
+                }
+                None => "ACK [50@0] {deleteid} No such song\n".to_string(),
+            },
+            "stop" => {
+                self.state = "stop";
+                self.changed();
+                "OK\n".to_string()
+            }
+            "pause" => {
+                if self.current.is_some() && self.state != "stop" {
+                    self.state = if arg(1) == "1" { "pause" } else { "play" };
+                }
+                self.changed();
+                "OK\n".to_string()
+            }
+            "next" | "previous" => {
+                if let Some(cur) = self.current {
+                    let to = if name == "next" {
+                        cur + 1
+                    } else {
+                        cur.saturating_sub(1)
+                    };
+                    if to < self.queue.len() {
+                        self.current = Some(to);
+                    } else {
+                        self.state = "stop";
+                    }
+                }
+                self.changed();
+                "OK\n".to_string()
+            }
+            "play" => {
+                let pos = arg(1).parse::<usize>().ok().or(self.current);
+                match pos {
+                    Some(p) if p < self.queue.len() => {
+                        self.start_at(p);
+                        self.changed();
+                        "OK\n".to_string()
+                    }
+                    _ => "ACK [50@0] {play} Bad song index\n".to_string(),
+                }
+            }
+            _ => "OK\n".to_string(),
+        }
+    }
 }
 
 /// Bind a loopback listener and serve incoming connections with
@@ -665,6 +980,37 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                     return;
                 } else {
                     let _ = w.write_all(b"OK\n").await;
+                }
+                let _ = w.flush().await;
+            }
+        }
+        ConnBehaviour::Model(ref model) => {
+            let mut changes = model
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .version
+                .subscribe();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                let cmd = line.trim_end().to_string();
+                if cmd.starts_with("idle") {
+                    if changes.changed().await.is_err() {
+                        return;
+                    }
+                    let _ = w
+                        .write_all(b"changed: playlist\nchanged: player\nOK\n")
+                        .await;
+                } else {
+                    let reply = model
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .exec(&cmd);
+                    let _ = w.write_all(reply.as_bytes()).await;
                 }
                 let _ = w.flush().await;
             }

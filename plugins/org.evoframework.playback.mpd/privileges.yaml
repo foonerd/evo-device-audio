@@ -29,6 +29,11 @@ capability_intent:
     access_path: sudoers/command
     failure_mode: AutoMpdRestarter resolves to the no-op variant; fragment file is on disk but MPD does not pick it up until next manual restart; route-change worker publishes Failed status with the framework's remedy string; playback continues on the prior MPD configuration; no panic.
 
+  - id: capture_writer_probe
+    need: read the kernel's own report of whether the reserved capture device's write end is open (`/proc/asound/Loopback/pcm0p/sub4/status`), so a request to play a live capture is refused while nothing writes to it.
+    access_path: filesystem/proc
+    failure_mode: an unreadable or absent report counts as no writer; the capture verb answers `capture_idle` and nothing is queued; no panic.
+
 required_binaries:
   - name: mpd
     failure_mode: refuse to admit; structured admission error names the missing binary.

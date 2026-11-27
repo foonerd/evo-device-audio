@@ -1,7 +1,7 @@
 [plugin]
 name = "org.evoframework.playback.mpd"
 # Keep in sync with this crate's Cargo.toml [package].version (PluginIdentity + packaging).
-version = "0.1.1"
+version = "0.1.2"
 contract = 1
 
 # Multi-stocking declaration: this plugin stocks five shelves on
@@ -34,6 +34,9 @@ request_types = [
     "set_consume",
     "get_now_playing",
     "get_stream_format",
+    "play_capture",
+    "set_capture_tags",
+    "end_capture",
 ]
 
 [[stockings]]
@@ -247,6 +250,9 @@ request_types = [
     "set_consume",
     "get_now_playing",
     "get_stream_format",
+    "play_capture",
+    "set_capture_tags",
+    "end_capture",
     # audio.queue.v1 shelf verbs
     "queue.get_queue",
     "queue.enqueue",

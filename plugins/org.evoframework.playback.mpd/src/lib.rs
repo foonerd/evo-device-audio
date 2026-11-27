@@ -110,6 +110,7 @@ mod album_shuffle;
 mod artwork_hash;
 mod asound_watcher;
 mod availability;
+mod capture;
 mod config;
 mod disposition_emitter;
 mod dlna_index;
@@ -263,6 +264,9 @@ const SOURCE_REQUEST_TYPES: &[&str] = &[
     "set_consume",
     "get_now_playing",
     "get_stream_format",
+    "play_capture",
+    "set_capture_tags",
+    "end_capture",
     // audio.queue.v1 shelf verbs
     "queue.get_queue",
     "queue.enqueue",
@@ -451,6 +455,9 @@ pub struct MpdPlaybackPlugin {
     /// `Plugin::load` refuses loudly when it is `None`.
     audio_routing: Option<Arc<dyn AudioRouting>>,
     custodies: HashMap<String, TrackedCustody>,
+    /// How the plugin learns whether anything is writing to a
+    /// capture's device. The system's `/proc/asound`; tests swap it.
+    capture_probe: Arc<dyn capture::WriterProbe>,
     /// Cumulative count of custodies accepted since construction.
     /// Does not decrement on release.
     custodies_taken: u64,
@@ -747,6 +754,7 @@ impl MpdPlaybackPlugin {
             subject_emitter: None,
             audio_routing: None,
             custodies: HashMap::new(),
+            capture_probe: Arc::new(capture::ProcWriterProbe::system()),
             custodies_taken: 0,
             active_command_sender: Arc::new(tokio::sync::Mutex::new(None)),
             envelope_subscriber: None,
@@ -2256,6 +2264,12 @@ fn playback_error_to_plugin_error(e: PlaybackError) -> PluginError {
         PlaybackError::Shutdown => PluginError::Permanent(
             "playback supervisor is shut down".to_string(),
         ),
+        PlaybackError::CaptureAbsent => {
+            PluginError::Transient("capture_absent".to_string())
+        }
+        PlaybackError::CaptureNotSeekable => PluginError::Permanent(
+            "a live capture cannot be seeked".to_string(),
+        ),
     }
 }
 
@@ -3188,6 +3202,9 @@ impl Respondent for MpdPlaybackPlugin {
                 "set_consume" => self.handle_set_bool(req, "set_consume").await,
                 "get_now_playing" => self.handle_get_now_playing(req).await,
                 "get_stream_format" => self.handle_get_stream_format(req).await,
+                "play_capture" => self.handle_play_capture(req).await,
+                "set_capture_tags" => self.handle_set_capture_tags(req).await,
+                "end_capture" => self.handle_end_capture(req).await,
                 _ => {
                     // Shelf verbs (queue / playlist /
                     // favourites / library). The bundle's
@@ -3369,6 +3386,72 @@ impl MpdPlaybackPlugin {
             ))
         })?;
         Ok(Response::for_request(req, body))
+    }
+
+    /// Handle `play_capture`: put the named capture at the end of the
+    /// queue, tag it and play it. Refused while nothing writes to the
+    /// capture, so the verb cannot leave the player holding an empty
+    /// live source.
+    async fn handle_play_capture(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: CapturePayload =
+            parse_versioned_payload(req, "play_capture")?;
+        let (source, tags) = payload.resolve("play_capture")?;
+        if !self.capture_probe.has_writer(&source) {
+            return Err(PluginError::Transient("capture_idle".to_string()));
+        }
+        let supervisor = self.active_supervisor("play_capture")?;
+        let outcome = supervisor
+            .capture(capture::CaptureRequest::Play { source, tags })
+            .await
+            .map_err(playback_error_to_plugin_error)?;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "v": PAYLOAD_VERSION,
+            "ok": true,
+            "queue_id": outcome.queue_id,
+        }))
+        .map_err(|e| {
+            PluginError::Permanent(format!(
+                "play_capture response JSON encode failed: {e}"
+            ))
+        })?;
+        Ok(Response::for_request(req, body))
+    }
+
+    /// Handle `set_capture_tags`: replace the capture's tags with the
+    /// sender's latest statement.
+    async fn handle_set_capture_tags(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: CapturePayload =
+            parse_versioned_payload(req, "set_capture_tags")?;
+        let (source, tags) = payload.resolve("set_capture_tags")?;
+        let supervisor = self.active_supervisor("set_capture_tags")?;
+        supervisor
+            .capture(capture::CaptureRequest::SetTags { source, tags })
+            .await
+            .map_err(playback_error_to_plugin_error)?;
+        encode_ok_flag(req)
+    }
+
+    /// Handle `end_capture`: take the capture out of the queue.
+    /// Ending a capture that is not there succeeds.
+    async fn handle_end_capture(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: CaptureNamePayload =
+            parse_versioned_payload(req, "end_capture")?;
+        let source = payload.resolve("end_capture")?;
+        let supervisor = self.active_supervisor("end_capture")?;
+        supervisor
+            .capture(capture::CaptureRequest::End { source })
+            .await
+            .map_err(playback_error_to_plugin_error)?;
+        encode_ok_flag(req)
     }
 
     /// Handle a `get_stream_format` source-verb request: read
@@ -4009,6 +4092,91 @@ where
 /// `v: u32` envelope field. Implemented mechanically.
 trait HasPayloadVersion {
     fn payload_version(&self) -> u32;
+}
+
+fn encode_ok_flag(req: &Request) -> Result<Response, PluginError> {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "v": PAYLOAD_VERSION,
+        "ok": true,
+    }))
+    .map_err(|e| {
+        PluginError::Permanent(format!(
+            "{verb} response JSON encode failed: {e}",
+            verb = req.request_type
+        ))
+    })?;
+    Ok(Response::for_request(req, body))
+}
+
+/// The one thing a capture verb may name: a capture from the closed
+/// table. Nothing else is accepted, so a payload cannot carry a
+/// device, a URI or a path.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureNamePayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    capture: String,
+}
+
+impl HasPayloadVersion for CaptureNamePayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+impl CaptureNamePayload {
+    fn resolve(
+        &self,
+        verb: &str,
+    ) -> Result<capture::CaptureSource, PluginError> {
+        capture::resolve(&self.capture).ok_or_else(|| {
+            PluginError::Permanent(format!(
+                "{verb:?} names a capture this player does not have"
+            ))
+        })
+    }
+}
+
+/// A capture and the display tags it should carry.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapturePayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    capture: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    artist: Option<String>,
+    #[serde(default)]
+    album: Option<String>,
+}
+
+impl HasPayloadVersion for CapturePayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+impl CapturePayload {
+    fn resolve(
+        self,
+        verb: &str,
+    ) -> Result<(capture::CaptureSource, capture::CaptureTags), PluginError>
+    {
+        let source = capture::resolve(&self.capture).ok_or_else(|| {
+            PluginError::Permanent(format!(
+                "{verb:?} names a capture this player does not have"
+            ))
+        })?;
+        let tags =
+            capture::CaptureTags::checked(self.title, self.artist, self.album)
+                .map_err(|why| {
+                    PluginError::Permanent(format!("{verb:?}: {why}"))
+                })?;
+        Ok((source, tags))
+    }
 }
 
 fn encode_simple_ok(req: &Request) -> Result<Response, PluginError> {
@@ -7034,5 +7202,444 @@ mod tests {
             std::fs::metadata(&path).unwrap().modified().unwrap(),
             before
         );
+    }
+
+    // ===== capture verbs =====
+
+    use crate::playback_supervisor::test_mock::FakeMpd;
+
+    /// A probe that says whether anything is writing, as a test sets it.
+    struct SwitchProbe(Arc<std::sync::atomic::AtomicBool>);
+
+    impl crate::capture::WriterProbe for SwitchProbe {
+        fn has_writer(&self, _: &crate::capture::CaptureSource) -> bool {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    const MUSIC: [&str; 4] = ["a/1.flac", "b/2.flac", "c/3.flac", "d/4.flac"];
+
+    struct CaptureRig {
+        plugin: MpdPlaybackPlugin,
+        handle: CustodyHandle,
+        model: Arc<std::sync::Mutex<FakeMpd>>,
+        writer: Arc<std::sync::atomic::AtomicBool>,
+        _mock: tokio::task::JoinHandle<()>,
+    }
+
+    impl CaptureRig {
+        async fn new(writer_present: bool) -> Self {
+            let model = FakeMpd::new(&MUSIC);
+            let (mut plugin, mock) = loaded_plugin_with_mock(vec![
+                F4Conn::Model(model.clone()),
+                F4Conn::Model(model.clone()),
+            ])
+            .await;
+            let writer =
+                Arc::new(std::sync::atomic::AtomicBool::new(writer_present));
+            plugin.capture_probe = Arc::new(SwitchProbe(writer.clone()));
+            let reporter: Arc<dyn CustodyStateReporter> =
+                Arc::new(CapturingReporter::default());
+            let handle =
+                plugin.take_custody(assignment(reporter, 7)).await.unwrap();
+            Self {
+                plugin,
+                handle,
+                model,
+                writer,
+                _mock: mock,
+            }
+        }
+
+        async fn call(
+            &self,
+            verb: &str,
+            payload: Value,
+        ) -> Result<Value, PluginError> {
+            let resp = self
+                .plugin
+                .handle_request(&source_request(verb, payload))
+                .await?;
+            Ok(serde_json::from_slice(&resp.payload).unwrap())
+        }
+
+        fn uris(&self) -> Vec<String> {
+            self.model.lock().unwrap().uris()
+        }
+
+        fn music() -> Vec<String> {
+            MUSIC.map(String::from).to_vec()
+        }
+
+        async fn until(
+            &self,
+            what: &str,
+            mut ok: impl FnMut(&FakeMpd) -> bool,
+        ) {
+            for _ in 0..200 {
+                if ok(&self.model.lock().unwrap()) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("never happened: {what}");
+        }
+
+        async fn release(mut self) {
+            self.plugin.release_custody(self.handle).await.unwrap();
+        }
+    }
+
+    fn mutated(model: &Arc<std::sync::Mutex<FakeMpd>>) -> bool {
+        model.lock().unwrap().log.iter().any(|c| {
+            ["addid", "addtagid", "cleartagid", "playid", "deleteid"]
+                .iter()
+                .any(|w| c.starts_with(w))
+        })
+    }
+
+    #[tokio::test]
+    async fn play_capture_is_refused_while_nothing_writes() {
+        let rig = CaptureRig::new(false).await;
+        let err = rig
+            .call("play_capture", json!({ "v": 1, "capture": "airplay" }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::Transient(why) if why == "capture_idle"),
+            "{err:?}"
+        );
+        assert_eq!(rig.uris(), CaptureRig::music());
+        assert!(!mutated(&rig.model), "an empty capture is never queued");
+        rig.release().await;
+    }
+
+    #[tokio::test]
+    async fn play_capture_queues_tags_and_plays_it() {
+        let rig = CaptureRig::new(true).await;
+        let body = rig
+            .call(
+                "play_capture",
+                json!({ "v": 1, "capture": "airplay",
+                        "title": "Song", "artist": "Band", "album": "Disc" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body["v"], 1);
+        assert_eq!(body["ok"], true);
+        let id = body["queue_id"].as_u64().expect("queue_id");
+        {
+            let m = rig.model.lock().unwrap();
+            let last = m.queue.last().unwrap();
+            assert_eq!(last.uri, crate::capture::AIRPLAY.uri);
+            assert_eq!(u64::from(last.id), id);
+            assert_eq!(m.state, "play");
+            assert_eq!(m.current, Some(MUSIC.len()));
+            assert_eq!(m.queue.len(), MUSIC.len() + 1);
+        }
+        rig.release().await;
+    }
+
+    #[tokio::test]
+    async fn the_capture_verbs_take_a_name_from_the_table_and_nothing_else() {
+        let rig = CaptureRig::new(true).await;
+        let bad = [
+            json!({ "v": 1, "capture": "other" }),
+            json!({ "v": 1, "capture": "" }),
+            json!({ "v": 1, "capture": "hw:Loopback,1,4" }),
+            json!({ "v": 1, "capture": "alsa://hw:Loopback,1,4" }),
+            json!({ "v": 1, "capture": "airplay", "device": "hw:0,0" }),
+            json!({ "v": 1, "capture": "airplay", "uri": "alsa://hw:0,0" }),
+            json!({ "v": 1, "capture": "airplay", "path": "/etc/passwd" }),
+            json!({ "v": 1, "uri": "alsa://hw:Loopback,1,4" }),
+            json!({ "v": 2, "capture": "airplay" }),
+        ];
+        for verb in ["play_capture", "set_capture_tags", "end_capture"] {
+            for payload in &bad {
+                let err = rig.call(verb, payload.clone()).await.unwrap_err();
+                assert!(
+                    matches!(err, PluginError::Permanent(_)),
+                    "{verb} {payload}: {err:?}"
+                );
+            }
+        }
+        for payload in [
+            json!({ "v": 1, "capture": "airplay", "title": "x".repeat(257) }),
+            json!({ "v": 1, "capture": "airplay", "title": "a\nb" }),
+        ] {
+            for verb in ["play_capture", "set_capture_tags"] {
+                let err = rig.call(verb, payload.clone()).await.unwrap_err();
+                assert!(matches!(err, PluginError::Permanent(_)), "{verb}");
+            }
+        }
+        assert!(!mutated(&rig.model), "a refused request reaches nothing");
+        assert_eq!(rig.uris(), CaptureRig::music());
+        rig.release().await;
+    }
+
+    #[tokio::test]
+    async fn play_now_still_refuses_a_capture_uri() {
+        let rig = CaptureRig::new(true).await;
+        for uri in ["alsa://hw:Loopback,1,4?format=44100:16:2", "alsa://hw:0,0"]
+        {
+            let err = rig
+                .call("play_now", json!({ "v": 1, "uri": uri }))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, PluginError::Permanent(_)), "{uri}: {err:?}");
+        }
+        assert!(!mutated(&rig.model));
+        rig.release().await;
+    }
+
+    #[tokio::test]
+    async fn a_session_leaves_the_queue_as_it_found_it() {
+        let rig = CaptureRig::new(true).await;
+        rig.model.lock().unwrap().start_at(2);
+        let before = rig.uris();
+        rig.call(
+            "play_capture",
+            json!({ "v": 1, "capture": "airplay", "title": "One" }),
+        )
+        .await
+        .unwrap();
+        rig.call(
+            "set_capture_tags",
+            json!({ "v": 1, "capture": "airplay", "title": "Two" }),
+        )
+        .await
+        .unwrap();
+        rig.call("end_capture", json!({ "v": 1, "capture": "airplay" }))
+            .await
+            .unwrap();
+        {
+            let m = rig.model.lock().unwrap();
+            assert_eq!(m.uris(), before, "the queue is as it was");
+            assert!(
+                m.log.iter().all(|c| c != "clear"
+                    && !c.starts_with("moveid")
+                    && !c.starts_with("add ")),
+                "a session never clears, reorders or adds music: {:?}",
+                m.log
+            );
+            assert_eq!(m.state, "stop", "nothing starts in its place");
+        }
+        rig.release().await;
+    }
+
+    /// With `repeat` on, deleting the last song the player is on would
+    /// wrap round to the first one. Ending a session must not start
+    /// the operator's music.
+    #[tokio::test]
+    async fn ending_a_session_with_repeat_on_does_not_start_the_music() {
+        let rig = CaptureRig::new(true).await;
+        rig.model.lock().unwrap().repeat = true;
+        rig.call("play_capture", json!({ "v": 1, "capture": "airplay" }))
+            .await
+            .unwrap();
+        rig.call("end_capture", json!({ "v": 1, "capture": "airplay" }))
+            .await
+            .unwrap();
+        {
+            let m = rig.model.lock().unwrap();
+            assert_eq!(m.uris(), CaptureRig::music());
+            assert_eq!(m.state, "stop", "the music does not start by itself");
+        }
+        rig.release().await;
+    }
+
+    #[tokio::test]
+    async fn set_capture_tags_without_a_capture_is_capture_absent() {
+        let rig = CaptureRig::new(true).await;
+        let err = rig
+            .call(
+                "set_capture_tags",
+                json!({ "v": 1, "capture": "airplay", "title": "x" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::Transient(why) if why == "capture_absent"),
+            "{err:?}"
+        );
+        rig.release().await;
+    }
+
+    #[tokio::test]
+    async fn ending_a_capture_that_is_not_there_succeeds() {
+        let rig = CaptureRig::new(true).await;
+        let body = rig
+            .call("end_capture", json!({ "v": 1, "capture": "airplay" }))
+            .await
+            .unwrap();
+        assert_eq!(body["ok"], true);
+        rig.release().await;
+    }
+
+    #[tokio::test]
+    async fn a_capture_ends_when_the_operator_stops_the_player() {
+        let rig = CaptureRig::new(true).await;
+        rig.call("play_capture", json!({ "v": 1, "capture": "airplay" }))
+            .await
+            .unwrap();
+        rig.call("stop", json!({ "v": 1 })).await.unwrap();
+        rig.until("the capture is taken out", |m| {
+            m.uris() == CaptureRig::music()
+        })
+        .await;
+        rig.release().await;
+    }
+
+    #[tokio::test]
+    async fn a_capture_ends_when_the_player_moves_to_another_song() {
+        let rig = CaptureRig::new(true).await;
+        rig.call("play_capture", json!({ "v": 1, "capture": "airplay" }))
+            .await
+            .unwrap();
+        // Something other than this plugin moved the player.
+        {
+            let mut m = rig.model.lock().unwrap();
+            m.start_at(1);
+            m.version.send_modify(|v| *v += 1);
+        }
+        rig.until("the capture is taken out", |m| {
+            m.uris() == CaptureRig::music()
+        })
+        .await;
+        assert_eq!(
+            rig.model.lock().unwrap().state,
+            "play",
+            "the song the operator chose plays on"
+        );
+        rig.release().await;
+    }
+
+    #[tokio::test]
+    async fn a_paused_capture_is_kept() {
+        let rig = CaptureRig::new(true).await;
+        rig.call("play_capture", json!({ "v": 1, "capture": "airplay" }))
+            .await
+            .unwrap();
+        rig.call("pause", json!({ "v": 1 })).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(rig.uris().len(), MUSIC.len() + 1, "pause is not the end");
+        assert_eq!(rig.model.lock().unwrap().state, "pause");
+        rig.release().await;
+    }
+
+    #[tokio::test]
+    async fn a_live_capture_cannot_be_seeked_but_music_can() {
+        let rig = CaptureRig::new(true).await;
+        rig.model.lock().unwrap().start_at(0);
+        rig.call("seek", json!({ "v": 1, "position_ms": 5000 }))
+            .await
+            .expect("music seeks");
+        rig.call("play_capture", json!({ "v": 1, "capture": "airplay" }))
+            .await
+            .unwrap();
+        let seek = rig
+            .call("seek", json!({ "v": 1, "position_ms": 5000 }))
+            .await
+            .unwrap_err();
+        assert!(matches!(seek, PluginError::Permanent(_)), "{seek:?}");
+        let delta = rig
+            .call("seek_by_delta", json!({ "v": 1, "delta_ms": 5000 }))
+            .await
+            .unwrap_err();
+        assert!(matches!(delta, PluginError::Permanent(_)), "{delta:?}");
+        rig.release().await;
+    }
+
+    #[tokio::test]
+    async fn the_writer_probe_is_asked_at_each_play() {
+        let rig = CaptureRig::new(true).await;
+        rig.call("play_capture", json!({ "v": 1, "capture": "airplay" }))
+            .await
+            .unwrap();
+        rig.writer.store(false, std::sync::atomic::Ordering::SeqCst);
+        let err = rig
+            .call("play_capture", json!({ "v": 1, "capture": "airplay" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PluginError::Transient(_)), "{err:?}");
+        rig.release().await;
+    }
+
+    // ----- what is declared -----
+
+    #[test]
+    fn the_capture_verbs_are_declared_ungated_and_are_not_course_corrections() {
+        let verbs = ["play_capture", "set_capture_tags", "end_capture"];
+        for toml_text in [
+            include_str!("../manifest.toml"),
+            include_str!("../manifest.oop.toml"),
+        ] {
+            let doc: toml::Value = toml::from_str(toml_text).unwrap();
+            let stockings = doc["stockings"].as_array().unwrap();
+            let playback = stockings
+                .iter()
+                .find(|s| s["shelf"].as_str() == Some("audio.playback"))
+                .expect("the playback stocking");
+            let declared: Vec<&str> = playback["request_types"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect();
+            let respondent: Vec<&str> = doc["capabilities"]["respondent"]
+                ["request_types"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect();
+            for v in verbs {
+                assert!(declared.contains(&v), "{v} on the shelf");
+                assert!(respondent.contains(&v), "{v} in the respondent list");
+                assert!(
+                    !COURSE_CORRECT_VERBS.contains(&v),
+                    "{v} is a source verb, not a course correction"
+                );
+                assert!(
+                    doc["capabilities"]["respondent"]
+                        .get("verb_capabilities")
+                        .and_then(|c| c.get(v))
+                        .is_none(),
+                    "{v} carries no scope, as play_now does not"
+                );
+            }
+        }
+    }
+
+    /// The `alsa://` input the player can be handed is named in one
+    /// place, so no request, config or other module can supply one.
+    #[test]
+    fn the_capture_device_is_named_only_in_the_capture_table() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for path in walk(&dir) {
+            let text = std::fs::read_to_string(&path).unwrap();
+            let live = &text[..text.find("#[cfg(test)]").unwrap_or(text.len())];
+            let file = path.file_name().unwrap().to_string_lossy().into_owned();
+            if file == "capture.rs" {
+                continue;
+            }
+            assert!(
+                !live.contains("alsa://"),
+                "{file} names an alsa input outside the capture table"
+            );
+        }
+    }
+
+    fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk(&path));
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+        out
     }
 }

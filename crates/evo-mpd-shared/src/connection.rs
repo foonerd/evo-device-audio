@@ -225,6 +225,16 @@ impl MpdConnection {
         Ok(())
     }
 
+    /// Start playback of the queue item with this songid.
+    ///
+    /// Wire form: `playid "<id>"\n`. An id that is not in the
+    /// queue ACKs.
+    pub async fn play_id(&mut self, id: u32) -> Result<(), MpdError> {
+        let arg = id.to_string();
+        self.dispatch("playid", &[arg.as_str()]).await?;
+        Ok(())
+    }
+
     /// Skip to the next song in the queue.
     ///
     /// Wire form: `next\n`. If the queue has no next song MPD may
@@ -677,6 +687,20 @@ impl MpdConnection {
         let id_str = id.to_string();
         self.dispatch("addtagid", &[id_str.as_str(), tag, value])
             .await?;
+        Ok(())
+    }
+
+    /// Remove one kind of tag from a queue item by songid, so a tag the
+    /// caller no longer has is not left behind.
+    ///
+    /// Wire form: `cleartagid "<id>" "<tag>"\n`.
+    pub async fn cleartagid(
+        &mut self,
+        id: u32,
+        tag: &str,
+    ) -> Result<(), MpdError> {
+        let id_str = id.to_string();
+        self.dispatch("cleartagid", &[id_str.as_str(), tag]).await?;
         Ok(())
     }
 
@@ -2782,6 +2806,24 @@ mod tests {
         conn.play_position(3).await.unwrap();
         let captured = rx.await.unwrap();
         assert_eq!(captured, b"play \"3\"\n");
+    }
+
+    #[tokio::test]
+    async fn play_id_sends_quoted_id() {
+        let (server, client) = duplex(4096);
+        let rx = spawn_capturing_exchange(server, b"OK MPD 0.23.5\n", b"OK\n");
+        let mut conn = handshake_for_exchange(client).await;
+        conn.play_id(41).await.unwrap();
+        assert_eq!(rx.await.unwrap(), b"playid \"41\"\n");
+    }
+
+    #[tokio::test]
+    async fn cleartagid_sends_the_id_and_the_tag() {
+        let (server, client) = duplex(4096);
+        let rx = spawn_capturing_exchange(server, b"OK MPD 0.23.5\n", b"OK\n");
+        let mut conn = handshake_for_exchange(client).await;
+        conn.cleartagid(7, "Artist").await.unwrap();
+        assert_eq!(rx.await.unwrap(), b"cleartagid \"7\" \"Artist\"\n");
     }
 
     #[tokio::test]

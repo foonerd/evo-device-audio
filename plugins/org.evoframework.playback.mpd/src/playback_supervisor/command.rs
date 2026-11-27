@@ -114,4 +114,14 @@ pub(crate) enum PlaybackError {
     /// The command was not executed.
     #[error("supervisor is shutting down")]
     Shutdown,
+
+    /// A capture was asked about and is not in the queue. Maps to
+    /// `Transient`: the capture may be started again.
+    #[error("capture_absent")]
+    CaptureAbsent,
+
+    /// A seek was asked of a live capture, which has no timeline.
+    /// Maps to `Permanent`.
+    #[error("a live capture cannot be seeked")]
+    CaptureNotSeekable,
 }

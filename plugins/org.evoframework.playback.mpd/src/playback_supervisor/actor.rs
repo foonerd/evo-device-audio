@@ -65,6 +65,7 @@ use evo_plugin_sdk::contract::{
     CustodyHandle, CustodyStateReporter, HealthStatus,
 };
 
+use crate::capture::{self, CaptureFailure, CaptureOutcome, CaptureRequest};
 use crate::mpd::{
     ConnectTimeouts, IdleSubsystem, MpdConnection, MpdEndpoint, MpdError,
     MpdSong, PlayState,
@@ -151,6 +152,18 @@ impl SupervisorHandle {
         .await
     }
 
+    /// Run a capture request. See [`SupervisorCommandSender::capture`].
+    pub(crate) async fn capture(
+        &self,
+        request: CaptureRequest,
+    ) -> Result<CaptureOutcome, PlaybackError> {
+        SupervisorCommandSender {
+            command_tx: self.command_tx.clone(),
+        }
+        .capture(request)
+        .await
+    }
+
     /// Return a cloneable command-side view of this handle.
     /// The returned [`SupervisorCommandSender`] can dispatch
     /// commands to the same supervisor but cannot initiate
@@ -218,6 +231,26 @@ impl SupervisorCommandSender {
         self.command_tx
             .send(SupervisorMessage::Command {
                 cmd,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| PlaybackError::Shutdown)?;
+        match reply_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(PlaybackError::Shutdown),
+        }
+    }
+
+    /// Run a capture request on the supervisor's command
+    /// connection, serialised with every other command.
+    pub(crate) async fn capture(
+        &self,
+        request: CaptureRequest,
+    ) -> Result<CaptureOutcome, PlaybackError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(SupervisorMessage::Capture {
+                request,
                 reply: reply_tx,
             })
             .await
@@ -567,6 +600,14 @@ enum SupervisorMessage {
         cmd: PlaybackCommand,
         reply: oneshot::Sender<Result<(), PlaybackError>>,
     },
+    /// A capture request: put the capture in the queue and play it,
+    /// retag it, or take it out. Runs on the command connection, so
+    /// it is ordered with every other command and the idle-driven
+    /// sweep never sees a capture half made.
+    Capture {
+        request: CaptureRequest,
+        reply: oneshot::Sender<Result<CaptureOutcome, PlaybackError>>,
+    },
     /// One-shot query for the current playback state report.
     /// Fired by the warden's `get_now_playing` read verb. The
     /// supervisor builds a fresh `PlaybackStateReport` from a
@@ -811,6 +852,31 @@ impl SupervisorTask {
                             ).await;
                             let _ = reply.send(result);
                         }
+                        Some(SupervisorMessage::Capture { request, reply }) => {
+                            let result = handle_capture(
+                                &request,
+                                &mut self.cmd_conn,
+                                &self.endpoint,
+                                self.timeouts,
+                            ).await;
+                            let ok = result.is_ok();
+                            let _ = reply.send(result);
+                            if ok {
+                                emit_best_effort_report(
+                                    &mut self.cmd_conn,
+                                    &self.custody_handle,
+                                    self.reporter.as_ref(),
+                                    &self.subject_emitter,
+                                    &mut self.file_tracker,
+                                    self.music_directory.as_deref(),
+                                    IntentCells {
+                                        mute: &self.muted,
+                                        shuffle: &self.shuffle_mode,
+                                    }
+                                    .read(),
+                                ).await;
+                            }
+                        }
                         Some(SupervisorMessage::QueryState { reply }) => {
                             // Live MPD status + currentsong round-trip;
                             // build a PlaybackStateReport carrying the
@@ -862,6 +928,27 @@ impl SupervisorTask {
                                 changed_count = changed.len(),
                                 "idle wake"
                             );
+                            // A capture lives only while it is the item
+                            // playing or paused. Whatever moved the player
+                            // off it — stop, another song, a cleared queue —
+                            // ends it here, so it is never left queued.
+                            if changed.iter().any(|s| {
+                                matches!(
+                                    s,
+                                    IdleSubsystem::Player
+                                        | IdleSubsystem::Playlist
+                                )
+                            }) {
+                                if let Err(e) =
+                                    capture::reap_all(&mut self.cmd_conn).await
+                                {
+                                    tracing::debug!(
+                                        plugin = PLUGIN_NAME,
+                                        error = %e,
+                                        "capture sweep failed"
+                                    );
+                                }
+                            }
                             emit_best_effort_report(
                                 &mut self.cmd_conn,
                                 &self.custody_handle,
@@ -891,6 +978,15 @@ async fn handle_command(
     muted: &crate::mute_cell::MuteCell,
     pre_mute_volume: &mut u8,
 ) -> Result<(), PlaybackError> {
+    // A live capture has no timeline to seek along.
+    if matches!(
+        cmd,
+        PlaybackCommand::Seek(_) | PlaybackCommand::SeekRelative(_)
+    ) && matches!(capture::any_live(cmd_conn).await, Ok(true))
+    {
+        return Err(PlaybackError::CaptureNotSeekable);
+    }
+
     // First attempt on the current connection.
     match dispatch_command(cmd.clone(), cmd_conn, muted, pre_mute_volume).await
     {
@@ -922,6 +1018,37 @@ async fn handle_command(
     match dispatch_command(cmd, cmd_conn, muted, pre_mute_volume).await {
         Ok(()) => Ok(()),
         Err(e) => Err(classify_command_error(e)),
+    }
+}
+
+/// Run a capture request with the same try-then-reconnect-then-retry
+/// contract `handle_command` uses.
+async fn handle_capture(
+    request: &CaptureRequest,
+    cmd_conn: &mut MpdConnection,
+    endpoint: &MpdEndpoint,
+    timeouts: ConnectTimeouts,
+) -> Result<CaptureOutcome, PlaybackError> {
+    let first = match capture::run(cmd_conn, request).await {
+        Ok(out) => return Ok(out),
+        Err(CaptureFailure::Absent) => {
+            return Err(PlaybackError::CaptureAbsent)
+        }
+        Err(CaptureFailure::Mpd(e)) if !error_calls_for_reconnect(&e) => {
+            return Err(classify_command_error(e));
+        }
+        Err(CaptureFailure::Mpd(e)) => e,
+    };
+    tracing::debug!(
+        plugin = PLUGIN_NAME,
+        error = %first,
+        "capture request hit transient error; reconnecting"
+    );
+    reconnect_cmd_conn(cmd_conn, endpoint, timeouts).await?;
+    match capture::run(cmd_conn, request).await {
+        Ok(out) => Ok(out),
+        Err(CaptureFailure::Absent) => Err(PlaybackError::CaptureAbsent),
+        Err(CaptureFailure::Mpd(e)) => Err(classify_command_error(e)),
     }
 }
 
