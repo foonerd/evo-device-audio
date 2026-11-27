@@ -246,6 +246,9 @@ pub(crate) mod fake {
         pub calls: Mutex<Vec<Call>>,
         pub play_error: Mutex<Option<PlayerError>>,
         pub tags_error: Mutex<Option<PlayerError>>,
+        /// How long ending the capture takes, so a test can tell the
+        /// receiver waiting for it from something else ending it.
+        pub end_delay: Mutex<Duration>,
     }
 
     impl FakePlayer {
@@ -286,6 +289,8 @@ pub(crate) mod fake {
             }
         }
         async fn end_capture(&self) -> Result<(), PlayerError> {
+            let delay = *self.end_delay.lock().unwrap();
+            tokio::time::sleep(delay).await;
             self.record(Call::End);
             Ok(())
         }

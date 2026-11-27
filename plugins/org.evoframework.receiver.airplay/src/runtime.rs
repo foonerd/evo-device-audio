@@ -816,6 +816,10 @@ mod tests {
     struct CapturingAnnouncer {
         announces: TestMutex<Vec<SubjectAnnouncement>>,
         updates: TestMutex<Vec<serde_json::Value>>,
+        /// When set, each update also records whether the capture had
+        /// already been taken out of this player.
+        player: TestMutex<Option<Arc<crate::player::fake::FakePlayer>>>,
+        ended_at: TestMutex<Vec<(String, bool)>>,
     }
 
     impl std::fmt::Debug for CapturingAnnouncer {
@@ -852,6 +856,13 @@ mod tests {
             state: serde_json::Value,
         ) -> Report<'_> {
             Box::pin(async move {
+                if let Some(p) = self.player.lock().unwrap().as_ref() {
+                    let word =
+                        state["state"].as_str().unwrap_or("").to_string();
+                    let ended =
+                        p.calls().contains(&crate::player::fake::Call::End);
+                    self.ended_at.lock().unwrap().push((word, ended));
+                }
                 self.updates.lock().unwrap().push(state);
                 Ok(())
             })
@@ -1022,10 +1033,10 @@ mod tests {
                 .is_ok_and(|g| g.status == Status::Advertising)
         })
         .await;
-        assert!(
-            r.player.calls().contains(&Call::End),
-            "the capture was ended"
-        );
+        eventually("the capture was ended", || {
+            r.player.calls().contains(&Call::End)
+        })
+        .await;
         eventually("the device is closed", || {
             r.opener.live.load(Ordering::SeqCst) == 0
         })
@@ -1035,19 +1046,45 @@ mod tests {
     #[tokio::test]
     async fn the_capture_is_out_of_the_player_before_the_session_is_reported_over(
     ) {
-        use crate::player::fake::Call;
         let r = rig();
+        // Ending the capture takes a moment, so only waiting for it can
+        // have it done by the time the end is published.
+        *r.player.end_delay.lock().unwrap() = Duration::from_millis(250);
+        let announcer = Arc::new(CapturingAnnouncer::default());
+        *announcer.player.lock().unwrap() = Some(r.player.clone());
+        r.rt.attach_subject_publisher(announcer.clone())
+            .await
+            .unwrap();
         let e = r.rt.enable(None).await.unwrap();
         let (mut s, _, _) = begin(e.port).await;
-        s.teardown().await.unwrap();
-        eventually("over", || {
+        eventually("a session", || {
             r.rt.inner
                 .try_lock()
-                .is_ok_and(|g| g.status == Status::Advertising)
+                .is_ok_and(|g| matches!(g.status, Status::Session { .. }))
         })
         .await;
-        // By the time the state said advertising, End had been asked.
-        assert!(r.player.calls().contains(&Call::End));
+        s.teardown().await.unwrap();
+        eventually("the end is published", || {
+            announcer
+                .ended_at
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(w, _)| w == "session")
+                && announcer
+                    .ended_at
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .is_some_and(|(w, _)| w == "advertising")
+        })
+        .await;
+        let seen = announcer.ended_at.lock().unwrap().clone();
+        let over = seen.last().expect("the end was published");
+        assert!(
+            over.1,
+            "the capture was out when the end was published: {seen:?}"
+        );
     }
 
     #[tokio::test]
@@ -1137,7 +1174,10 @@ mod tests {
         })
         .await;
         assert!(s.is_closed().await, "the sender's connection is closed");
-        assert!(r.player.calls().contains(&Call::End));
+        eventually("the capture was ended", || {
+            r.player.calls().contains(&Call::End)
+        })
+        .await;
         eventually("the device is closed", || {
             r.opener.live.load(Ordering::SeqCst) == 0
         })
@@ -1171,6 +1211,7 @@ mod tests {
     async fn disabling_mid_stream_takes_the_capture_out_before_it_returns() {
         use crate::player::fake::Call;
         let r = rig();
+        *r.player.end_delay.lock().unwrap() = Duration::from_millis(250);
         let e = r.rt.enable(None).await.unwrap();
         let (_s, reply, _) = begin(e.port).await;
         assert_eq!(reply.code(), 200);

@@ -100,6 +100,11 @@ mod tests {
             Level::Volume(0),
             "below the floor is silent, not mute"
         );
+        assert_eq!(
+            level_from_db(-120.0),
+            Level::Volume(0),
+            "only the sender's mute is mute"
+        );
         assert_eq!(level_from_db(-144.0), Level::Mute);
         assert_eq!(
             level_from_db(3.0),
