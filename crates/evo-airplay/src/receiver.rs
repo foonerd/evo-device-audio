@@ -15,7 +15,7 @@ use crate::events::EventSender;
 use crate::identity::Identity;
 use crate::server::{serve, Context};
 use crate::sink::{AudioSink, SinkFactory};
-use crate::{avahi, info, mac, Config};
+use crate::{info, mac, Config};
 
 const DEFAULT_NAME: &str = "Evo Audio";
 const DEFAULT_PORT: u16 = 7000;
@@ -62,7 +62,6 @@ pub struct ReceiverBuilder {
     mac: Option<[u8; 6]>,
     identity: Option<Identity>,
     identity_path: Option<PathBuf>,
-    advertise: bool,
     password: Option<String>,
 }
 
@@ -74,7 +73,6 @@ impl ReceiverBuilder {
             mac: None,
             identity: None,
             identity_path: None,
-            advertise: true,
             password: None,
         }
     }
@@ -111,14 +109,6 @@ impl ReceiverBuilder {
     /// first run.
     pub fn identity_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.identity_path = Some(path.into());
-        self
-    }
-
-    /// Whether [`Receiver::run`] registers `_airplay._tcp` with the system
-    /// Avahi daemon (default `true`). Pass `false` when the host owns its
-    /// mDNS registration and use [`Receiver::txt_records`] to advertise.
-    pub fn advertise(mut self, advertise: bool) -> Self {
-        self.advertise = advertise;
         self
     }
 
@@ -174,7 +164,6 @@ impl ReceiverBuilder {
                 password: self.password,
             },
             identity,
-            advertise: self.advertise,
         })
     }
 }
@@ -185,7 +174,6 @@ impl ReceiverBuilder {
 pub struct Receiver {
     config: Config,
     identity: Identity,
-    advertise: bool,
 }
 
 impl Receiver {
@@ -205,11 +193,23 @@ impl Receiver {
         &self.identity
     }
 
-    /// The `_airplay._tcp` TXT records, for hosts that own their mDNS
-    /// registration (built with `advertise(false)`). Advertise these on
-    /// [`Config::port`] under the receiver's name.
+    /// The `_airplay._tcp` TXT records. The host owns mDNS registration:
+    /// advertise these on [`Config::port`] under the receiver's name.
     pub fn txt_records(&self) -> Vec<String> {
         info::txt_records(&self.config, &self.identity)
+    }
+
+    /// The `_raop._tcp` TXT records. AirPlay 2 receivers advertise this
+    /// service alongside `_airplay._tcp`, on the same port, under the
+    /// instance name [`raop_instance_name`](Self::raop_instance_name).
+    pub fn raop_txt_records(&self) -> Vec<String> {
+        info::raop_txt_records(&self.config, &self.identity)
+    }
+
+    /// The `_raop._tcp` instance name: the device id without its colons,
+    /// an `@`, then the receiver's name.
+    pub fn raop_instance_name(&self) -> String {
+        info::raop_instance_name(&self.config)
     }
 
     /// Serve AirPlay on the caller's runtime until a listener error.
@@ -220,8 +220,8 @@ impl Receiver {
     /// milestones are reported on `events`; dropping the receiving half is
     /// allowed and simply discards them.
     ///
-    /// Cancellation: dropping the returned future (e.g. in `select!`) stops
-    /// accepting new connections and withdraws the Avahi advertisement;
+    /// The receiver advertises nothing itself. Cancellation: dropping the
+    /// returned future (e.g. in `select!`) stops accepting new connections;
     /// already-accepted connections are detached and end when their sockets
     /// close.
     pub async fn run<F>(
@@ -252,19 +252,6 @@ impl Receiver {
                     format!("cannot bind control port {port}: {e}"),
                 )
             })?,
-        };
-
-        let _advertisement = if self.advertise {
-            let records = self.txt_records();
-            match avahi::publish(&self.config.name, port, &records).await {
-                Ok(ad) => Some(ad),
-                Err(e) => {
-                    warn!("avahi advertisement disabled ({e}); is avahi-daemon running?");
-                    None
-                }
-            }
-        } else {
-            None
         };
 
         let sink_factory: SinkFactory = Arc::new(sink_factory);
@@ -347,12 +334,48 @@ mod tests {
             .identity(Identity::generate())
             .name("Office")
             .port(7100)
-            .advertise(false)
             .build()
             .unwrap();
         assert_eq!(receiver.config().name, "Office");
         assert_eq!(receiver.config().port, 7100);
-        assert!(!receiver.advertise);
+    }
+
+    #[test]
+    fn raop_records_describe_the_same_device() {
+        let receiver = Receiver::builder()
+            .identity(Identity::generate())
+            .mac([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+            .name("Office")
+            .build()
+            .unwrap();
+        let records = receiver.raop_txt_records();
+        for want in [
+            "cn=0,1",
+            "da=true",
+            "et=0,4",
+            "md=0,1,2",
+            "tp=UDP",
+            "vn=65537",
+            "sf=0x4",
+            "ft=0x405FCA00,0x18340",
+        ] {
+            assert!(records.iter().any(|r| r == want), "missing {want}");
+        }
+        assert!(records.iter().any(|r| r.starts_with("pk=")));
+        assert!(!records.iter().any(|r| r.starts_with("pw=")));
+        assert_eq!(receiver.raop_instance_name(), "AABBCCDDEEFF@Office");
+    }
+
+    #[test]
+    fn raop_records_flag_a_required_password() {
+        let receiver = Receiver::builder()
+            .identity(Identity::generate())
+            .password("sekrit1")
+            .build()
+            .unwrap();
+        let records = receiver.raop_txt_records();
+        assert!(records.iter().any(|r| r == "pw=true"));
+        assert!(records.iter().any(|r| r == "sf=0x84"));
     }
 
     #[test]

@@ -1449,7 +1449,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
- "zbus",
 ]
 
 [[package]]

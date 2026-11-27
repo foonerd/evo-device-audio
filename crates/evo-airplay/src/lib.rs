@@ -40,7 +40,7 @@
 
 #![warn(missing_docs)]
 
-mod avahi;
+mod apple_interop;
 mod buffered;
 mod crypto_stream;
 mod decode;

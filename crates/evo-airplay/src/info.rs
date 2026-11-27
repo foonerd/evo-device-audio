@@ -28,6 +28,36 @@ pub fn txt_records(config: &Config, identity: &Identity) -> Vec<String> {
     ]
 }
 
+/// The `_raop._tcp` TXT records an AirPlay 2 receiver advertises beside
+/// `_airplay._tcp`: the same device, the legacy-service view of it. `pw` is
+/// present only when a password is required.
+pub fn raop_txt_records(config: &Config, identity: &Identity) -> Vec<String> {
+    let (lo, hi) = config.features_split();
+    let mut records = vec![
+        "cn=0,1".to_string(),
+        "da=true".to_string(),
+        "et=0,4".to_string(),
+        format!("ft=0x{lo:X},0x{hi:X}"),
+        "md=0,1,2".to_string(),
+        format!("am={}", config.model),
+        format!("pk={}", identity.public_key_hex()),
+        format!("sf=0x{:X}", config.status_flags),
+        "tp=UDP".to_string(),
+        "vn=65537".to_string(),
+        format!("vs={}", config.source_version),
+    ];
+    if config.password.is_some() {
+        records.push("pw=true".to_string());
+    }
+    records
+}
+
+/// The `_raop._tcp` instance name: the device id with its colons removed,
+/// `@`, then the receiver's name.
+pub fn raop_instance_name(config: &Config) -> String {
+    format!("{}@{}", config.device_id().replace(':', ""), config.name)
+}
+
 /// Pack TXT records the way `txtAirPlay` wants them: each record as a
 /// length-prefixed byte string (1-byte length + bytes), concatenated — the
 /// DNS-SD TXT wire format.
