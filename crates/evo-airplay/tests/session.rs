@@ -619,3 +619,54 @@ async fn a_setup_that_is_not_a_binary_plist_or_nests_absurdly_is_refused_and_the
 
     assert!(sender.info().await.expect("still serving").is_ok());
 }
+
+#[tokio::test]
+async fn cancelling_the_receiver_closes_the_listener_and_every_connection() {
+    let (factory, _pcm) = capture();
+    let gate = CountingGate::new(false);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (events_tx, _events) = tokio::sync::mpsc::unbounded_channel();
+    let context = Arc::new(Context::new(
+        Config {
+            name: "Test Room".into(),
+            port: addr.port(),
+            mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            model: "EvoAudio,1".into(),
+            source_version: "366.0".into(),
+            features: 0x0001_8340_405F_CA00,
+            status_flags: 0x4,
+            password: None,
+        },
+        Identity::generate(),
+        factory,
+        events_tx,
+    ));
+    let mut context = Arc::try_unwrap(context).ok().expect("sole owner");
+    context.gate = gate.clone();
+    let server = tokio::spawn(serve(listener, Arc::new(context)));
+
+    // One streaming session, and one connection that never gets past hello.
+    let (_streaming, reply, _) = begin(addr, 103).await;
+    assert!(reply.is_ok());
+    let mut idle = tokio::net::TcpStream::connect(addr).await.expect("idle");
+
+    server.abort();
+    let _ = server.await;
+
+    use tokio::io::AsyncReadExt;
+    let mut byte = [0u8; 1];
+    let closed =
+        tokio::time::timeout(Duration::from_secs(3), idle.read(&mut byte))
+            .await
+            .expect("the idle connection must be closed, not left open");
+    assert!(matches!(closed, Ok(0) | Err(_)));
+    assert!(
+        tokio::net::TcpStream::connect(addr).await.is_err(),
+        "the listener is closed"
+    );
+    eventually("the streaming session released its slot", || {
+        gate.releases() == 1
+    })
+    .await;
+}

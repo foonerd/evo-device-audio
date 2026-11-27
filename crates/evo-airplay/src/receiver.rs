@@ -260,9 +260,9 @@ impl Receiver {
     /// allowed and simply discards them.
     ///
     /// The receiver advertises nothing itself. Cancellation: dropping the
-    /// returned future (e.g. in `select!`) stops accepting new connections;
-    /// already-accepted connections are detached and end when their sockets
-    /// close.
+    /// returned future (e.g. in `select!`, or by aborting the task running it)
+    /// closes the listener and every accepted connection, ends the running
+    /// session and releases the host's gate.
     pub async fn run<F>(
         self,
         sink_factory: F,

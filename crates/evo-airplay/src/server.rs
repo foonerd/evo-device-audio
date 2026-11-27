@@ -86,13 +86,23 @@ impl Context {
     }
 }
 
+/// Accept connections on `listener` until an accept error, serving each on its
+/// own task. The connection tasks belong to this future: dropping it (a host
+/// cancelling the receiver) aborts every one of them, which closes their
+/// sockets and drops their sessions, so a stopped receiver holds nothing open.
 pub async fn serve(
     listener: TcpListener,
     context: Arc<Context>,
 ) -> io::Result<()> {
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let mut tasks = tokio::task::JoinSet::new();
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            // Reap finished connections so the set stays as small as the
+            // number of live ones.
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => continue,
+        };
         // The host may not want to talk to this peer at all: no reply, no
         // task, no permit.
         if !context.gate.accept_peer(peer.ip().to_canonical()) {
@@ -109,7 +119,7 @@ pub async fn serve(
             continue;
         };
         let context = context.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let _permit = permit;
             debug!("[{peer}] connected");
             if let Err(e) =
