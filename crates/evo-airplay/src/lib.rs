@@ -67,6 +67,7 @@ mod fairplay;
 mod http;
 mod identity;
 mod info;
+mod limiter;
 mod mac;
 mod pairing;
 mod player;
@@ -92,6 +93,7 @@ pub mod tlv;
 pub use events::{Event, EventSender};
 pub use identity::Identity;
 pub use info::txt_records;
+pub use limiter::PairingLimiter;
 pub use policy::{Admission, SessionControl, SessionGate, SingleSession};
 pub use receiver::{Receiver, ReceiverBuilder};
 pub use sink::{AudioSink, SinkError, SinkFactory};
@@ -113,12 +115,12 @@ pub struct Config {
     pub features: u64,
     /// AirPlay status flags.
     pub status_flags: u32,
-    /// `Some` → require this password to pair — Apple's own word: iOS and
-    /// macOS show a "password" dialog and accept alphanumerics, not just
-    /// digits. Advertised as "password required" via status-flag bit 7; a
-    /// sender enters it in transient pairing. `None` → the standard
-    /// transient code `3939`. Unlike openairplay1 there is no "open" mode —
-    /// AirPlay 2 always pairs. Never logged.
+    /// `Some` → require this password to pair: iOS and macOS show a
+    /// "password" dialog and accept alphanumerics, not just digits. It is
+    /// advertised as "password required" via status-flag bit 7 and entered by
+    /// the sender during transient pairing. `None` → the receiver is **open**:
+    /// pairing uses the protocol's fixed, public code, so any device that can
+    /// reach it may stream. Never logged.
     pub password: Option<String>,
 }
 

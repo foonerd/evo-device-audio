@@ -164,7 +164,16 @@ impl Sender {
         let (Some(salt), Some(server_key)) =
             (m2.get(ty::SALT), m2.get(ty::PUBLIC_KEY))
         else {
-            return Err(io::Error::other("pair-setup M2 lacks salt or key"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "pairing refused (error {:?}, retry in {:?} s)",
+                    m2.get_u8(ty::ERROR),
+                    m2.get(ty::RETRY_DELAY)
+                        .filter(|d| d.len() == 2)
+                        .map(|d| u16::from_le_bytes([d[0], d[1]]))
+                ),
+            ));
         };
         let mut client = SrpClient::new(password);
         let proof = client.process(salt, server_key);

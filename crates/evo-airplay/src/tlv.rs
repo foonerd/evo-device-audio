@@ -14,6 +14,7 @@ pub mod ty {
     pub const ENCRYPTED_DATA: u8 = 0x05;
     pub const STATE: u8 = 0x06;
     pub const ERROR: u8 = 0x07;
+    pub const RETRY_DELAY: u8 = 0x08;
     pub const SIGNATURE: u8 = 0x0a;
     pub const FLAGS: u8 = 0x13;
 }

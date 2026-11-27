@@ -36,10 +36,12 @@ use crate::fairplay;
 use crate::http::{Request, Response};
 use crate::identity::Identity;
 use crate::info::info_plist;
+use crate::limiter::PairingLimiter;
 use crate::pairing::{Outcome, PairSetup};
 use crate::policy::{SessionControl, SessionGate, SingleSession};
 use crate::session::{Session, SetupError};
 use crate::sink::SinkFactory;
+use crate::tlv::{ty, Tlv};
 use crate::Config;
 
 pub const SERVER_ID: &str = "AirTunes/366.0";
@@ -58,6 +60,9 @@ pub struct Context {
     pub gate: Arc<dyn SessionGate>,
     /// The host's handle for ending the running session from outside.
     pub control: SessionControl,
+    /// Failed-pairing bookkeeping: a peer that keeps guessing is told to
+    /// back off.
+    pub limiter: PairingLimiter,
 }
 
 impl Context {
@@ -76,6 +81,7 @@ impl Context {
             events,
             gate: Arc::new(SingleSession::new()),
             control: SessionControl::new(),
+            limiter: PairingLimiter::default(),
         }
     }
 }
@@ -180,15 +186,27 @@ async fn handle_connection(
         // `/pair-setup` advances the state machine and may install the cipher
         // (after the plaintext M4 response is written).
         if request.method == "POST" && request.target == "/pair-setup" {
-            let outcome = pair.handle(&request.body);
-            let (tlv, secret) = match outcome {
-                Outcome::Continue(tlv) => (tlv, None),
-                Outcome::Failed(tlv) => (tlv, None),
-                Outcome::Done {
-                    response,
-                    shared_secret,
-                } => (response, Some(shared_secret)),
-            };
+            let peer_ip = peer.ip().to_canonical();
+            let (tlv, secret) =
+                if let Some(wait) = context.limiter.locked_for(peer_ip) {
+                    debug!("[{peer}] pairing refused: backing off {wait:?}");
+                    (backoff_response(wait), None)
+                } else {
+                    match pair.handle(&request.body) {
+                        Outcome::Continue(tlv) => (tlv, None),
+                        Outcome::Failed(tlv) => {
+                            context.limiter.record_failure(peer_ip);
+                            (tlv, None)
+                        }
+                        Outcome::Done {
+                            response,
+                            shared_secret,
+                        } => {
+                            context.limiter.record_success(peer_ip);
+                            (response, Some(shared_secret))
+                        }
+                    }
+                };
             let response = finalize(
                 Response::ok(&request.protocol).body(PAIRING_CONTENT_TYPE, tlv),
                 &request,
@@ -226,6 +244,18 @@ async fn handle_connection(
         conn.write_response(&response).await?;
     }
     Ok(())
+}
+
+/// HAP's "Backoff" pairing error, with the seconds the sender must wait.
+const PAIRING_ERROR_BACKOFF: u8 = 0x03;
+
+fn backoff_response(wait: Duration) -> Vec<u8> {
+    let seconds = u16::try_from(wait.as_secs().max(1)).unwrap_or(u16::MAX);
+    let mut tlv = Tlv::new();
+    tlv.put_u8(ty::STATE, 2)
+        .put_u8(ty::ERROR, PAIRING_ERROR_BACKOFF)
+        .put(ty::RETRY_DELAY, seconds.to_le_bytes().to_vec());
+    tlv.encode()
 }
 
 /// Resolves when the host asks for the running session to end; never, while

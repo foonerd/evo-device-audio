@@ -21,8 +21,8 @@ use std::time::Duration;
 use evo_airplay::sender::{channel_hz, parse_frames, Sender, StreamPorts};
 use evo_airplay::server::{serve, Context};
 use evo_airplay::{
-    Admission, AudioSink, Config, Event, Identity, SessionControl, SessionGate,
-    SingleSession, SinkError, SinkFactory,
+    Admission, AudioSink, Config, Event, Identity, PairingLimiter,
+    SessionControl, SessionGate, SingleSession, SinkError, SinkFactory,
 };
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -129,6 +129,15 @@ struct Harness {
 }
 
 async fn start(factory: SinkFactory, gate: Arc<CountingGate>) -> Harness {
+    start_custom(factory, gate, None, PairingLimiter::default()).await
+}
+
+async fn start_custom(
+    factory: SinkFactory,
+    gate: Arc<CountingGate>,
+    password: Option<&str>,
+    limiter: PairingLimiter,
+) -> Harness {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
@@ -142,13 +151,14 @@ async fn start(factory: SinkFactory, gate: Arc<CountingGate>) -> Harness {
             source_version: "366.0".into(),
             features: 0x0001_8340_405F_CA00,
             status_flags: 0x4,
-            password: None,
+            password: password.map(str::to_string),
         },
         identity: Identity::generate(),
         sink_factory: factory,
         events: events_tx,
         gate: gate.clone(),
         control: control.clone(),
+        limiter,
     });
     tokio::spawn(serve(listener, context));
     Harness {
@@ -452,4 +462,61 @@ async fn a_sink_that_ignores_stop_cannot_stall_the_runtime_or_free_the_gate_earl
         h.gate.releases() == 1
     })
     .await;
+}
+
+#[tokio::test]
+async fn a_peer_that_keeps_guessing_is_told_to_back_off_then_may_try_again() {
+    let (factory, _pcm) = capture();
+    let h = start_custom(
+        factory,
+        CountingGate::new(false),
+        Some("sekrit1"),
+        PairingLimiter::new(3, Duration::from_millis(600)),
+    )
+    .await;
+    for _ in 0..3 {
+        let refused = Sender::connect(h.addr, "wrong").await.err();
+        let refused = refused.expect("a wrong password is refused");
+        assert!(
+            refused.to_string().contains("Some(2)"),
+            "authentication error: {refused}"
+        );
+    }
+    // The right password is now turned away: this peer must wait.
+    let backed_off = Sender::connect(h.addr, "sekrit1")
+        .await
+        .err()
+        .expect("locked out");
+    assert!(
+        backed_off.to_string().contains("Some(3)"),
+        "backoff error: {backed_off}"
+    );
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(
+        Sender::connect(h.addr, "sekrit1").await.is_ok(),
+        "the right password pairs once the wait is over"
+    );
+}
+
+#[tokio::test]
+async fn a_success_resets_the_failure_count() {
+    let (factory, _pcm) = capture();
+    let h = start_custom(
+        factory,
+        CountingGate::new(false),
+        Some("sekrit1"),
+        PairingLimiter::new(3, Duration::from_secs(30)),
+    )
+    .await;
+    for _ in 0..2 {
+        assert!(Sender::connect(h.addr, "wrong").await.is_err());
+    }
+    assert!(Sender::connect(h.addr, "sekrit1").await.is_ok());
+    for _ in 0..2 {
+        assert!(Sender::connect(h.addr, "wrong").await.is_err());
+    }
+    assert!(
+        Sender::connect(h.addr, "sekrit1").await.is_ok(),
+        "two failures after a success are not a lockout"
+    );
 }

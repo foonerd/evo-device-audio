@@ -17,7 +17,10 @@ const STATE_M2: u8 = 2;
 const STATE_M4: u8 = 4;
 const FLAG_TRANSIENT: u8 = 0x10;
 const ERROR_AUTHENTICATION: u8 = 0x02;
-const PAIR_SETUP_PIN: &str = "3939";
+/// The pairing code the protocol fixes for a receiver with no password. It is
+/// public by design: a receiver using it is **open** to every device that can
+/// reach it, and the host says so to its operator.
+pub const OPEN_RECEIVER_CODE: &str = "3939";
 
 pub enum Outcome {
     /// A TLV response; the exchange continues.
@@ -45,7 +48,7 @@ impl PairSetup {
         PairSetup {
             srp: None,
             transient: false,
-            pin: password.unwrap_or(PAIR_SETUP_PIN).to_string(),
+            pin: password.unwrap_or(OPEN_RECEIVER_CODE).to_string(),
         }
     }
 
@@ -109,8 +112,9 @@ impl PairSetup {
         let response = response.encode();
 
         if self.transient {
-            let shared_secret =
-                *srp.session_key().expect("session key set after verify");
+            let Some(shared_secret) = srp.session_key().copied() else {
+                return failed(STATE_M4, "no session key after verify");
+            };
             debug!("pair-setup complete (transient); channel now encrypted");
             Outcome::Done {
                 response,

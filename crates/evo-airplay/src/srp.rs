@@ -154,6 +154,13 @@ impl SrpServer {
     /// Verify the client's proof `M1` over its public key `A`. On success,
     /// stores the session key and returns the server proof `HAMK`.
     pub fn verify(&mut self, a_bytes: &[u8], m1: &[u8]) -> Option<[u8; 64]> {
+        // `A` is an element of the group and `M1` a SHA-512 digest: anything
+        // longer is not an attempt, and a huge `A` would make the modular
+        // arithmetic below cost the sender nothing and us a great deal.
+        let width = usize::try_from(self.n.bits().div_ceil(8)).ok()?;
+        if a_bytes.len() > width || m1.len() != 64 {
+            return None;
+        }
         let a = BigUint::from_bytes_be(a_bytes);
         if &a % &self.n == BigUint::from(0u32) {
             return None; // SRP-6a safety check
@@ -292,5 +299,15 @@ mod tests {
         let m1 = client.process(server.salt(), &server.public_b());
         server.verify(&client.public_a(), &m1).unwrap();
         assert_eq!(server.session_key().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn an_oversized_client_key_and_a_wrong_length_proof_are_not_attempts() {
+        let mut server = SrpServer::new("3939");
+        let huge = vec![0x7fu8; 100_000];
+        assert!(server.verify(&huge, &[0u8; 64]).is_none());
+        let client = SrpClient::new("3939");
+        assert!(server.verify(&client.public_a(), &[0u8; 63]).is_none());
+        assert!(server.verify(&client.public_a(), &[0u8; 65]).is_none());
     }
 }

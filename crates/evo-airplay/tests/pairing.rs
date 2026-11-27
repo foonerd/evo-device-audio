@@ -55,6 +55,7 @@ async fn start_with_password(
         events,
         gate: Arc::new(evo_airplay::SingleSession::new()),
         control: evo_airplay::SessionControl::new(),
+        limiter: evo_airplay::PairingLimiter::default(),
     });
     tokio::spawn(serve(listener, context));
     addr

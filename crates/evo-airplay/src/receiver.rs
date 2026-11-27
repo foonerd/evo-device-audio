@@ -141,6 +141,17 @@ impl ReceiverBuilder {
 
     /// Resolve the identity and MAC and produce a runnable [`Receiver`].
     pub fn build(self) -> io::Result<Receiver> {
+        if let Some(password) = &self.password {
+            if password.is_empty()
+                || password.len() > 128
+                || password.chars().any(char::is_control)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the password must be 1 to 128 printable characters",
+                ));
+            }
+        }
         let identity = match (self.identity, &self.identity_path) {
             (Some(identity), None) => identity,
             (None, Some(path)) => Identity::load_or_create(path)?,
@@ -211,6 +222,13 @@ impl Receiver {
     /// Clones share the same session.
     pub fn session_control(&self) -> SessionControl {
         self.control.clone()
+    }
+
+    /// Whether the receiver has no password, so that any device able to reach
+    /// it may pair and stream. The pairing code is then the protocol's fixed,
+    /// public one; say so to the operator.
+    pub fn is_open(&self) -> bool {
+        self.config.password.is_none()
     }
 
     /// The `_airplay._tcp` TXT records. The host owns mDNS registration:
@@ -286,6 +304,7 @@ impl Receiver {
             events,
             gate: self.gate,
             control: self.control,
+            limiter: crate::limiter::PairingLimiter::default(),
         });
         serve(listener, context).await
     }
@@ -364,6 +383,40 @@ mod tests {
             .unwrap();
         assert_eq!(receiver.config().name, "Office");
         assert_eq!(receiver.config().port, 7100);
+    }
+
+    #[test]
+    fn a_receiver_without_a_password_is_open() {
+        let open = Receiver::builder()
+            .identity(Identity::generate())
+            .build()
+            .unwrap();
+        assert!(open.is_open());
+        let closed = Receiver::builder()
+            .identity(Identity::generate())
+            .password("sekrit1")
+            .build()
+            .unwrap();
+        assert!(!closed.is_open());
+    }
+
+    #[test]
+    fn a_password_that_cannot_be_typed_is_refused_at_build() {
+        for bad in ["", "line\nbreak", &"x".repeat(129)] {
+            let outcome = Receiver::builder()
+                .identity(Identity::generate())
+                .password(bad)
+                .build();
+            let err = outcome.err().expect("refused");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad:?}");
+        }
+        assert!(Receiver::builder()
+            .identity(Identity::generate())
+            .password(
+                "exactly sixty four characters long and nothing else here ok"
+            )
+            .build()
+            .is_ok());
     }
 
     #[test]
