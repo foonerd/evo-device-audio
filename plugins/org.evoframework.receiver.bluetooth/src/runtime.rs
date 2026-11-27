@@ -54,6 +54,13 @@ pub const WINDOW_DEFAULT: u32 = 120;
 /// The longest pairing window, in seconds.
 pub const WINDOW_MAX: u32 = 300;
 
+/// Seconds added to the window for the host stack's own timeouts. They are
+/// the backstop for a plugin that dies mid-window, so the plugin's own close
+/// must always come first: when the stack's timer closes the adapter instead,
+/// the stack reports it closed but the controller can stay visible over the
+/// air.
+pub const STACK_MARGIN: u32 = 5;
+
 /// Degraded reasons.
 pub mod reason {
     /// The stack is not running or cannot be reached.
@@ -462,8 +469,20 @@ impl BluetoothRuntime {
             bluez.set_pairable(false).await.map_err(|e| reason_of(&e))?;
             adapter.pairable = false;
         }
-        // A window that died with the plugin left the stack's own timeouts at
-        // the window's length: put them back.
+        // A window that died with the plugin: the stack's own timer may have
+        // closed it, in which case the adapter reads closed but the controller
+        // can still be visible, and only a real change of state clears that.
+        // Make one, then put the stack's own timeouts back.
+        if g.persisted.restore_timeouts.is_some() && !adapter.discoverable {
+            bluez
+                .set_discoverable(true)
+                .await
+                .map_err(|e| reason_of(&e))?;
+            bluez
+                .set_discoverable(false)
+                .await
+                .map_err(|e| reason_of(&e))?;
+        }
         if let Some((d, p)) = g.persisted.restore_timeouts {
             if bluez.set_timeouts(d, p).await.is_ok() {
                 adapter.discoverable_timeout = d;
@@ -681,7 +700,12 @@ impl BluetoothRuntime {
             // The agent is part of the window: registering it is what makes
             // the stack pairable, and it goes with the window.
             let opened = async {
-                bluez.set_timeouts(seconds, seconds).await?;
+                bluez
+                    .set_timeouts(
+                        seconds + STACK_MARGIN,
+                        seconds + STACK_MARGIN,
+                    )
+                    .await?;
                 bluez.register_agent(self.gate.clone()).await?;
                 bluez.set_pairable(true).await?;
                 bluez.set_discoverable(true).await
@@ -1103,7 +1127,7 @@ mod tests {
         );
         let a = r.bt.adapter_now();
         assert!(a.discoverable && a.pairable);
-        assert_eq!((a.discoverable_timeout, a.pairable_timeout), (120, 120));
+        assert_eq!((a.discoverable_timeout, a.pairable_timeout), (125, 125));
         let gate = r.bt.st.lock().unwrap().gate.clone().unwrap();
         assert!(gate.is_open());
         r.bt.pair("AA:BB:CC:DD:EE:01", "phone")
@@ -1249,6 +1273,62 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_window_the_stack_closed_by_its_own_timer_is_resynchronised_at_the_next_start(
+    ) {
+        let r = rig().await;
+        r.rt.enable().await.unwrap();
+        r.rt.start_pairing(30).await.unwrap();
+        // the plugin dies; the stack's own timer later reports the adapter
+        // closed (and the controller can stay visible: a property that reads
+        // false is not proof)
+        {
+            let mut s = r.bt.st.lock().unwrap();
+            s.gate = None;
+            let a = s.adapter.as_mut().unwrap();
+            a.discoverable = false;
+            a.pairable = false;
+            s.calls.clear();
+        }
+        let (bt, dir) = (r.bt, r.dir);
+        let r2 = rig_over(bt.clone(), dir).await;
+        r2.rt.reconcile_on_load().await;
+        let calls = bt.calls();
+        let on = calls.iter().position(|c| c == "discoverable=true");
+        let off = calls.iter().rposition(|c| c == "discoverable=false");
+        assert!(
+            matches!((on, off), (Some(a), Some(b)) if a < b),
+            "a real change of state, on then off, must clear it: {calls:?}"
+        );
+        assert!(!bt.adapter_now().discoverable);
+        // a start with nothing to recover from does no such thing
+        r2.rt.disable().await.unwrap();
+        bt.st.lock().unwrap().calls.clear();
+        r2.rt.enable().await.unwrap();
+        assert!(
+            !bt.calls().contains(&"discoverable=true".to_string()),
+            "a clean start never makes the adapter visible, even for a moment"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_stacks_own_timer_is_a_backstop_that_fires_after_ours() {
+        const { assert!(STACK_MARGIN > 0) };
+        let r = rig().await;
+        r.rt.enable().await.unwrap();
+        r.rt.start_pairing(30).await.unwrap();
+        let a = r.bt.adapter_now();
+        assert_eq!(
+            (a.discoverable_timeout, a.pairable_timeout),
+            (30 + STACK_MARGIN, 30 + STACK_MARGIN)
+        );
+        // our own timer closes the window at 30 s, before the stack's at 35 s
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        settle().await;
+        assert_eq!(word(&r.rt.get_state().await), "ready");
+        assert!(r.bt.calls().iter().any(|c| c == "discoverable=false"));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_window_that_fails_half_way_is_taken_down_again() {
         let r = rig().await;
         r.rt.enable().await.unwrap();
@@ -1299,7 +1379,7 @@ mod tests {
             "kept on disk while the window has them changed"
         );
         let a = r.bt.adapter_now();
-        assert_eq!((a.discoverable_timeout, a.pairable_timeout), (120, 120));
+        assert_eq!((a.discoverable_timeout, a.pairable_timeout), (125, 125));
         // the plugin dies: its connection goes, and with it its agent
         r.bt.st.lock().unwrap().gate = None;
         let (bt, dir) = (r.bt, r.dir);
