@@ -75,6 +75,7 @@ use crate::library::LIBRARY_PAYLOAD_VERSION;
 use crate::mpd::{MpdConnection, MpdLibraryEntry, MpdQueueItem, PlayState};
 use crate::skip_traversal::{PlayableQueueItem, SkipOutcome, SkipTraversal};
 use crate::source_registry::SourceRegistry;
+use crate::stream_tags::{StreamTagStore, StreamTags};
 
 const PLUGIN_NAME: &str = "org.evoframework.playback.mpd";
 
@@ -125,6 +126,10 @@ pub(crate) struct QueueContext {
     /// Where the last queue is kept for `restore_last_queue`.
     /// Written before a clear and at shutdown.
     pub(crate) last_queue: LastQueueStore,
+    /// What each stream was last known by. A stream's title lives only
+    /// on its queue row, so it is put back whenever the URL is added
+    /// again.
+    pub(crate) stream_tags: StreamTagStore,
     /// In-memory mirror of the last published envelope, used
     /// by `queue.get_queue` to satisfy read-then-subscribe
     /// without round-tripping through the framework's subject
@@ -170,6 +175,7 @@ impl QueueContext {
             mute,
             shuffle,
             last_queue: LastQueueStore::default(),
+            stream_tags: StreamTagStore::default(),
             mirror: Arc::new(Mutex::new(None)),
             shelf_dispatcher,
             artwork_hashes: Default::default(),
@@ -183,6 +189,40 @@ impl QueueContext {
         index: crate::artwork_hash::ArtworkHashIndex,
     ) -> Self {
         self.artwork_hashes = index;
+        self
+    }
+
+    /// A URI as it is added when nothing resolves it: the bare URI, with
+    /// the tags a stream was last known by if it is one this plugin has
+    /// seen. Never a made-up title.
+    pub(crate) fn known_track(&self, uri: &str) -> ResolvedTrack {
+        match self.stream_tags.get(uri) {
+            Some(tags) => ResolvedTrack::known(uri, tags),
+            None => ResolvedTrack::passthrough(uri),
+        }
+    }
+
+    /// Learn what the queue's own stream rows are called, so a row tagged
+    /// before this plugin knew it comes back titled too.
+    pub(crate) fn learn_queue(&self, items: &[MpdQueueItem]) {
+        for item in items {
+            self.stream_tags.remember(
+                &item.file_path,
+                StreamTags {
+                    title: item.title.clone(),
+                    artist: item.artist.clone(),
+                    album: item.album.clone(),
+                    composer: item.classical.composer.clone(),
+                    ..StreamTags::default()
+                },
+            );
+        }
+    }
+
+    /// Keep what streams are called here, across restarts. Without this
+    /// they are remembered only until the plugin stops.
+    pub(crate) fn with_stream_tags(mut self, store: StreamTagStore) -> Self {
+        self.stream_tags = store;
         self
     }
 
@@ -1513,6 +1553,33 @@ impl ResolvedTrack {
         }
     }
 
+    /// A URI added again, with whatever it was last known by.
+    fn known(uri: &str, tags: StreamTags) -> Self {
+        Self {
+            uri: uri.to_string(),
+            title: tags.title,
+            artist: tags.artist,
+            album: tags.album,
+            genre: tags.genre,
+            date: tags.date,
+            composer: tags.composer,
+            artwork_url: None,
+            duration: None,
+        }
+    }
+
+    /// The tags this track carries, for remembering.
+    fn stream_tags(&self) -> StreamTags {
+        StreamTags {
+            title: self.title.clone(),
+            artist: self.artist.clone(),
+            album: self.album.clone(),
+            genre: self.genre.clone(),
+            date: self.date.clone(),
+            composer: self.composer.clone(),
+        }
+    }
+
     /// True when at least one metadata tag is present. Enqueue
     /// paths use this to decide whether the follow-up
     /// `addtagid` burst is needed at all.
@@ -1599,7 +1666,7 @@ pub(crate) async fn resolve_uri_for_mpd(
     uri: &str,
 ) -> Result<ResolvedTrack, VerbError> {
     if !uri.starts_with(URI_SCHEME_DLNA) {
-        return Ok(ResolvedTrack::passthrough(uri));
+        return Ok(ctx.known_track(uri));
     }
     let (service_id, object_id) =
         parse_dlna_uri(uri).ok_or_else(|| VerbError::Mpd {
@@ -1683,7 +1750,7 @@ pub(crate) async fn resolve_uri_for_mpd(
             .filter(|s| !s.is_empty())
             .map(String::from)
     };
-    Ok(ResolvedTrack {
+    let resolved = ResolvedTrack {
         uri: http_uri.to_string(),
         title: opt_str("title"),
         artist: opt_str("artist"),
@@ -1693,7 +1760,12 @@ pub(crate) async fn resolve_uri_for_mpd(
         composer: opt_str("composer"),
         artwork_url: opt_str("artwork_url"),
         duration: opt_str("duration"),
-    })
+    };
+    // The server has just said what this stream is called. The queue row
+    // will hold that only until the URL is added again.
+    ctx.stream_tags
+        .remember(&resolved.uri, resolved.stream_tags());
+    Ok(resolved)
 }
 
 /// Split `dlna:<service_id>/<objectId>` into its parts. Service
@@ -1967,6 +2039,7 @@ pub(crate) async fn snapshot_last_queue(
     if items.is_empty() {
         return Ok(false);
     }
+    ctx.learn_queue(&items);
     let status = conn.status().await.map_err(|e| mpd(e, "status"))?;
     let current = match status.state {
         PlayState::Playing | PlayState::Paused => status.song_position,
@@ -2025,8 +2098,14 @@ pub(crate) async fn handle_restore_last_queue(
     conn.clear().await.map_err(|e| mpd(e, "clear"))?;
     let mut restored = 0usize;
     for uri in &last.uris {
-        match conn.add(uri).await {
-            Ok(()) => restored += 1,
+        // A stream goes back with the tags it was known by: the URL alone
+        // names nothing.
+        let track = ctx.known_track(uri);
+        match conn.addid(&track.uri, None).await {
+            Ok(id) => {
+                apply_resolved_tags(conn, id, &track).await;
+                restored += 1;
+            }
             Err(e) => tracing::warn!(
                 plugin = PLUGIN_NAME,
                 uri = %uri,
@@ -2528,11 +2607,16 @@ async fn add_resolved_to_queue(
 /// `queue.save_queue_as_playlist` — persist the current queue
 /// as a stored playlist.
 pub(crate) async fn handle_save_queue_as_playlist(
-    _ctx: &QueueContext,
+    ctx: &QueueContext,
     conn: &mut MpdConnection,
     payload: SaveQueueAsPlaylistPayload,
 ) -> Result<(), VerbError> {
     check_version(payload.v, "queue.save_queue_as_playlist")?;
+    // MPD's `save` writes URLs and nothing else. Learn what the stream
+    // rows are called now, so the playlist can give them back when it loads.
+    if let Ok(items) = conn.playlistinfo().await {
+        ctx.learn_queue(&items);
+    }
     if payload.overwrite {
         // MPD's `save` ACKs with 56 (exists) on collision.
         // When overwrite is true, pre-delete then save.
@@ -5507,5 +5591,285 @@ mod tests {
 
         assert!(leaves.is_empty(), "no leaves at depth 1");
         assert!(truncated, "depth cap fired on child");
+    }
+
+    // ===== a stream keeps its title when it is added again =====
+    //
+    // MPD reads no title from an HTTP URL: a stream's title is whatever
+    // `addtagid` put on that queue row. Anything that adds the bare URL
+    // again — the last queue coming back, a stored playlist loading — drops
+    // it, and the glass then paints the URL. These pin that the tags a
+    // stream was enqueued with are put back whenever it is.
+
+    const STREAM_A: &str = "http://192.0.2.9:32469/object/aaa/file.mp3";
+    const STREAM_B: &str = "http://192.0.2.9:32469/object/bbb/file.mp3";
+
+    /// Answers `source.dlna.resolve` with a stream URL and its DIDL tags.
+    struct ResolveDispatcher;
+
+    impl evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher
+        for ResolveDispatcher
+    {
+        fn dispatch<'a>(
+            &'a self,
+            _shelf: &'a str,
+            _request_type: &'a str,
+            payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<u8>,
+                            evo_plugin_sdk::contract::shelf_dispatch::ShelfDispatchError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        >{
+            Box::pin(async move {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&payload).unwrap();
+                let (uri, title, artist) = match body["object_id"].as_str() {
+                    Some("aaa") => (STREAM_A, "Sweet Title", "Band A"),
+                    _ => (STREAM_B, "Second Title", "Band B"),
+                };
+                Ok(serde_json::to_vec(&serde_json::json!({
+                    "uri": uri, "title": title, "artist": artist,
+                    "album": "The Album", "genre": "Rock",
+                }))
+                .unwrap())
+            })
+        }
+    }
+
+    async fn titled_harness(
+        dir: &std::path::Path,
+        items: Vec<(u32, String)>,
+    ) -> (QueueContext, MpdConnection) {
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::new(std::sync::Mutex::new(Vec::new())),
+                items,
+                playing: None,
+            }])
+            .await;
+        let conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+        let ann = Arc::new(RecordingAnn::default());
+        let registry = SourceRegistry::new();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            ann as Arc<dyn SubjectAnnouncer>,
+            skip,
+            Some(Arc::new(ResolveDispatcher)),
+            crate::mute_cell::MuteCell::new(),
+            crate::album_shuffle::ShuffleModeCell::new(),
+        )
+        .with_last_queue_store(LastQueueStore::at(dir.join("last-queue.toml")));
+        (ctx, conn)
+    }
+
+    /// What the queue shows for each row: the title MPD holds, else none.
+    async fn titles(conn: &mut MpdConnection) -> Vec<(String, Option<String>)> {
+        conn.playlistinfo()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| (i.file_path, i.title))
+            .collect()
+    }
+
+    fn enqueue_both() -> EnqueuePayload {
+        EnqueuePayload {
+            v: QUEUE_PAYLOAD_VERSION,
+            uris: vec!["dlna:svc/aaa".into(), "dlna:svc/bbb".into()],
+            position: None,
+        }
+    }
+
+    fn streams_titled() -> Vec<(String, Option<String>)> {
+        vec![
+            (STREAM_A.to_string(), Some("Sweet Title".to_string())),
+            (STREAM_B.to_string(), Some("Second Title".to_string())),
+        ]
+    }
+
+    /// A fresh enqueue titles the rows. This is the half that works
+    /// today and must not move.
+    #[tokio::test]
+    async fn a_fresh_dlna_enqueue_titles_the_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut conn) = titled_harness(dir.path(), Vec::new()).await;
+        handle_enqueue(&ctx, &mut conn, enqueue_both())
+            .await
+            .unwrap();
+        assert_eq!(titles(&mut conn).await, streams_titled());
+    }
+
+    /// The row the operator cleared away comes back with its title.
+    #[tokio::test]
+    async fn the_last_queue_comes_back_with_its_stream_titles() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut conn) = titled_harness(dir.path(), Vec::new()).await;
+        handle_enqueue(&ctx, &mut conn, enqueue_both())
+            .await
+            .unwrap();
+        handle_clear_queue(&ctx, &mut conn).await.unwrap();
+        assert!(titles(&mut conn).await.is_empty());
+
+        handle_restore_last_queue(&ctx, &mut conn).await.unwrap();
+
+        assert_eq!(
+            titles(&mut conn).await,
+            streams_titled(),
+            "a restored stream must keep the title it was enqueued with"
+        );
+    }
+
+    /// Rows already in the queue when this plugin first sees them — tagged
+    /// by an earlier run — are learned when the queue is kept, so they come
+    /// back too.
+    #[tokio::test]
+    async fn rows_tagged_before_the_plugin_knew_them_are_learned_when_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut conn) = titled_harness(dir.path(), Vec::new()).await;
+        let id = conn.addid(STREAM_A, None).await.unwrap();
+        conn.addtagid(id, "Title", "Earlier Title").await.unwrap();
+        conn.addtagid(id, "Artist", "Earlier Band").await.unwrap();
+
+        handle_clear_queue(&ctx, &mut conn).await.unwrap();
+        handle_restore_last_queue(&ctx, &mut conn).await.unwrap();
+
+        assert_eq!(
+            titles(&mut conn).await,
+            vec![(STREAM_A.to_string(), Some("Earlier Title".to_string()))]
+        );
+    }
+
+    /// A stored playlist holds bare URLs (that is all MPD's `save` writes).
+    /// Loading one back titles the rows the plugin knows.
+    #[tokio::test]
+    async fn a_stored_playlist_of_streams_loads_with_their_titles() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut conn) = titled_harness(dir.path(), Vec::new()).await;
+        handle_enqueue(&ctx, &mut conn, enqueue_both())
+            .await
+            .unwrap();
+        // What `save` leaves in MPD: the two URLs, no tags.
+        conn.playlistadd("mix", STREAM_A).await.unwrap();
+        conn.playlistadd("mix", STREAM_B).await.unwrap();
+        conn.clear().await.unwrap();
+
+        handle_load_playlist_to_queue(
+            &ctx,
+            &mut conn,
+            LoadPlaylistPayload {
+                v: QUEUE_PAYLOAD_VERSION,
+                playlist_name: "mix".into(),
+                start_position: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(titles(&mut conn).await, streams_titled());
+    }
+
+    /// A queue the plugin has never resolved is saved as a playlist: the
+    /// save is when it learns what the rows are called.
+    #[tokio::test]
+    async fn saving_the_queue_as_a_playlist_learns_its_stream_titles() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut conn) = titled_harness(dir.path(), Vec::new()).await;
+        let id = conn.addid(STREAM_B, None).await.unwrap();
+        conn.addtagid(id, "Title", "Saved Title").await.unwrap();
+        handle_save_queue_as_playlist(
+            &ctx,
+            &mut conn,
+            SaveQueueAsPlaylistPayload {
+                v: QUEUE_PAYLOAD_VERSION,
+                playlist_name: "saved".into(),
+                overwrite: false,
+            },
+        )
+        .await
+        .unwrap();
+        conn.playlistadd("saved", STREAM_B).await.unwrap();
+        conn.clear().await.unwrap();
+
+        handle_load_playlist_to_queue(
+            &ctx,
+            &mut conn,
+            LoadPlaylistPayload {
+                v: QUEUE_PAYLOAD_VERSION,
+                playlist_name: "saved".into(),
+                start_position: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            titles(&mut conn).await,
+            vec![(STREAM_B.to_string(), Some("Saved Title".to_string()))]
+        );
+    }
+
+    /// Local library rows are untouched by any of this: restored by their
+    /// path alone, with no tag written.
+    #[tokio::test]
+    async fn local_rows_come_back_as_they_always_did() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut conn) = titled_harness(
+            dir.path(),
+            vec![
+                (1, "INTERNAL/Adele/a.flac".to_string()),
+                (2, "USB/Stick/b.flac".to_string()),
+            ],
+        )
+        .await;
+        handle_clear_queue(&ctx, &mut conn).await.unwrap();
+        handle_restore_last_queue(&ctx, &mut conn).await.unwrap();
+        assert_eq!(
+            titles(&mut conn).await,
+            vec![
+                ("INTERNAL/Adele/a.flac".to_string(), None),
+                ("USB/Stick/b.flac".to_string(), None),
+            ],
+            "a local row's tags come from its file, not from this plugin"
+        );
+    }
+
+    /// A stream the plugin knows nothing about is added as the bare URL it
+    /// is: no title is made up.
+    #[tokio::test]
+    async fn an_unknown_stream_is_restored_bare_and_never_given_a_made_up_title(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut conn) = titled_harness(
+            dir.path(),
+            vec![(1, "http://example.invalid/radio".to_string())],
+        )
+        .await;
+        handle_clear_queue(&ctx, &mut conn).await.unwrap();
+        handle_restore_last_queue(&ctx, &mut conn).await.unwrap();
+        assert_eq!(
+            titles(&mut conn).await,
+            vec![("http://example.invalid/radio".to_string(), None)]
+        );
     }
 }

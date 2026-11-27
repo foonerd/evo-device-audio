@@ -218,6 +218,9 @@ impl ShelfBundle {
         .with_last_queue_store(crate::last_queue::LastQueueStore::at(
             state_dir.join("last-queue.toml"),
         ))
+        .with_stream_tags(crate::stream_tags::StreamTagStore::at(
+            state_dir.join("stream-tags.toml"),
+        ))
         .with_artwork_hashes(artwork_hashes.clone());
         let playlist = PlaylistContext::new(
             music_directory.clone(),
@@ -605,6 +608,9 @@ impl ShelfBundle {
                 "MPD unreachable at shutdown; the queue was not kept"
             ),
         }
+        // What streams are called is written with the queue, not left to
+        // the short delay that batches it.
+        self.queue.stream_tags.flush().await;
         if let Some(handle) = self.idle_observer.take() {
             handle.stop().await;
         }
@@ -1944,6 +1950,37 @@ mod tests {
         assert_eq!(kept.uris, vec!["INTERNAL/a/1.flac", "INTERNAL/b/2.flac"]);
         assert_eq!(kept.current, Some(1));
         assert_eq!(kept.reason, crate::last_queue::SnapshotReason::Shutdown);
+    }
+
+    /// What a stream is called is written when the plugin unloads, not
+    /// left to the short delay that batches changes: a stop inside that
+    /// delay would otherwise cost the titles.
+    #[tokio::test]
+    async fn shutdown_writes_what_streams_are_called() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = live_bundle(dir.path()).await;
+        let url = "http://192.0.2.9:32469/object/aaa/file.mp3";
+        bundle.queue.stream_tags.remember(
+            url,
+            crate::stream_tags::StreamTags {
+                title: Some("Kept at stop".into()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !dir.path().join("stream-tags.toml").exists(),
+            "a change waits for the delay"
+        );
+
+        bundle.shutdown().await;
+
+        let again = crate::stream_tags::StreamTagStore::at(
+            dir.path().join("stream-tags.toml"),
+        );
+        assert_eq!(
+            again.get(url).and_then(|t| t.title).as_deref(),
+            Some("Kept at stop")
+        );
     }
 
     /// A nested refusal by name reaches the glass by name, as a

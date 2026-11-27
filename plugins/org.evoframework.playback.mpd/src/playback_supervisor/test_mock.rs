@@ -680,6 +680,12 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
             let mut next_id =
                 queue.iter().map(|(id, _)| *id).max().unwrap_or(99) + 1;
             let mut in_list = false;
+            // Tags `addtagid` put on a row, by songid: what a stream's
+            // title is, since MPD reads none from an HTTP URL.
+            let mut tags: std::collections::HashMap<
+                u32,
+                Vec<(String, String)>,
+            > = std::collections::HashMap::new();
             let mut stored: std::collections::HashMap<String, Vec<String>> =
                 std::collections::HashMap::new();
             let mut line = String::new();
@@ -703,13 +709,22 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                         out.push_str(&format!(
                             "file: {path}\nPos: {pos}\nId: {id}\n"
                         ));
+                        for (tag, value) in tags.get(id).into_iter().flatten() {
+                            out.push_str(&format!("{tag}: {value}\n"));
+                        }
                         // The directory is the album, so a row
                         // under `blue/` is on album `blue`. Album
                         // shuffle groups by this tag; without it
                         // every file is its own album and no
                         // fixture can make an order the planner
                         // cannot draw.
-                        if let Some((dir, _)) = path.rsplit_once('/') {
+                        // A stream has no folder, so no album from one.
+                        let folder = if path.contains("://") {
+                            None
+                        } else {
+                            path.rsplit_once('/')
+                        };
+                        if let Some((dir, _)) = folder {
                             out.push_str(&format!("Album: {dir}\n"));
                         }
                     }
@@ -725,6 +740,27 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                     }
                     out.push_str("OK\n");
                     let _ = w.write_all(out.as_bytes()).await;
+                } else if cmd.starts_with("addtagid") {
+                    let mut args = cmd.split('"').filter(|s| {
+                        !s.trim().is_empty() && !s.starts_with("addtagid")
+                    });
+                    let id =
+                        args.next().and_then(|t| t.trim().parse::<u32>().ok());
+                    let tag = args.next().unwrap_or_default().to_string();
+                    let value = args.next().unwrap_or_default().to_string();
+                    match id.filter(|id| queue.iter().any(|(q, _)| q == id)) {
+                        Some(id) => {
+                            tags.entry(id).or_default().push((tag, value));
+                            let _ = w.write_all(b"OK\n").await;
+                        }
+                        None => {
+                            let _ = w
+                                .write_all(
+                                    b"ACK [50@0] {addtagid} No such song\n",
+                                )
+                                .await;
+                        }
+                    }
                 } else if cmd.starts_with("deleteid") {
                     let id = cmd
                         .split_whitespace()
@@ -732,6 +768,7 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                         .and_then(|t| t.trim_matches('"').parse::<u32>().ok());
                     if let Some(id) = id {
                         queue.retain(|(qid, _)| *qid != id);
+                        tags.remove(&id);
                     }
                     if current.is_some_and(|p| p as usize >= queue.len()) {
                         current = None;
@@ -856,6 +893,7 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                     }
                 } else if cmd == "clear" {
                     queue.clear();
+                    tags.clear();
                     current = None;
                     if !in_list {
                         let _ = w.write_all(b"OK\n").await;
